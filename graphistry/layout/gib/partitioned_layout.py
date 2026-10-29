@@ -1,0 +1,220 @@
+from typing import Any, Callable, Dict, Optional, Union
+import numpy as np, pandas as pd
+from timeit import default_timer as timer
+
+from graphistry.Engine import Engine, df_concat, df_cons
+from graphistry.Plottable import Plottable
+from graphistry.util import setup_logger
+
+from .layout_bulk import layout_bulk_mode
+from .layout_non_bulk import layout_non_bulk_mode
+
+
+logger = setup_logger(__name__)
+
+
+#TODO layout engine may be diff from base engine!
+def partitioned_layout(
+    self: Plottable,
+    partition_offsets: Dict[str, Dict[int, float]],
+    layout_alg: Optional[Union[str, Callable[[Plottable], Plottable]]] = None,
+    layout_params: Optional[Dict[str, Any]] = None,
+    partition_key='partition',
+    bulk_mode: bool = True,
+    engine: Engine = Engine.PANDAS,
+) -> Plottable:
+    """    
+    :param partition_offsets: {'dx', 'dy', 'x', 'y'} => <partition> => float
+    :type partition_offsets: Dict[str, Dict[int, float]]
+    :param layout_alg: Layout algorithm used to position nodes within each partition. When
+        None, the default depends on ``bulk_mode``: under ``bulk_mode=True`` (the default)
+        both CPU and GPU use fa2_layout; under ``bulk_mode=False`` CPU uses igraph ``fr``
+        and GPU uses cugraph ``force_atlas2``.
+    :type layout_alg: Optional[Union[str, Callable[[Plottable], Plottable]]]
+    :param layout_params: Parameters for the layout algorithm
+    :type layout_params: Optional[Dict[str, Any]]
+    :param partition_key: Name of the existing node column holding the partition id; must
+        already be present on the node table. Defaults to the literal ``'partition'``.
+    :type partition_key: str
+    :param bulk_mode: Whether to apply layout in bulk mode
+    :type bulk_mode: bool
+    :param engine: The engine being used (Pandas or CUDF)
+    :type engine: Engine
+
+    :return: The resulting Plottable object with positioned nodes
+    """
+    start = timer()
+
+    node_partitions = []
+    # edgeless_partitions = None
+
+    g_degrees = self.get_degrees()
+
+    # | partition , id_count, degree_max |
+    node_splits_info = (
+        g_degrees._nodes[[self._node, 'degree', partition_key]]
+        .groupby(partition_key).agg({
+            g_degrees._node: 'count',
+            'degree': 'max'
+        })
+        .rename(columns={g_degrees._node: 'id_count', 'degree': 'degree_max'})
+        .reset_index()
+    )
+
+    singleton_nodes = (
+        node_splits_info[node_splits_info['id_count'] == 1][[partition_key]]
+        .merge(g_degrees._nodes, on=partition_key, how='left')
+    )
+    remaining = node_splits_info[node_splits_info['id_count'] > 1]
+
+    pair_nodes = (
+        node_splits_info[node_splits_info['id_count'] == 2][[partition_key]]
+        .merge(g_degrees._nodes, on=partition_key, how='left')
+    )
+    pre_n = len(remaining)
+    remaining = remaining[remaining['id_count'] > 2]
+    logger.debug('pruned pairs: %s -> %s', pre_n, len(remaining))
+
+    #incomplete: misses groups that have only out-of-group edges!
+    edgeless_nodes = (
+        remaining[remaining['degree_max'] == 0][[partition_key]]
+        .merge(g_degrees._nodes, on=partition_key, how='left')
+    )
+    remaining = remaining[remaining['degree_max'] > 0]
+
+    #nodes = g_degrees
+    nodes = g_degrees._nodes.merge(
+        node_splits_info[[partition_key, 'id_count', 'degree_max']],
+        on=partition_key,
+        how='left'
+    )
+    end_stats = timer()
+    logger.debug('partition stats: %s s', end_stats - start)
+
+    self_selfless = self.edges(
+        self._edges[
+            self._edges[self._source] != self._edges[self._destination]
+        ]
+    )
+
+    if engine == Engine.CUDF and self_selfless._edge_weight is None:
+        self_selfless = (
+            self_selfless.edges(
+                self_selfless._edges.assign(weight=1.)
+            ).bind(edge_weight='weight')
+        )
+
+    if bulk_mode:
+        combined_nodes = layout_bulk_mode(self, nodes, partition_key, layout_alg, layout_params, engine)
+        node_partitions.append(combined_nodes)
+    else:
+        node_partitions, s_layout, s_keep, s_layout_by_size = layout_non_bulk_mode(
+            self, node_partitions, remaining, partition_key, layout_alg, layout_params, engine, self_selfless
+        )
+
+    end_communities = timer()  # Define end_communities here to track layout time
+    logger.debug('part_layout time: %s s', end_communities - start)
+
+    # small-partition fallbacks only apply to non-bulk mode; bulk already positions every node
+    if not bulk_mode and len(singleton_nodes) > 0:
+        logger.debug('# SINGLETONS: %s', len(singleton_nodes))
+        start_sing = timer()
+        singletons = singleton_nodes.assign(
+            x=0.5,
+            y=0.5,
+            type='singleton'
+        )
+        node_partitions.append(singletons)
+        end_sing = timer()
+        logger.debug('singleton groups (%s): %s s', len(singletons), end_sing - start_sing)
+
+    if not bulk_mode and len(pair_nodes) > 0:
+        logger.debug('# PAIRS: %s', len(pair_nodes))
+        start_pair = timer()
+        pairs_indexed = pair_nodes.reset_index()
+        pairs = pairs_indexed.assign(
+            x = 0.33 + (pairs_indexed['index'] % 2) * 0.33,
+            y = 0.33 + (pairs_indexed['index'] % 2) * 0.33
+        ).drop(columns=['index'])
+        node_partitions.append(pairs)
+        end_pair = timer()
+        logger.debug('pairs groups (%s): %s s', len(pairs), end_pair - start_pair)
+
+    #FIXME: how to make safe?
+    if not bulk_mode and len(edgeless_nodes) > 0:
+        logger.debug('# EDGELESS: %s', len(edgeless_nodes))
+        start_e = timer()
+        edgeless = edgeless_nodes
+        # FIXME: Sorted grid vs random
+        if engine == Engine.PANDAS:
+            edgeless['x'] = pd.Series(np.random.default_rng().uniform(0., 1., size=len(edgeless)), dtype='float32')
+            edgeless['y'] = pd.Series(np.random.default_rng().uniform(0., 1., size=len(edgeless)), dtype='float32')
+        elif engine == Engine.CUDF:
+            import cudf, cupy as cp
+            edgeless['x'] = cudf.Series(cp.random.rand(len(edgeless), dtype=cp.float32))
+            edgeless['y'] = cudf.Series(cp.random.rand(len(edgeless), dtype=cp.float32))
+        else:
+            raise ValueError('Unknown engine, expected Pandas or CuDF')
+        edgeless['type'] = 'singleton'
+        node_partitions.append(edgeless)
+        end_e = timer()
+        logger.debug('edgeless-community (%s): %s s', len(edgeless), end_e - start_e)
+
+    combined_nodes = df_concat(engine)(node_partitions, ignore_index=True, sort=False)
+    # FA unnconnected nodes, though circle would autoplace
+    for axis in ['x', 'y']:
+        na_count = combined_nodes[axis].isna().sum()
+        if na_count > 0:
+            logger.debug('filling layout-returned NAs as random: %s %ss', na_count, axis)
+            fill = df_cons(engine)({
+                axis: np.random.default_rng().uniform(0., 1., size=len(combined_nodes)).astype('float32')
+            })[axis]
+            combined_nodes[axis] = combined_nodes[axis].fillna(fill)
+
+    node_stats = combined_nodes.groupby(partition_key).agg({
+        'x': ['max', 'min'],
+        'y': ['max', 'min']
+    })
+    node_stats.columns = ['x_max', 'x_min', 'y_max', 'y_min']  # type: ignore
+    node_stats['dx'] = df_cons(engine)({
+        'dx': node_stats['x_max'] - node_stats['x_min'],
+        'min': 1
+    }).max(axis=1)
+    node_stats['dy'] = df_cons(engine)({
+        'dy': node_stats['y_max'] - node_stats['y_min'],
+        'min': 1
+    }).max(axis=1)
+
+    # Stats stay in-engine: cudf's merge rejects a pandas right operand.
+    combined_with_stats = combined_nodes.merge(
+        node_stats[['x_min', 'dx', 'y_min', 'dy']],
+        left_on=partition_key,
+        right_index=True,
+        how='left',
+    )
+    normalized_nodes = combined_nodes.copy()
+    normalized_nodes['x'] = (combined_with_stats['x'] - combined_with_stats['x_min']) / combined_with_stats['dx']
+    normalized_nodes['y'] = (combined_with_stats['y'] - combined_with_stats['y_min']) / combined_with_stats['dy']
+    g_locally_positioned = self.nodes(normalized_nodes)
+
+    # Vectorized global transform: merge treemap offsets once
+    # Rename offsets cols to avoid suffix ambiguity (local_nodes has x/y but not ox/oy/odx/ody)
+    offsets_df = df_cons(engine)(partition_offsets)  # index=partition_id, cols: x y dx dy
+    offsets_df = offsets_df.rename(columns={'x': 'ox', 'y': 'oy', 'dx': 'odx', 'dy': 'ody'})
+    local_nodes = g_locally_positioned._nodes
+    local_with_offsets = local_nodes.merge(
+        offsets_df[['ox', 'oy', 'odx', 'ody']],
+        left_on=partition_key,
+        right_index=True,
+        how='left',
+    )
+    global_nodes = local_nodes.copy()
+    global_nodes['x'] = local_with_offsets['x'] * local_with_offsets['odx'] + local_with_offsets['ox']
+    global_nodes['y'] = local_with_offsets['y'] * local_with_offsets['ody'] + local_with_offsets['oy']
+    global_nodes['y'] = -global_nodes['y']
+    g_globally_positioned = g_locally_positioned.nodes(global_nodes)
+    g_globally_positioned._edge_weight = self._edge_weight
+    end = timer()
+    logger.debug('part_layout postproc: %s s', end - end_communities)
+    logger.debug('partitioned_layout total: %s s', end - start)
+    return g_globally_positioned

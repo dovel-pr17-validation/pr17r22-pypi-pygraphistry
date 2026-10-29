@@ -1,0 +1,2262 @@
+name: CI Tests
+
+on:
+
+  #NOTE: All jobs gated by auth job
+
+  #Regular dev
+  push:
+    branches:
+      - master
+  pull_request:
+
+  #Enable UI-driven branch testing
+  workflow_dispatch:
+    inputs:
+      cooldown_days:
+        description: 'Lockfile cooldown days (0 = no cooldown/force-refresh, default 6)'
+        required: false
+        default: '6'
+
+  #Test main bidaily @ 1a
+  schedule:
+    - cron: '0 1 1-31/2 * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  # Cancel stale same-branch PR/manual runs. Branch push CI is master-only;
+  # branch validation happens via pull_request or workflow_dispatch.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+env:
+  # 6-day dependency cooldown: refuse packages uploaded less than 6 days ago
+  # to mitigate supply chain attacks. Belt-and-suspenders with lockfile --exclude-newer.
+  UV_EXCLUDE_NEWER: "6 days"
+
+jobs:
+
+  changes:
+    # Determine which files changed to run only relevant jobs
+    runs-on: ubuntu-24.04
+    outputs:
+      python: ${{ steps.filter.outputs.python }}
+      spark: ${{ steps.filter.outputs.spark }}
+      docs: ${{ steps.filter.outputs.docs }}
+      infra: ${{ steps.filter.outputs.infra }}
+      gfql: ${{ steps.filter.outputs.gfql }}
+      cypher_frontend_ci: ${{ steps.filter.outputs.cypher_frontend_ci }}
+      benchmarks: ${{ steps.filter.outputs.benchmarks }}
+      ai: ${{ steps.filter.outputs.ai }}
+      core: ${{ steps.filter.outputs.core }}
+      plugins: ${{ steps.filter.outputs.plugins }}
+      networkx: ${{ steps.filter.outputs.networkx }}
+      docs_test: ${{ steps.filter.outputs.docs_test }}
+      schema_lane: ${{ steps.filter.outputs.schema_lane }}
+      pandas_compat: ${{ steps.filter.outputs.pandas_compat }}
+      graphviz_lane: ${{ steps.filter.outputs.graphviz_lane }}
+      neo4j_lane: ${{ steps.filter.outputs.neo4j_lane }}
+      build_package: ${{ steps.filter.outputs.build_package }}
+      dgl_lane: ${{ steps.filter.outputs.dgl_lane }}
+      networkx_test_only: ${{ steps.filter.outputs.networkx_test_only }}
+      docs_test_only: ${{ steps.filter.outputs.docs_test_only }}
+      benchmarks_only: ${{ steps.filter.outputs.benchmarks_only }}
+      gfql_only: ${{ steps.filter.outputs.gfql_only }}
+      narrow_python_only: ${{ steps.filter.outputs.narrow_python_only }}
+      docs_only_latest: ${{ steps.docs_only_latest.outputs.docs_only_latest }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+        # full history needed so `git diff <base>..<head>` resolves on PRs / non-trivial pushes
+        fetch-depth: 0
+    - name: Compute path filters
+      id: filter
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PUSH_BEFORE: ${{ github.event.before }}
+        HEAD_SHA: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+        keys=(infra python spark gfql cypher_frontend_ci benchmarks ai docs core plugins networkx docs_test schema_lane pandas_compat graphviz_lane neo4j_lane build_package dgl_lane networkx_test_only docs_test_only benchmarks_only gfql_only graphviz_only neo4j_only build_package_only narrow_python_only)
+
+        emit_all() {
+          # $1 = "true" or "false" — emit the same value for every key
+          for k in "${keys[@]}"; do
+            echo "${k}=$1" >> "$GITHUB_OUTPUT"
+          done
+        }
+
+        # Non diff-bearing events: rely on downstream `event_name == 'workflow_dispatch'`
+        # / `'schedule'` OR-conditions in job `if:` expressions. Emit false safely.
+        if [[ "$EVENT_NAME" != "pull_request" && "$EVENT_NAME" != "push" ]]; then
+          emit_all false
+          exit 0
+        fi
+
+        if [[ "$EVENT_NAME" == "pull_request" ]]; then
+          base="$PR_BASE_SHA"
+          head="$PR_HEAD_SHA"
+        else
+          base="$PUSH_BEFORE"
+          head="$HEAD_SHA"
+        fi
+
+        # New branch / first push: zero-SHA base. Conservative: run everything.
+        if [[ -z "$base" || "$base" == "0000000000000000000000000000000000000000" ]]; then
+          emit_all true
+          exit 0
+        fi
+
+        # Diff vs the merge-base so PR runs see only commits that diverge from base
+        # (avoids picking up unrelated commits the base ref has gained meanwhile).
+        # If either resolution fails (e.g., force-pushed branch with orphaned
+        # event.before, or rebased PR base ref), fall back to the conservative
+        # "couldn't compute, run everything" stance and surface a GHA warning
+        # so operators can see why every job ran. Note: stderr is left
+        # un-redirected so the underlying git error (e.g., "Not a valid object
+        # name") shows up in the runner log alongside the warning.
+        if ! merge_base=$(git merge-base "$base" "$head"); then
+          echo "::warning::path-filter: git merge-base failed for $base..$head; running all gated jobs conservatively"
+          emit_all true
+          exit 0
+        fi
+        if ! changed=$(git diff --name-only "$merge_base" "$head"); then
+          echo "::warning::path-filter: git diff failed for $merge_base..$head; running all gated jobs conservatively"
+          emit_all true
+          exit 0
+        fi
+
+        echo "::group::Changed files for path filters"
+        if [[ -n "$changed" ]]; then
+          printf '%s\n' "$changed"
+        else
+          echo "(none)"
+        fi
+        echo "::endgroup::"
+
+        filter_summary="${RUNNER_TEMP}/path-filter-summary.md"
+        {
+          echo "### Path filter summary"
+          echo ""
+          echo "**Changed files:**"
+          echo ""
+          if [[ -n "$changed" ]]; then
+            while IFS= read -r f; do
+              printf -- '- `%s`\n' "$f"
+            done <<< "$changed"
+          else
+            echo "- (none)"
+          fi
+          echo ""
+          echo "| Filter | Value |"
+          echo "|---|---|"
+        } > "$filter_summary"
+
+        # emit <key> <regex>...  — joins regex args with `|` and emits true/false.
+        # Each pattern goes on its own line at the call site for readability;
+        # this is the reason emit takes variadic args instead of a pre-joined string.
+        emit() {
+          local key="$1"
+          shift
+          local IFS='|'
+          local pat="$*"
+          local value="false"
+          # Use a here-string instead of `printf "%s\n" "$changed" | grep -qE`.
+          # Why: with `set -o pipefail`, if `grep -q` matches early on a $changed
+          # larger than the pipe buffer (~64 KB; thousands of files), `grep` exits
+          # before `printf` finishes flushing. `printf` then receives SIGPIPE and
+          # exits 141. `pipefail` propagates that 141 to the pipeline, the `if`
+          # sees non-zero, and we'd silently emit `false` for a key that should
+          # be `true`. A here-string is a pure redirection (not a pipeline), so
+          # the data is fully buffered before grep reads, eliminating the race.
+          if [[ -n "$changed" ]] && grep -qE "$pat" <<< "$changed"; then
+            value="true"
+          fi
+          echo "${key}=${value}" >> "$GITHUB_OUTPUT"
+          echo "path-filter: ${key}=${value}"
+          echo "| \`${key}\` | \`${value}\` |" >> "$filter_summary"
+        }
+
+        # emit_only <key> <allowed-regex>... emits true only when every
+        # changed file matches the allowed set. These are safe carve-outs for
+        # known narrow PR shapes; unknown Python edits still fall through to the
+        # broad `python && narrow_python_only != true` gates below.
+        emit_only() {
+          local key="$1"
+          shift
+          local IFS='|'
+          local pat="$*"
+          local value="false"
+          if [[ -n "$changed" ]]; then
+            value="true"
+            while IFS= read -r f; do
+              if ! [[ "$f" =~ $pat ]]; then
+                value="false"
+                break
+              fi
+            done <<< "$changed"
+          fi
+          printf -v "$key" '%s' "$value"
+          echo "${key}=${value}" >> "$GITHUB_OUTPUT"
+          echo "path-filter: ${key}=${value}"
+          echo "| \`${key}\` | \`${value}\` |" >> "$filter_summary"
+        }
+
+        # Filter dimensions — patterns mirror the prior dorny/paths-filter YAML
+        # globs converted to anchored regex. Keep one pattern per line so adds
+        # / removes diff cleanly and the conversion stays auditable.
+
+        # Infrastructure: workflow defs, docker, bin scripts, root build config.
+        emit infra \
+          '^\.github/workflows/ci\.yml$' \
+          '^\.readthedocs\.yml$' \
+          '^docker/' \
+          '^bin/' \
+          '^requirements/rtd-py3\.12\.lock$' \
+          '^requirements/spark-py3\.14\.(in|lock)$' \
+          '^setup\.py$' \
+          '^setup\.cfg$' \
+          '^MANIFEST\.in$'
+
+        # Python code + lint/type config.
+        emit python \
+          '\.py$' \
+          '^graphistry/' \
+          '^schemas/' \
+          '^setup\.py$' \
+          '^setup\.cfg$' \
+          '^pytest\.ini$' \
+          '^mypy\.ini$' \
+          '^bin/lint\.sh$' \
+          '^bin/typecheck\.sh$' \
+          '^bin/ci/ci_.*baseline\.json$'
+
+        # GFQL core + tests.
+        emit gfql \
+          '^graphistry/gfql/' \
+          '^graphistry/compute/gfql/' \
+          '^graphistry/compute/gfql_validate\.py$' \
+          '^graphistry/compute/gfql_unified\.py$' \
+          '^graphistry/compute/gfql_fast_paths\.py$' \
+          '^graphistry/compute/chain.*\.py$' \
+          '^graphistry/compute/hop\.py$' \
+          '^graphistry/compute/filter_by_dict\.py$' \
+          '^graphistry/compute/ast\.py$' \
+          '^graphistry/compute/predicates/' \
+          '^graphistry/models/gfql/' \
+          '^graphistry/Plottable\.py$' \
+          '^graphistry/tests/benchmarks/gfql/' \
+          '^graphistry/tests/compute/gfql/' \
+          '^graphistry/tests/compute/test_gfql.*\.py$' \
+          '^graphistry/tests/compute/test_chain.*\.py$' \
+          '^graphistry/tests/compute/test_hop.*\.py$' \
+          '^graphistry/tests/test_gfql_.*\.py$' \
+          '^tests/gfql/'
+
+        # Spark lane: spark coercion/runtime + spark-focused tests + workflow changes.
+        emit spark \
+          '^\.github/workflows/ci\.yml$' \
+          '^setup\.py$' \
+          '^graphistry/Engine\.py$' \
+          '^graphistry/PlotterBase\.py$' \
+          '^graphistry/hyper_dask\.py$' \
+          '^graphistry/compute/ComputeMixin\.py$' \
+          '^graphistry/tests/compute/test_df_types\.py$' \
+          '^graphistry/tests/compute/test_engine_coercion\.py$' \
+          '^requirements/spark-py3\.14\.(in|lock)$'
+
+        # Cypher frontend gate-relevant paths (workflow defs included so a CI
+        # change here re-triggers the cypher gate alongside gfql/infra).
+        emit cypher_frontend_ci \
+          '^\.github/workflows/ci\.yml$' \
+          '^\.github/workflows/ci-gpu\.yml$' \
+          '^graphistry/compute/gfql/ir/' \
+          '^graphistry/compute/gfql/cypher/' \
+          '^graphistry/compute/gfql/frontends/cypher/' \
+          '^graphistry/tests/compute/gfql/cypher/' \
+          '^tests/gfql/ref/'
+
+        # Benchmarks suite.
+        emit benchmarks \
+          '^benchmarks/'
+
+        # AI/UMAP/text featurization lanes. Keep shared public entrypoints and
+        # dependency lock generation conservative; GFQL-only internals should
+        # not drag the expensive AI matrix unless they touch UMAP/CALL surfaces.
+        emit ai \
+          '^setup\.py$' \
+          '^\.github/workflows/ci\.yml$' \
+          '^bin/generate-lockfiles\.sh$' \
+          '^bin/test-(ai|features|umap-learn-core|text|dbscan|embed|dgl)\.sh$' \
+          '^graphistry/Plottable\.py$' \
+          '^graphistry/PlotterBase\.py$' \
+          '^graphistry/Engine\.py$' \
+          '^graphistry/compute/chain\.py$' \
+          '^graphistry/compute/cluster\.py$' \
+          '^graphistry/dgl_utils\.py$' \
+          '^graphistry/feature_utils\.py$' \
+          '^graphistry/features\.py$' \
+          '^graphistry/networks\.py$' \
+          '^graphistry/text_utils\.py$' \
+          '^graphistry/umap_utils\.py$' \
+          '^graphistry/utils/lazy_import\.py$' \
+          '^graphistry/plugins_types/(embed|umap)_types\.py$' \
+          '^graphistry/compute/gfql/call/' \
+          '^graphistry/tests/test_(compute_cluster|feature_utils|text_utils|umap_utils)\.py$' \
+          '^graphistry/tests/compute/test_call_engine_coercion\.py$' \
+          '^graphistry/tests/data/reddit\.csv$' \
+          '^requirements/(test-ai|test-umap)-py.*\.lock$'
+
+        # Classifier-only dimensions for CI-silo audit. These outputs are
+        # intentionally not used by job gates yet; later stacked PRs can consume
+        # them after scenario validation and review.
+        emit core \
+          '^\.github/workflows/ci\.yml$' \
+          '^setup\.py$' \
+          '^setup\.cfg$' \
+          '^pyproject\.toml$' \
+          '^pytest\.ini$' \
+          '^mypy\.ini$' \
+          '^MANIFEST\.in$' \
+          '^graphistry/Engine\.py$' \
+          '^graphistry/PlotterBase\.py$' \
+          '^graphistry/Plottable\.py$' \
+          '^graphistry/compute/ComputeMixin\.py$' \
+          '^graphistry/compute/dataframe_utils\.py$' \
+          '^graphistry/compute/typing\.py$' \
+          '^graphistry/utils/'
+
+        emit plugins \
+          '^graphistry/plugins/' \
+          '^graphistry/plugins_types/' \
+          '^graphistry/tests/plugins/'
+
+        emit networkx \
+          '^graphistry/plugins/networkx/' \
+          '^graphistry/compute/gfql/cypher/lowering\.py$' \
+          '^graphistry/compute/gfql/cypher/call_procedures\.py$' \
+          '^graphistry/compute/gfql/cypher/procedures/(common|networkx)\.py$' \
+          '^graphistry/compute/gfql/ir/logical_plan\.py$' \
+          '^graphistry/compute/gfql/physical_planner\.py$' \
+          '^graphistry/tests/plugins/test_networkx\.py$' \
+          '^graphistry/tests/compute/gfql/cypher/test_lowering\.py$' \
+          '^docs/source/api/plugins/compute/networkx\.rst$' \
+          '^demos/demos_databases_apis/networkx/'
+
+        emit docs_test \
+          '^docs/ci\.sh$' \
+          '^docs/docker/' \
+          '^docs/test_doc_examples\.py$' \
+          '^requirements/rtd-py3\.12\.lock$' \
+          '^\.readthedocs\.yml$'
+
+        emit schema_lane \
+          '^graphistry/schema\.py$' \
+          '^graphistry/devschemas/' \
+          '^schemas/' \
+          '^graphistry/tests/compute/gfql/test_public_schema\.py$' \
+          '^docs/source/gfql/schema\.rst$'
+
+        emit pandas_compat \
+          '^graphistry/compute/' \
+          '^graphistry/hyper\.py$' \
+          '^graphistry/PlotterBase\.py$' \
+          '^graphistry/Plottable\.py$' \
+          '^graphistry/tests/test_(plotter|compute_chain|hypergraph|compute_hops|compute_collapse|compute_filter_by_dict|bolt_util|nodexl)\.py$' \
+          '^graphistry/tests/compute/test_(chain|chain_let|chain_concat|dataframe_primitives|hop)\.py$' \
+          '^graphistry/tests/compute/gfql/' \
+          '^tests/gfql/ref/'
+
+        emit graphviz_lane \
+          '^graphistry/plotter\.py$' \
+          '^graphistry/PlotterBase\.py$' \
+          '^graphistry/tests/.*graphviz.*\.py$' \
+          '^bin/test-graphviz\.sh$' \
+          '^requirements/test-graphviz-py.*\.lock$'
+
+        emit neo4j_lane \
+          '^docker/.*neo4j' \
+          '^graphistry/bolt_util\.py$' \
+          '^graphistry/tests/test_bolt_util\.py$'
+
+        emit build_package \
+          '^setup\.py$' \
+          '^setup\.cfg$' \
+          '^pyproject\.toml$' \
+          '^MANIFEST\.in$' \
+          '^graphistry/py\.typed$' \
+          '^bin/build\.sh$'
+
+        emit dgl_lane \
+          '^graphistry/dgl_utils\.py$' \
+          '^graphistry/tests/.*dgl.*\.py$' \
+          '^bin/test-(dgl|embed)\.sh$'
+
+        emit_only networkx_test_only \
+          '^CHANGELOG\.md$' \
+          '^graphistry/tests/plugins/test_networkx\.py$'
+
+        emit_only docs_test_only \
+          '^CHANGELOG\.md$' \
+          '^docs/ci\.sh$' \
+          '^docs/docker/' \
+          '^docs/test_doc_examples\.py$' \
+          '^requirements/rtd-py3\.12\.lock$' \
+          '^\.readthedocs\.yml$'
+
+        emit_only benchmarks_only \
+          '^CHANGELOG\.md$' \
+          '^benchmarks/'
+
+        # Conservative GFQL-owned code/test slice. Do not include docs/source,
+        # broad compute entrypoints, gfql_unified.py, Plottable.py, or shared
+        # compute files; those continue to fail closed through broad Python gates.
+        emit_only gfql_only \
+          '^CHANGELOG\.md$' \
+          '^graphistry/gfql/' \
+          '^graphistry/compute/gfql/' \
+          '^graphistry/compute/gfql_validate\.py$' \
+          '^graphistry/models/gfql/' \
+          '^graphistry/tests/benchmarks/gfql/' \
+          '^graphistry/tests/compute/gfql/' \
+          '^graphistry/tests/compute/test_gfql.*\.py$' \
+          '^graphistry/tests/test_gfql_.*\.py$' \
+          '^tests/gfql/'
+
+        emit_only graphviz_only \
+          '^CHANGELOG\.md$' \
+          '^graphistry/plotter\.py$' \
+          '^graphistry/tests/.*graphviz.*\.py$' \
+          '^bin/test-graphviz\.sh$' \
+          '^requirements/test-graphviz-py.*\.lock$'
+
+        emit_only neo4j_only \
+          '^CHANGELOG\.md$' \
+          '^docker/.*neo4j' \
+          '^graphistry/bolt_util\.py$' \
+          '^graphistry/tests/test_bolt_util\.py$'
+
+        emit_only build_package_only \
+          '^CHANGELOG\.md$' \
+          '^graphistry/py\.typed$'
+
+        narrow_python_only="false"
+        if [[ "${networkx_test_only}" == "true" || "${docs_test_only}" == "true" || "${benchmarks_only}" == "true" || "${gfql_only}" == "true" || "${graphviz_only}" == "true" || "${neo4j_only}" == "true" || "${build_package_only}" == "true" ]]; then
+          narrow_python_only="true"
+        fi
+        echo "narrow_python_only=${narrow_python_only}" >> "$GITHUB_OUTPUT"
+        echo "path-filter: narrow_python_only=${narrow_python_only}"
+        echo "| \`narrow_python_only\` | \`${narrow_python_only}\` |" >> "$filter_summary"
+
+        # Documentation: docs tree + any md/rst at any depth + demos + notebooks.
+        emit docs \
+          '^docs/' \
+          '\.md$' \
+          '\.rst$' \
+          '^demos/' \
+          '^notebooks/'
+
+        cat "$filter_summary" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Detect docs-only change on tip
+      id: docs_only_latest
+      run: |
+        # Only apply the latest-commit docs-only optimization on push.
+        # PR runs already have path-filter gating and should not infer commit ancestry from merge refs.
+        docs_only=false
+
+        if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+          base_ref="${{ github.event.before }}"
+          if [[ -z "$base_ref" ]]; then
+            base_ref=$(git rev-parse HEAD^ 2>/dev/null || true)
+          fi
+
+          changed_files=""
+          if [[ -n "${base_ref:-}" ]]; then
+            changed_files=$(git diff --name-only "$base_ref" HEAD 2>/dev/null || true)
+          fi
+
+          if [[ -n "$changed_files" ]]; then
+            docs_only=true
+            for f in $changed_files; do
+              if [[ "$f" == "README.md" || "$f" == "CHANGELOG.md" || "$f" == docs/* || "$f" == demos/* || "$f" == notebooks/* || "$f" == *.md || "$f" == *.rst ]]; then
+                continue
+              else
+                docs_only=false
+                break
+              fi
+            done
+          else
+            echo "Could not determine latest-commit diff; conservatively disabling docs-only skip."
+          fi
+        fi
+
+        echo "docs_only_latest=${docs_only}" >> "$GITHUB_OUTPUT"
+
+  no-plans-in-repo:
+    # Reject PRs that add or modify files under plans/ (gitignored working directory).
+    # Uses the PR head ref (not merge ref) to avoid false positives from
+    # plans/ files that already exist on the base branch.
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Reject plans/ files added by this PR
+      env:
+        BASE_REF: ${{ github.base_ref }}
+      run: |
+        merge_base=$(git merge-base "origin/${BASE_REF}" HEAD)
+        plans_files=$(git diff --name-only --diff-filter=ACMR "$merge_base"..HEAD -- 'plans/' || true)
+        if [ -n "$plans_files" ]; then
+          echo "::error::PR adds or modifies files under plans/ which is gitignored and must not be committed:"
+          echo "$plans_files"
+          exit 1
+        fi
+
+  schema-artifacts:
+    needs: changes
+    if: ${{ (needs.changes.outputs.python == 'true' && needs.changes.outputs.narrow_python_only != 'true') || needs.changes.outputs.schema_lane == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Install package
+      run: python -m pip install -e .
+    - name: Check schema artifacts
+      run: python -m graphistry.devschemas.export --check
+
+  generate-lockfiles:
+    needs: changes
+    if: ${{ needs.changes.outputs.python == 'true' || needs.changes.outputs.ai == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Cache lockfiles
+      id: lockfile-cache
+      uses: actions/cache@v4
+      with:
+        path: requirements/*.lock
+        key: lockfiles-cd${{ inputs.cooldown_days || '6' }}-${{ hashFiles('setup.py', 'pyproject.toml', 'requirements/*.txt', 'requirements/*.in', 'bin/generate-lockfiles.sh') }}
+    - name: Install uv
+      if: steps.lockfile-cache.outputs.cache-hit != 'true'
+      run: pip install "uv==0.11.3"  # pinned version; bump periodically
+    - name: Generate lockfiles
+      if: steps.lockfile-cache.outputs.cache-hit != 'true'
+      env:
+        COOLDOWN_DAYS: ${{ inputs.cooldown_days || '6' }}
+      run: |
+        if ! [[ "${COOLDOWN_DAYS}" =~ ^[0-9]+$ ]]; then
+          echo "::error::cooldown_days must be a non-negative integer"
+          exit 1
+        fi
+        ./bin/generate-lockfiles.sh
+    - name: Upload lockfiles
+      uses: actions/upload-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements/*.lock
+        retention-days: 1
+
+  check-rtd-lockfile:
+    needs: changes
+    if: ${{ (needs.changes.outputs.docs == 'true' && needs.changes.outputs.narrow_python_only != 'true') || (needs.changes.outputs.python == 'true' && needs.changes.outputs.narrow_python_only != 'true') || needs.changes.outputs.docs_test == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Install uv
+      run: pip install "uv==0.11.3"  # keep in sync with RTD install and generate-lockfiles
+    - name: Verify committed RTD lockfile
+      run: |
+        set -euo pipefail
+        exclude_newer=$(sed -n 's/.*--exclude-newer \([^ ]*\).*/\1/p' requirements/rtd-py3.12.lock | head -n 1)
+        if [ -z "${exclude_newer}" ]; then
+          echo "::error::requirements/rtd-py3.12.lock is missing an --exclude-newer timestamp in its generated header"
+          exit 1
+        fi
+
+        EXCLUDE_NEWER="${exclude_newer}" PROFILES=rtd VERSIONS=3.12 ./bin/generate-lockfiles.sh
+
+        if ! git diff --exit-code -- requirements/rtd-py3.12.lock; then
+          echo "::error::requirements/rtd-py3.12.lock is stale. Regenerate with: PROFILES=rtd VERSIONS=3.12 ./bin/generate-lockfiles.sh"
+          exit 1
+        fi
+
+  check-spark-lockfile:
+    needs: changes
+    if: ${{ needs.changes.outputs.spark == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Install uv
+      run: pip install "uv==0.11.3"  # keep in sync with generate-lockfiles
+    - name: Verify committed Spark lockfile
+      run: |
+        set -euo pipefail
+        exclude_newer=$(sed -n 's/.*--exclude-newer \([^ ]*\).*/\1/p' requirements/spark-py3.14.lock | head -n 1)
+        if [ -z "${exclude_newer}" ]; then
+          echo "::error::requirements/spark-py3.14.lock is missing an --exclude-newer timestamp in its generated header"
+          exit 1
+        fi
+
+        EXCLUDE_NEWER="${exclude_newer}" PROFILES=spark VERSIONS=3.14 ./bin/generate-lockfiles.sh
+
+        if ! git diff --exit-code -- requirements/spark-py3.14.lock; then
+          echo "::error::requirements/spark-py3.14.lock is stale. Regenerate with: PROFILES=spark VERSIONS=3.14 ./bin/generate-lockfiles.sh"
+          exit 1
+        fi
+
+  tck-gfql:
+    needs: [changes, test-minimal-python, generate-lockfiles]
+    if: ${{ (needs.changes.outputs.gfql == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Install dependencies
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        uv pip install --require-hashes -r requirements/tck-py3.12.lock
+        uv pip install -e . --no-deps
+
+    - name: Resolve tck-gfql ref
+      id: tck_gfql
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        HEAD_REF: ${{ github.head_ref }}
+        REF_NAME: ${{ github.ref_name }}
+      run: |
+        tck_repo="https://github.com/graphistry/tck-gfql.git"
+        candidate_ref="main"
+
+        if [[ "${EVENT_NAME}" == "pull_request" && -n "${HEAD_REF}" ]]; then
+          candidate_ref="${HEAD_REF}"
+        elif [[ -n "${REF_NAME}" ]]; then
+          candidate_ref="${REF_NAME}"
+        fi
+
+        tck_ref="main"
+        if git ls-remote --exit-code --heads "${tck_repo}" "${candidate_ref}" >/dev/null 2>&1; then
+          tck_ref="${candidate_ref}"
+        fi
+
+        tck_sha=$(git ls-remote --exit-code --heads "${tck_repo}" "${tck_ref}" | awk '{print $1}')
+        if [[ -z "${tck_sha}" ]]; then
+          echo "Failed to resolve sha for tck-gfql ref: ${tck_ref}" >&2
+          exit 1
+        fi
+
+        echo "repo=${tck_repo}" >> "$GITHUB_OUTPUT"
+        echo "ref=${tck_ref}" >> "$GITHUB_OUTPUT"
+        echo "sha=${tck_sha}" >> "$GITHUB_OUTPUT"
+        echo "Using tck-gfql ref: ${tck_ref}"
+        echo "Using tck-gfql sha: ${tck_sha}"
+
+    - name: Run tck-gfql
+      run: |
+        source pygraphistry/bin/activate
+        git init tck-gfql
+        cd tck-gfql
+        git remote add origin "${{ steps.tck_gfql.outputs.repo }}"
+        git fetch --depth 1 origin "${{ steps.tck_gfql.outputs.sha }}"
+        git checkout --detach FETCH_HEAD
+        echo "### tck-gfql conformance report" >> "$GITHUB_STEP_SUMMARY"
+        echo "- tck-gfql ref: \`${{ steps.tck_gfql.outputs.ref }}\`" >> "$GITHUB_STEP_SUMMARY"
+        echo "- tck-gfql sha: \`${{ steps.tck_gfql.outputs.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+        PYGRAPHISTRY_PATH="${{ github.workspace }}" PYGRAPHISTRY_INSTALL=1 ./bin/ci.sh
+
+  gfql-benchmarks:
+    needs: [changes, generate-lockfiles]
+    if: ${{ (needs.changes.outputs.gfql == 'true' || needs.changes.outputs.benchmarks == 'true' || github.event_name == 'workflow_dispatch') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install dependencies
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        uv pip install --require-hashes -r requirements/test-py3.12.lock
+        uv pip install -e . --no-deps
+
+    - name: Run GFQL benchmarks (small)
+      run: |
+        source pygraphistry/bin/activate
+        if [[ ! -f graphistry/compute/gfql/df_executor.py ]]; then
+          echo "df_executor missing; skipping benchmarks." >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        python benchmarks/gfql/chain_vs_samepath.py \
+          --runs 1 \
+          --warmup 0 \
+          --max-scenario-seconds 10 \
+          --graph-filter tiny,small \
+          --scenario-filter 1hop_simple,2hop_where_nonadj_eq_lowcard,2hop_where_nonadj_multi_eq \
+          --output gfql-bench.md
+        cat gfql-bench.md
+        cat gfql-bench.md >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload benchmark artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: gfql-benchmarks
+        path: gfql-bench.md
+
+  python-lint-types:
+    needs: [changes, generate-lockfiles]
+    # Run if Python files changed OR infrastructure changed OR manual/scheduled run
+    if: ${{ (needs.changes.outputs.python == 'true' || needs.changes.outputs.ai == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    
+    strategy:
+      matrix:
+        python-version: [3.8, 3.9, '3.10', 3.11, 3.12, '3.13', '3.14']  # Run lint/types on all versions
+    
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        uv pip install --require-hashes -r requirements/test-py${{ matrix.python-version }}.lock
+        uv pip install -e . --no-deps
+
+    - name: Lint
+      run: |
+        source pygraphistry/bin/activate
+        ./bin/lint.sh
+
+    - name: Type check
+      run: |
+        source pygraphistry/bin/activate
+        ./bin/typecheck.sh
+
+  python-pyright:
+    name: python-pyright (py3.12)
+    needs: [changes, generate-lockfiles]
+    # One python version on purpose: the rules this gate ratchets are decided by the
+    # source alone, so all seven matrix cells would produce byte-identical output.
+    if: ${{ (needs.changes.outputs.python == 'true' || needs.changes.outputs.ai == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install dependencies
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        uv pip install --require-hashes -r requirements/test-py3.12.lock
+        uv pip install -e . --no-deps
+
+    - name: Pyright ratchet
+      run: |
+        source pygraphistry/bin/activate
+        ./bin/ci/ci_pyright_guard.py
+
+  cypher-frontend-strict-typing:
+    name: cypher-frontend-strict-typing (py3.12)
+    needs: [changes, generate-lockfiles]
+    if: ${{ (needs.changes.outputs.cypher_frontend_ci == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install dependencies
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        uv pip install --require-hashes -r requirements/test-py3.12.lock
+        uv pip install -e . --no-deps
+
+    - name: Cypher frontend strict typing gate (binder + IR)
+      run: |
+        source pygraphistry/bin/activate
+        targets=()
+        for f in graphistry/compute/gfql/ir/*.py; do
+          if [[ -f "$f" ]]; then
+            targets+=("$f")
+          fi
+        done
+        if [[ -f graphistry/compute/gfql/frontends/cypher/binder.py ]]; then
+          targets+=(graphistry/compute/gfql/frontends/cypher/binder.py)
+        fi
+        if [[ ${#targets[@]} -eq 0 ]]; then
+          echo "No binder/IR strict typing targets present on this branch; skipping."
+          exit 0
+        fi
+        printf 'Strict typing targets:\n- %s\n' "${targets[@]}"
+        mypy --strict --follow-imports=skip "${targets[@]}"
+
+  cypher-frontend-differential-parity:
+    name: cypher-frontend-differential-parity (py3.12)
+    needs: [changes, generate-lockfiles]
+    if: ${{ (needs.changes.outputs.cypher_frontend_ci == 'true' || needs.changes.outputs.gfql == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install dependencies
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        uv pip install --require-hashes -r requirements/test-py3.12.lock
+        uv pip install -e . --no-deps
+
+    - name: Differential/parity gate tests
+      run: |
+        source pygraphistry/bin/activate
+        parity_tests=()
+        for pattern in \
+          tests/gfql/ref/test_m1_*.py \
+          tests/gfql/ref/test_differential*.py \
+          graphistry/tests/compute/gfql/cypher/test_m1_*.py \
+          graphistry/tests/compute/gfql/cypher/test_differential*.py; do
+          for f in $pattern; do
+            if [[ -f "$f" ]]; then
+              parity_tests+=("$f")
+            fi
+          done
+        done
+        if [[ ${#parity_tests[@]} -eq 0 ]]; then
+          parity_tests=("tests/gfql/ref/test_enumerator_parity.py")
+        fi
+        printf 'Differential/parity tests:\n- %s\n' "${parity_tests[@]}"
+        python -B -m pytest -vv -n auto "${parity_tests[@]}"
+
+  gpu-gate-audit:
+    # Ungated: a guard against a silent coverage gap must not itself be conditionally
+    # silent, and the path filters do not cover every file it cross-checks.
+    name: gpu-gate-audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Audit cuDF test gates and the CI coverage they lack
+      run: |
+        python bin/ci/ci_gpu_gate_audit.py
+
+  cypher-frontend-surface-guard:
+    name: cypher-frontend-surface-guard
+    needs: [changes]
+    if: ${{ (needs.changes.outputs.cypher_frontend_ci == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+    - name: Cypher surface growth guard
+      run: |
+        python bin/ci/ci_cypher_surface_guard.py
+
+  test-networkx-scipy-policy:
+    name: test-networkx-scipy-policy (${{ matrix.label }}, py${{ matrix.python-version }})
+    needs: [changes, generate-lockfiles]
+    if: ${{ ((needs.changes.outputs.python == 'true' && needs.changes.outputs.narrow_python_only != 'true') || needs.changes.outputs.networkx == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: nx-lower-no-scipy
+            python-version: '3.8'
+            lock-profile: test-networkx-policy-lower-no-scipy
+          - label: nx-lower-scipy
+            python-version: '3.8'
+            lock-profile: test-networkx-policy-lower-scipy
+          - label: nx-upper-scipy
+            python-version: '3.12'
+            lock-profile: test-networkx-policy-upper-scipy
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install NetworkX policy dependencies
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        uv pip install --require-hashes -r requirements/${{ matrix.lock-profile }}-py${{ matrix.python-version }}.lock
+        uv pip install -e . --no-deps
+        python - <<'PY'
+        import importlib.util
+        import networkx
+        print("networkx:", networkx.__version__)
+        if importlib.util.find_spec("scipy") is None:
+            print("scipy: not installed")
+        else:
+            import scipy
+            print("scipy:", scipy.__version__)
+        PY
+
+    - name: Run NetworkX CALL policy tests
+      run: |
+        source pygraphistry/bin/activate
+        python -B -m pytest -q graphistry/tests/compute/gfql/cypher/test_lowering.py -k 'networkx'
+        python -B -m pytest -q graphistry/tests/plugins/test_networkx.py
+
+  test-minimal-python:
+    # Lite sentinel: oldest + newest Python only, heavy test files excluded. Gates all downstream.
+    # Non-GFQL deferred files run in test-minimal-python-rest; GFQL-heavy files run in test-gfql-core.
+    needs: [changes, python-lint-types, generate-lockfiles]
+    # Run if Python files changed OR infrastructure changed OR manual/scheduled run
+    if: ${{ (needs.changes.outputs.python == 'true' || needs.changes.outputs.ai == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    strategy:
+      matrix:
+        python-version: [3.8, '3.14']
+
+    steps:
+
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install test dependencies
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        uv pip install --require-hashes -r requirements/test-py${{ matrix.python-version }}.lock
+        uv pip install -e . --no-deps
+
+    - name: Test pip install (Docker)
+      env:
+        PYTHON_VERSION: ${{ matrix.python-version }}
+      run: |
+        ./docker/test-pip-install.sh
+
+    - name: Minimal lite tests (fast sentinel gate)
+      run: |
+        source pygraphistry/bin/activate
+        ./bin/test-minimal-lite.sh -n auto
+
+  cypher-frontend-ci-gates:
+    name: cypher-frontend-ci-gates
+    # Keep cypher frontend gates chained to strict typing + differential/parity
+    # + surface guard + full-suite sentinel.
+    needs: [changes, test-minimal-python, cypher-frontend-strict-typing, cypher-frontend-differential-parity, cypher-frontend-surface-guard]
+    if: ${{ (needs.changes.outputs.cypher_frontend_ci == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+    - name: Report cypher frontend gate status
+      run: |
+        echo "Cypher frontend gates passed:"
+        echo "- cypher-frontend-strict-typing (py3.12)"
+        echo "- cypher-frontend-differential-parity (py3.12)"
+        echo "- cypher-frontend-surface-guard"
+        echo "- test-minimal-python (lite sentinel gate)"
+
+
+  test-minimal-python-rest:
+    # Middle versions (3.9-3.13) + non-GFQL deferred files.
+    needs: [changes, test-minimal-python, generate-lockfiles]
+    if: ${{ ((needs.changes.outputs.python == 'true' && needs.changes.outputs.narrow_python_only != 'true') || needs.changes.outputs.core == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    strategy:
+      matrix:
+        python-version: [3.9, '3.10', 3.11, 3.12, '3.13']
+
+    steps:
+
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install test dependencies
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        uv pip install --require-hashes -r requirements/test-py${{ matrix.python-version }}.lock
+        uv pip install -e . --no-deps
+
+    - name: Test pip install (Docker)
+      env:
+        PYTHON_VERSION: ${{ matrix.python-version }}
+      run: |
+        ./docker/test-pip-install.sh
+
+    - name: Minimal rest tests (middle versions and non-GFQL deferred files)
+      run: |
+        source pygraphistry/bin/activate
+        ./bin/test-minimal.sh -n auto
+
+
+  # GFQL-heavy tests split out of the minimal gate to reduce critical path.
+  # Runs in parallel with downstream jobs instead of blocking them.
+  # test-polars (gated on test-minimal-python) and gfql-routes-off (gated on python-lint-types)
+  # no longer wait on this lane, which kept it off their critical path (#2042).
+  test-gfql-core:
+    needs: [changes, python-lint-types, generate-lockfiles]
+    if: ${{ ((needs.changes.outputs.python == 'true' && needs.changes.outputs.narrow_python_only != 'true') || needs.changes.outputs.gfql == 'true' || needs.changes.outputs.schema_lane == 'true' || needs.changes.outputs.pandas_compat == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ai == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    strategy:
+      matrix:
+        python-version: ['3.12', '3.14']
+
+    steps:
+
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install test dependencies
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        uv pip install --require-hashes -r requirements/test-py${{ matrix.python-version }}.lock
+        uv pip install -e . --no-deps
+
+    - name: GFQL core tests with coverage audit
+      if: ${{ matrix.python-version == '3.12' }}
+      run: |
+        source pygraphistry/bin/activate
+        mkdir -p build/gfql-coverage-audit
+        COVERAGE_FILE=build/gfql-coverage-audit/coverage.gfql-py3.12 python -B -m pytest -vv -n auto \
+          --cov=graphistry/compute \
+          --cov-report= \
+          graphistry/tests/benchmarks/gfql \
+          graphistry/tests/compute/test_ast.py \
+          graphistry/tests/compute/test_chain.py \
+          graphistry/tests/compute/test_chain_let.py \
+          graphistry/tests/compute/test_chain_concat.py \
+          graphistry/tests/compute/test_dataframe_primitives.py \
+          graphistry/tests/compute/test_gfql.py \
+          graphistry/tests/compute/test_gfql_call_validation.py \
+          graphistry/tests/compute/test_gfql_exceptions.py \
+          graphistry/tests/compute/test_gfql_hypergraph.py \
+          graphistry/tests/compute/test_gfql_validate_only.py \
+          graphistry/tests/compute/test_gfql_validation.py \
+          graphistry/tests/compute/test_hop.py \
+          graphistry/tests/compute/gfql \
+          graphistry/tests/test_gfql_remote_metadata.py \
+          graphistry/tests/test_gfql_remote_persistence.py \
+          tests/gfql/ref
+        python bin/ci/coverage_audit.py \
+          --profile gfql \
+          --skip-tests \
+          --engine-label ci-pandas-py3.12 \
+          --output-dir build/gfql-coverage-audit \
+          --data-file build/gfql-coverage-audit/coverage.gfql-py3.12 \
+          --baseline-file graphistry/tests/compute/gfql/coverage_baselines/ci-pandas-py3.12.json
+        cat build/gfql-coverage-audit/gfql-coverage-audit.md >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload GFQL coverage audit
+      if: ${{ always() && matrix.python-version == '3.12' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: gfql-coverage-audit-py3.12
+        path: build/gfql-coverage-audit/
+        retention-days: 14
+
+    - name: GFQL core tests
+      if: ${{ matrix.python-version != '3.12' }}
+      run: |
+        source pygraphistry/bin/activate
+        python -B -m pytest -vv -n auto \
+          graphistry/tests/compute/test_ast.py \
+          graphistry/tests/compute/test_chain.py \
+          graphistry/tests/compute/test_chain_let.py \
+          graphistry/tests/compute/test_chain_concat.py \
+          graphistry/tests/compute/test_dataframe_primitives.py \
+          graphistry/tests/benchmarks/gfql \
+          graphistry/tests/compute/test_gfql.py \
+          graphistry/tests/compute/test_gfql_call_validation.py \
+          graphistry/tests/compute/test_gfql_exceptions.py \
+          graphistry/tests/compute/test_gfql_hypergraph.py \
+          graphistry/tests/compute/test_gfql_validate_only.py \
+          graphistry/tests/compute/test_gfql_validation.py \
+          graphistry/tests/compute/test_hop.py \
+          graphistry/tests/compute/gfql \
+          graphistry/tests/test_gfql_remote_metadata.py \
+          graphistry/tests/test_gfql_remote_persistence.py \
+          tests/gfql/ref
+
+    - name: T5 rollout gate — execution-path canary (env=true)
+      # Default-loose path is exercised by the env-unset run above (T5 #1311).
+      # This step asserts the env-on canary path for rollout helper behavior.
+      env:
+        GRAPHISTRY_GFQL_STRICT_SCHEMA: "true"
+      run: |
+        source pygraphistry/bin/activate
+        python -B -m pytest -vv graphistry/tests/compute/gfql/test_rollout.py
+
+  changed-line-coverage:
+    # PR hygiene only: combine coverage collected by existing CPU test jobs and
+    # gate executable package lines touched by this PR. Historical uncovered
+    # lines outside the diff are intentionally ignored.
+    needs: [changes, test-core-python, test-gfql-core, test-polars, generate-lockfiles]
+    if: ${{ github.event_name == 'pull_request' && ((needs.changes.outputs.python == 'true' && needs.changes.outputs.narrow_python_only != 'true') || needs.changes.outputs.gfql == 'true' || needs.changes.outputs.schema_lane == 'true' || needs.changes.outputs.pandas_compat == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.infra == 'true') && !(needs.changes.outputs.docs_only_latest == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+        fetch-depth: 0
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install coverage tooling
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        uv pip install --require-hashes -r requirements/test-py3.12.lock
+
+    - name: Download core coverage data
+      uses: actions/download-artifact@v4
+      with:
+        name: python-coverage-core-py3.14
+        path: build/changed-line-coverage/artifacts/core
+
+    - name: Download GFQL coverage data
+      uses: actions/download-artifact@v4
+      with:
+        name: gfql-coverage-audit-py3.12
+        path: build/changed-line-coverage/artifacts/gfql
+
+    - name: Download Polars coverage data
+      uses: actions/download-artifact@v4
+      with:
+        name: polars-coverage-py3.12
+        path: build/changed-line-coverage/artifacts/polars
+
+    - name: Changed-line coverage gate
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        source pygraphistry/bin/activate
+        mkdir -p build/changed-line-coverage
+        python -m coverage combine \
+          --data-file=build/changed-line-coverage/combined.coverage \
+          build/changed-line-coverage/artifacts/core/coverage.core-py3.14 \
+          build/changed-line-coverage/artifacts/gfql/coverage.gfql-py3.12 \
+          build/changed-line-coverage/artifacts/polars/coverage.polars-py3.12
+        python bin/ci/changed_line_coverage.py \
+          --data-file build/changed-line-coverage/combined.coverage \
+          --base-ref "$BASE_SHA" \
+          --head-ref "$HEAD_SHA" \
+          --min-percent 80 \
+          --output-dir build/changed-line-coverage
+        cat build/changed-line-coverage/changed-line-coverage.md >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload changed-line coverage report
+      uses: actions/upload-artifact@v4
+      with:
+        name: changed-line-coverage-pr
+        path: |
+          build/changed-line-coverage/changed-line-coverage.md
+          build/changed-line-coverage/changed-line-coverage.json
+        retention-days: 14
+
+  test-pandas-compat:
+    name: test-pandas-compat (${{ matrix.label }}, py${{ matrix.python-version }})
+    needs: [changes, test-minimal-python, generate-lockfiles]
+    # Run if Python files changed OR infrastructure changed OR manual/scheduled run
+    if: ${{ ((needs.changes.outputs.python == 'true' && needs.changes.outputs.narrow_python_only != 'true') || needs.changes.outputs.pandas_compat == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    strategy:
+      matrix:
+        include:
+          - python-version: '3.9'    # oldest Python supporting pandas 2.2.3 (>=3.9); lockfile: test-compat-legacy
+            label: 'legacy'
+          - python-version: '3.13'   # RAPIDS 26.02: pandas 2.3.3 + py3.13; lockfile: test-compat-rapids-aligned
+            label: 'rapids-aligned'
+          - python-version: '3.14'   # latest pandas 3.x; lockfile: test-compat-latest
+            label: 'latest'
+
+    steps:
+
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install test dependencies
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        uv pip install --require-hashes -r requirements/test-compat-${{ matrix.label }}-py${{ matrix.python-version }}.lock
+        uv pip install -e . --no-deps
+
+    - name: Pandas compatibility tests
+      run: |
+        source pygraphistry/bin/activate
+        python -B -m pytest -vv -n auto \
+          graphistry/tests/test_plotter.py \
+          graphistry/tests/test_compute_chain.py \
+          graphistry/tests/test_hypergraph.py \
+          graphistry/tests/test_compute_hops.py \
+          graphistry/tests/test_compute_collapse.py \
+          graphistry/tests/test_compute_filter_by_dict.py \
+          graphistry/tests/test_bolt_util.py \
+          graphistry/tests/test_nodexl.py
+
+
+  test-pandas-compat-gfql:
+    name: test-pandas-compat-gfql (${{ matrix.label }}, py${{ matrix.python-version }})
+    needs: [changes, test-minimal-python, generate-lockfiles]
+    # Run if Python files changed OR infrastructure changed OR manual/scheduled run
+    if: ${{ ((needs.changes.outputs.python == 'true' && needs.changes.outputs.narrow_python_only != 'true') || needs.changes.outputs.pandas_compat == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    strategy:
+      matrix:
+        include:
+          - python-version: '3.9'    # pandas 2.2.3 — oldest; lockfile: test-compat-gfql-legacy
+            label: 'legacy'
+          # rapids-aligned (pandas 2.3.3 / py3.13) is SKIPPED — test-gfql-core resolves ~2.3.x already
+          - python-version: '3.14'   # pandas >=3.x — latest; lockfile: test-compat-gfql-latest
+            label: 'latest'
+
+    steps:
+
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install test dependencies
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        uv pip install --require-hashes -r requirements/test-compat-gfql-${{ matrix.label }}-py${{ matrix.python-version }}.lock
+        uv pip install -e . --no-deps
+
+    - name: GFQL pandas compat tests
+      run: |
+        source pygraphistry/bin/activate
+        python -B -m pytest -vv -n auto \
+          graphistry/tests/compute/gfql/cypher/test_lowering.py \
+          graphistry/tests/compute/gfql/cypher/test_parser.py \
+          graphistry/tests/compute/gfql/test_row_pipeline_ops.py \
+          graphistry/tests/compute/gfql/test_schema_changers.py \
+          graphistry/tests/compute/gfql/test_let_schema_changers.py \
+          graphistry/tests/compute/gfql/test_rollout.py \
+          graphistry/tests/compute/test_hop.py \
+          graphistry/tests/compute/test_chain.py \
+          graphistry/tests/compute/test_chain_let.py \
+          graphistry/tests/compute/test_chain_concat.py \
+          graphistry/tests/compute/test_dataframe_primitives.py \
+          tests/gfql/ref/
+
+    - name: T5 rollout gate — execution-path canary (env=true)
+      # Default-loose path is exercised by the env-unset run above (T5 #1311).
+      # This step asserts the env-on canary path for rollout helper behavior
+      # on the pandas-compat matrix.
+      env:
+        GRAPHISTRY_GFQL_STRICT_SCHEMA: "true"
+      run: |
+        source pygraphistry/bin/activate
+        python -B -m pytest -vv graphistry/tests/compute/gfql/test_rollout.py
+
+
+  test-core-python:
+    needs: [changes, test-minimal-python, generate-lockfiles]
+    if: ${{ ((needs.changes.outputs.python == 'true' && needs.changes.outputs.narrow_python_only != 'true') || needs.changes.outputs.gfql == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+
+    strategy:
+      matrix:
+        python-version: [3.8, 3.9, '3.10', 3.11, 3.12, '3.13', '3.14']
+
+    steps:
+
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install test dependencies
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        uv pip install --require-hashes -r requirements/test-core-py${{ matrix.python-version }}.lock
+        uv pip install -e . --no-deps
+
+    - name: Core tests
+      if: ${{ matrix.python-version != '3.14' }}
+      run: |
+        source pygraphistry/bin/activate
+        # GFQL core still runs this full-corpus parity test on 3.12/3.14 (3.12 with coverage).
+        ./bin/test.sh -n auto --ignore=graphistry/tests/compute/gfql/cypher/test_differential_grammar_parity.py
+
+    - name: Core tests with changed-line coverage
+      if: ${{ matrix.python-version == '3.14' }}
+      run: |
+        source pygraphistry/bin/activate
+        mkdir -p "$RUNNER_TEMP/changed-line-coverage"
+        COVERAGE_FILE="$RUNNER_TEMP/changed-line-coverage/coverage.core-py3.14" \
+          ./bin/test.sh -n auto --cov=graphistry --cov-report= \
+            --ignore=graphistry/tests/compute/gfql/cypher/test_differential_grammar_parity.py
+
+    - name: Upload core coverage data
+      if: ${{ matrix.python-version == '3.14' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: python-coverage-core-py3.14
+        path: ${{ runner.temp }}/changed-line-coverage/coverage.core-py3.14
+        retention-days: 14
+
+  test-graphviz:
+    needs: [changes, test-minimal-python, generate-lockfiles]
+    if: ${{ ((needs.changes.outputs.python == 'true' && needs.changes.outputs.narrow_python_only != 'true') || needs.changes.outputs.graphviz_lane == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10  # Accommodate retry logic: 3 attempts × 2min + 1.5min backoff/cleanup
+
+    strategy:
+      matrix:
+        python-version: [3.8, 3.9, '3.10', 3.11, 3.12, '3.13', '3.14']
+
+    steps:
+
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Install system dependencies
+      run: |
+        # Install graphviz system packages (typically fast: 10-30s)
+        sudo apt-get install -y graphviz graphviz-dev
+
+    - name: Install Python dependencies with retry
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+
+        # Retry uv install up to 3 times with exponential backoff
+        for attempt in 1 2 3; do
+          echo "==== Attempt $attempt of 3 ===="
+
+          if uv pip install --require-hashes -r requirements/test-graphviz-py${{ matrix.python-version }}.lock && uv pip install -e . --no-deps; then
+            echo "✅ Installation successful on attempt $attempt"
+            break
+          fi
+
+          if [ $attempt -lt 3 ]; then
+            wait_time=$((attempt * 30))
+            echo "⚠️ Installation failed, retrying in ${wait_time}s..."
+            uv cache clean || true
+            sleep $wait_time
+          else
+            echo "❌ Installation failed after 3 attempts"
+            exit 1
+          fi
+        done
+
+    - name: Graphviz tests
+      run: |
+        source pygraphistry/bin/activate
+        ./bin/test-graphviz.sh
+
+  gfql-route-manifest:
+    # One normal Polars-enabled pass records which tests actually call each route.
+    # Every replay compares its collection hash before deselecting unaffected tests.
+    needs: [changes, python-lint-types, generate-lockfiles]
+    if: ${{ needs.changes.outputs.gfql == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: 3.12
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Install Python dependencies
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        uv pip install --require-hashes -r requirements/test-polars-py3.12.lock
+        uv pip install -e . --no-deps
+
+    - name: Record normal route engagement
+      run: |
+        source pygraphistry/bin/activate
+        mkdir -p build/route-engagement/records
+        GFQL_ROUTE_RECORD_DIR=build/route-engagement/records python -m pytest -n 2 \
+          graphistry/tests/compute/test_chain.py \
+          graphistry/tests/compute/test_hop.py \
+          graphistry/tests/compute/test_gfql.py \
+          graphistry/tests/compute/gfql \
+          -q -p graphistry.tests.compute.gfql.routes.engagement_manifest \
+          -p no:cacheprovider -o addopts="" -rfE
+        python -m bin.ci.build_route_manifest \
+          build/route-engagement/records build/route-engagement/manifest.json --workers 2
+
+    - name: Upload route engagement manifest
+      uses: actions/upload-artifact@v4
+      with:
+        name: gfql-route-engagement
+        path: build/route-engagement/manifest.json
+        if-no-files-found: error
+
+  gfql-routes-off:
+    # Required replay: run the GFQL suites with one hot path declined per cell
+    # (GFQL_ROUTES_OFF); engagement pins are skipped via the route_engaged marker, so the
+    # uploaded lists hold route-vs-general result divergences only.
+    needs: [changes, python-lint-types, generate-lockfiles, gfql-route-manifest]
+    if: ${{ needs.changes.outputs.gfql == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [polars-point-rows, point-rows, native-fast, polars-single-node, polars-seeded, polars-plain, index-hop, indexed-kernel, polars-bindings-select, cypher-fast, cross-alias-or, binding-limit, all-off]
+
+    steps:
+
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: 3.12
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Download route engagement manifest
+      uses: actions/download-artifact@v4
+      with:
+        name: gfql-route-engagement
+        path: build/route-engagement
+
+    - name: Install Python dependencies
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        uv pip install --require-hashes -r requirements/test-polars-py3.12.lock
+        uv pip install -e . --no-deps
+
+    - name: Routes-off replay (${{ matrix.mode }})
+      run: |
+        source pygraphistry/bin/activate
+        GFQL_ROUTE_SELECT_MANIFEST=build/route-engagement/manifest.json ROUTES_XDIST=2 MODES=${{ matrix.mode }} ./bin/test-routes-off.sh
+        echo "## routes-off: ${{ matrix.mode }}" >> "$GITHUB_STEP_SUMMARY"
+        sed 's/^/- /' build/routes-off/${{ matrix.mode }}.divergences >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload ledger
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: routes-off-${{ matrix.mode }}
+        path: build/routes-off/
+        if-no-files-found: ignore
+
+  test-polars:
+    needs: [changes, test-minimal-python, generate-lockfiles]
+    if: ${{ ((needs.changes.outputs.python == 'true' && needs.changes.outputs.narrow_python_only != 'true') || needs.changes.outputs.gfql == 'true' || needs.changes.outputs.pandas_compat == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    # The py3.12 coverage cell can exceed 20 minutes including setup,
+    # two test phases, and coverage artifact work.
+    timeout-minutes: 30
+
+    strategy:
+      matrix:
+        python-version: [3.9, '3.10', 3.11, 3.12, '3.13', '3.14']
+
+    steps:
+
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Install Python dependencies
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        uv pip install --require-hashes -r requirements/test-polars-py${{ matrix.python-version }}.lock
+        uv pip install -e . --no-deps
+
+    - name: Polars tests
+      if: ${{ matrix.python-version != '3.12' }}
+      run: |
+        source pygraphistry/bin/activate
+        ./bin/test-polars.sh
+
+    - name: Polars tests with coverage
+      if: ${{ matrix.python-version == '3.12' }}
+      run: |
+        source pygraphistry/bin/activate
+        mkdir -p build/polars-coverage
+        COVERAGE_FILE=build/polars-coverage/coverage.polars-py3.12 POLARS_COV=1 ./bin/test-polars.sh
+
+    - name: Polars GFQL coverage audit (per-file floors)
+      if: ${{ matrix.python-version == '3.12' }}
+      run: |
+        source pygraphistry/bin/activate
+        python bin/ci/coverage_audit.py \
+          --profile gfql-polars \
+          --skip-tests \
+          --engine-label ci-polars-py3.12 \
+          --output-dir build/polars-coverage-audit \
+          --data-file build/polars-coverage/coverage.polars-py3.12 \
+          --baseline-file graphistry/tests/compute/gfql/coverage_baselines/ci-polars-py3.12.json
+        cat build/polars-coverage-audit/gfql-polars-coverage-audit.md | tee -a "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload polars coverage
+      if: ${{ matrix.python-version == '3.12' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: polars-coverage-py3.12
+        path: build/polars-coverage/
+        retention-days: 14
+
+  test-core-umap:
+    needs: [changes, test-minimal-python, test-gfql-core, generate-lockfiles]
+    if: ${{ success() && (needs.changes.outputs.ai == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    strategy:
+      matrix:
+        # RAPIDS (umap-learn/numba) lacks Python 3.14 wheels as of 2025-11, so keep <=3.13 here
+        python-version: [3.9, '3.10', 3.11, 3.12, '3.13']
+
+    steps:
+
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Set Python dependency env
+      run: |
+        echo "PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu" >> "$GITHUB_ENV"
+        echo "PIP_PREFER_BINARY=1" >> "$GITHUB_ENV"
+
+    - name: Install test dependencies
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        uv pip install -r requirements/test-umap-py${{ matrix.python-version }}.lock
+        # Keep pip for torch +cpu from the PyTorch CPU wheel index: uv cannot resolve this local-version pin.
+        python -m pip install --no-deps torch==2.8.0+cpu -f https://download.pytorch.org/whl/cpu
+        uv pip install -e . --no-deps
+
+    - name: Core feature tests (weak featurize)
+      run: |
+        source pygraphistry/bin/activate
+        ./bin/test-features.sh
+
+    - name: Core umap tests (weak featurize)
+      run: |
+        source pygraphistry/bin/activate
+        ./bin/test-umap-learn-core.sh
+
+  test-full-ai:
+    needs: [changes, test-minimal-python, test-gfql-core, generate-lockfiles]
+    if: ${{ success() && (needs.changes.outputs.ai == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    strategy:
+      matrix:
+        # RAPIDS stack not available on Python 3.14 yet
+        python-version: [3.9, '3.10', 3.11, 3.12, '3.13']
+        #include:
+        #  - python-version: 3.12
+        #    continue-on-error: true
+
+    steps:
+
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Derive HF cache key
+      id: hf-cache-key
+      run: |
+        key_output="$(python bin/ci/ci-hf-cache-key.py requirements/test-ai-py${{ matrix.python-version }}.lock)"
+        printf '%s\n' "$key_output"
+        printf '%s\n' "$key_output" >> "$GITHUB_OUTPUT"
+
+    - name: Set HF cache env
+      run: |
+        echo "HF_HOME=${RUNNER_TEMP}/hf-cache" >> "$GITHUB_ENV"
+        echo "HF_HUB_CACHE=${RUNNER_TEMP}/hf-cache" >> "$GITHUB_ENV"
+        echo "PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu" >> "$GITHUB_ENV"
+        echo "PIP_PREFER_BINARY=1" >> "$GITHUB_ENV"
+
+    - name: Prepare HF cache directory
+      run: |
+        mkdir -p "${HF_HOME}"
+
+    - name: Restore HF cache
+      id: hf-cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/hf-cache
+        key: hf-cache-${{ runner.os }}-models-v3-${{ steps.hf-cache-key.outputs.key }}
+
+    - name: Install test dependencies
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        uv pip install -r requirements/test-ai-py${{ matrix.python-version }}.lock
+        # Keep pip for torch +cpu from the PyTorch CPU wheel index: uv cannot resolve this local-version pin.
+        python -m pip install --no-deps torch==2.8.0+cpu -f https://download.pytorch.org/whl/cpu
+        uv pip install -e . --no-deps
+        echo "skrub: `pip show skrub | grep Version`"
+        echo "pandas: `pip show pandas | grep Version`"
+        echo "numpy: `pip show numpy | grep Version`"
+        echo "scikit-learn: `pip show scikit-learn | grep Version`"
+        echo "scipy: `pip show scipy | grep Version`"
+        echo "umap-learn: `pip show umap-learn | grep Version`"
+
+    - name: Warm HF cache (sentence-transformers)
+      id: warm-hf
+      if: steps['hf-cache'].outputs['cache-hit'] != 'true'
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        HUGGING_FACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
+      run: |
+        mkdir -p "${HF_HOME}"
+        source pygraphistry/bin/activate
+        # sentence-transformers already installed from lockfile
+        python - <<'PY'
+        import os
+        from pathlib import Path
+        from sentence_transformers import SentenceTransformer
+
+        models = [
+            "sentence-transformers/average_word_embeddings_komninos",
+            "sentence-transformers/paraphrase-MiniLM-L6-v2",
+            "sentence-transformers/paraphrase-albert-small-v2",
+        ]
+
+        cache_dir = os.environ["HF_HOME"]
+        status_file = Path(cache_dir) / ".hf_cache_warmed"
+        status_file.parent.mkdir(parents=True, exist_ok=True)
+
+        success = True
+        for model in models:
+            try:
+                SentenceTransformer(model, cache_folder=cache_dir)
+            except Exception as exc:  # pragma: no cover - logging only
+                success = False
+                print(f"⚠️ HF warm failed for {model}: {exc}")
+
+        status_file.write_text("ok\n" if success else "partial\n")
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+            fh.write(f"success={str(success).lower()}\n")
+
+        print(f"✅ HF cache warm {'succeeded' if success else 'partial/fail'} at {cache_dir}")
+        PY
+
+    - name: Enable HF offline for tests
+      run: |
+        cache_hit="${{ steps['hf-cache'].outputs['cache-hit'] }}"
+        warm_success="${{ steps['warm-hf'].outputs.success }}"
+        if [ "${cache_hit}" = "true" ] || [ "${warm_success}" = "true" ]; then
+          echo "HF_HUB_OFFLINE=1" >> "$GITHUB_ENV"
+          echo "TRANSFORMERS_OFFLINE=1" >> "$GITHUB_ENV"
+          echo "Using HF cache at ${HF_HOME} (cache-hit: ${cache_hit}, warm_success: ${warm_success})"
+        else
+          echo "::error::HF cache is unavailable and warmup did not succeed; refusing to run feature tests online."
+          exit 1
+        fi
+
+    - name: Verify HF offline cache
+      run: |
+        source pygraphistry/bin/activate
+        python - <<'PY'
+        import os
+        from sentence_transformers import SentenceTransformer
+
+        assert os.environ.get("HF_HUB_OFFLINE") == "1"
+        assert os.environ.get("TRANSFORMERS_OFFLINE") == "1"
+
+        cache_dir = os.environ["HF_HOME"]
+        models = [
+            "sentence-transformers/average_word_embeddings_komninos",
+            "sentence-transformers/paraphrase-MiniLM-L6-v2",
+            "sentence-transformers/paraphrase-albert-small-v2",
+        ]
+        for model in models:
+            SentenceTransformer(model, cache_folder=cache_dir, local_files_only=True)
+        print(f"Verified HF offline cache at {cache_dir}")
+        PY
+
+    - name: Full AI tests (rich featurize)
+      run: |
+        source pygraphistry/bin/activate
+        python -B -m pytest -vv -n auto \
+          --durations=50 \
+          graphistry/tests/test_compute_cluster.py \
+          graphistry/tests/test_feature_utils.py \
+          graphistry/tests/test_text_utils.py \
+          graphistry/tests/test_umap_utils.py
+
+  test-dgl-cpu:
+    needs: [changes, test-minimal-python]
+    if: ${{ ((needs.changes.outputs.python == 'true' && needs.changes.outputs.narrow_python_only != 'true') || needs.changes.outputs.ai == 'true' || needs.changes.outputs.dgl_lane == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+      PIP_PREFER_BINARY: "1"
+      DGLBACKEND: pytorch
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install DGL stack (CPU, legacy)
+      run: |
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip uv
+        cat <<'EOF' > /tmp/dgl-constraints.txt
+        torch==2.0.1
+        torchdata==0.6.1
+        dgl==2.1.0
+        sentence-transformers==5.1.2
+        faiss-cpu
+        EOF
+        uv pip install --constraint /tmp/dgl-constraints.txt torch==2.0.1 torchdata==0.6.1 dgl==2.1.0
+        uv pip install --constraint /tmp/dgl-constraints.txt -e .[test,testai,ai,dgl-cpu]
+
+    - name: Run DGL tests
+      env:
+        HF_HUB_OFFLINE: 1
+        HF_HOME: /tmp/hf-cache
+        HF_HUB_CACHE: /tmp/hf-cache
+      run: |
+        source pygraphistry/bin/activate
+        mkdir -p "${HF_HOME}"
+        ./bin/test-embed.sh
+        ./bin/test-dgl.sh
+
+
+  test-spark:
+    needs: [changes, test-minimal-python, test-gfql-core]
+    if: ${{ (needs.changes.outputs.spark == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+    - name: Set up Python 3.14
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.14'
+
+    - name: Set up Java 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+
+    - name: Restore uv cache (spark)
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/uv
+        key: uv-spark-${{ runner.os }}-py3.14-v3-${{ hashFiles('requirements/spark-py3.14.lock') }}
+        restore-keys: |
+          uv-spark-${{ runner.os }}-py3.14-v3-
+
+    - name: Install pyspark stack + graphistry
+      run: |
+        java -version
+        python -m venv pygraphistry
+        source pygraphistry/bin/activate
+        python -m pip install --upgrade pip "uv==0.11.3"
+        uv pip install --require-hashes -r requirements/spark-py3.14.lock
+        # Spark smoke tests do not require the full test extra toolchain.
+        # Install base graphistry deps, but skip heavy contributor-only [test] extras.
+        uv pip install -e . --no-deps
+
+    - name: Run Spark tests
+      run: |
+        source pygraphistry/bin/activate
+        python -B -m pytest graphistry/tests/compute/test_df_types.py -v -k spark
+
+
+  test-neo4j:
+    needs: [changes, test-minimal-python]
+    if: ${{ ((needs.changes.outputs.python == 'true' && needs.changes.outputs.narrow_python_only != 'true') || needs.changes.outputs.neo4j_lane == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    env:
+      COMPOSE_DOCKER_CLI_BUILD: 1
+      DOCKER_BUILDKIT: 1
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+
+    - name: Neo4j connector tests
+      run: |
+        cd docker && WITH_SUDO=" " ./test-cpu-local-neo4j-only.sh
+
+
+  test-build:
+    needs: [changes, test-minimal-python, generate-lockfiles]
+    if: ${{ ((needs.changes.outputs.python == 'true' && needs.changes.outputs.narrow_python_only != 'true') || needs.changes.outputs.build_package == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && !(needs.changes.outputs.docs_only_latest == 'true' && (github.event_name == 'push' || github.event_name == 'pull_request')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+
+
+    - name: Download lockfiles
+      uses: actions/download-artifact@v4
+      with:
+        name: lockfiles
+        path: requirements
+
+    - name: Set up Python 3.14
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.14'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip uv
+        UV_SYSTEM_PYTHON=1 uv pip install --require-hashes -r requirements/build-py3.14.lock
+        UV_SYSTEM_PYTHON=1 uv pip install -e . --no-deps
+
+    - name: Test building
+      run: |
+        ./bin/build.sh
+
+    - name: Validate py.typed in wheel
+      run: |
+        unzip -l dist/graphistry*.whl | grep -q "graphistry/py.typed" || (echo "ERROR: py.typed marker missing from wheel - users won't get type information" && exit 1)
+        echo "✅ py.typed marker confirmed in wheel distribution"
+
+
+  docs-latex-unicode-guard:
+    needs: [changes]
+    # Run if docs changed OR Python changed OR infrastructure changed OR manual/scheduled run
+    if: ${{ (needs.changes.outputs.docs == 'true' && needs.changes.outputs.narrow_python_only != 'true') || (needs.changes.outputs.python == 'true' && needs.changes.outputs.narrow_python_only != 'true') || needs.changes.outputs.docs_test == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Guard LaTeX-unsafe Unicode in docs-fed text
+      run: |
+        ./bin/check_docs_latex_unicode.sh
+
+  test-docs:
+    needs: [changes, python-lint-types, docs-latex-unicode-guard]
+    # Run if docs changed OR Python changed OR infrastructure changed OR manual/scheduled run.
+    # A docs-only PR skips python-lint-types; that skip must not skip this job (#2018), so the
+    # gate accepts skipped prerequisites and refuses only failed or cancelled ones.
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.python-lint-types.result != 'failure' && needs.docs-latex-unicode-guard.result != 'failure' && ((needs.changes.outputs.docs == 'true' && needs.changes.outputs.narrow_python_only != 'true') || (needs.changes.outputs.python == 'true' && needs.changes.outputs.narrow_python_only != 'true') || needs.changes.outputs.docs_test == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Test building docs
+      env:
+        VALIDATE_NOTEBOOK_EXECUTION: 1
+        # Same-repo PRs get full HTML/EPUB/PDF Read the Docs previews.
+        # Keep HTML + example/notebook audits here; build all formats for forks
+        # and push/scheduled/manual runs that may lack an RTD preview.
+        DOCS_FORMAT: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && 'html' || 'all' }}
+      run: |
+        cd docs && ./ci.sh
+
+  
+  test-readme:
+    needs: [changes]
+    # Run if docs changed OR infrastructure changed OR manual/scheduled run
+    if: ${{ needs.changes.outputs.docs == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Lint README markdown
+      continue-on-error: true
+      run: |
+        docker run --rm -v "$(pwd)/README.md:/workdir/README.md:ro" -v "$(pwd)/.markdownlint.yaml:/workdir/.markdownlint.yaml:ro" ghcr.io/igorshubovych/markdownlint-cli:v0.37.0 README.md
+
+  

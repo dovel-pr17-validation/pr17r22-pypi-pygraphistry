@@ -1,0 +1,175 @@
+import pandas as pd
+from functools import lru_cache
+
+from graphistry.compute.ast import is_in, IsIn
+from graphistry.compute.filter_by_dict import filter_by_dict
+from graphistry.tests.test_compute import CGFull
+
+@lru_cache(maxsize=1)
+def hops_graph():
+
+    #| node, type, i, v | 
+    nodes_df = (pd.DataFrame([
+        {'node': 'a'},
+        {'node': 'b'},
+        {'node': 'c'},
+        {'node': 'd'},
+        {'node': 'e'},
+        {'node': 'f'},
+        {'node': 'g'},
+        {'node': 'h'},
+        {'node': 'i'},
+        {'node': 'j'},
+        {'node': 'k'},
+        {'node': 'l'},
+        {'node': 'm'},
+        {'node': 'n'},
+        {'node': 'o'},
+        {'node': 'p'}
+    ])
+    .assign(type='n')
+    .reset_index().rename(columns={'index': 'i'})
+    .pipe(lambda df: df.assign(v=df.index * 2)))
+
+    #| s, d, type, i, v |
+    edges_df = (pd.DataFrame([
+        {'s': 'e', 'd': 'l'},
+        {'s': 'l', 'd': 'b'},
+        {'s': 'k', 'd': 'a'},
+        {'s': 'e', 'd': 'g'},
+        {'s': 'g', 'd': 'a'},
+        {'s': 'd', 'd': 'f'},
+        {'s': 'd', 'd': 'c'},
+        {'s': 'd', 'd': 'j'},
+        {'s': 'd', 'd': 'i'},
+        {'s': 'd', 'd': 'h'},
+        {'s': 'j', 'd': 'p'},
+        {'s': 'i', 'd': 'n'},
+        {'s': 'h', 'd': 'm'},
+        {'s': 'j', 'd': 'o'},
+        {'s': 'o', 'd': 'b'},
+        {'s': 'm', 'd': 'a'},
+        {'s': 'n', 'd': 'a'},
+        {'s': 'p', 'd': 'b'},
+    ]).assign(type='e')
+    .reset_index().rename(columns={'index': 'i'})
+    .pipe(lambda df: df.assign(v=df.index * 2)))
+
+    return CGFull().nodes(nodes_df, 'node').edges(edges_df, 's', 'd')
+
+class TestFilterByDict(object):
+
+    def test_none(self):
+        g = hops_graph()
+        assert filter_by_dict(g._nodes).equals(g._nodes)
+
+    def test_kv_single_good_str(self):
+        g = hops_graph()
+        assert filter_by_dict(g._nodes, {'node': 'a'}).equals(g._nodes[:1])
+
+    def test_kv_single_good_int(self):
+        g = hops_graph()
+        assert filter_by_dict(g._nodes, {'v': 0}).equals(g._nodes[:1])
+
+    def test_kv_single_miss(self):
+        g = hops_graph()
+        assert filter_by_dict(g._nodes, {'node': 'bad'}).equals(g._nodes[:0])
+
+    def test_kv_single_multiple(self):
+        g = hops_graph()
+        assert filter_by_dict(g._nodes, {'type': 'n'}).equals(g._nodes)
+
+    def test_kv_single_membership_list(self):
+        g = hops_graph()
+        expected = g._nodes[g._nodes['node'].isin(['a', 'b'])].reset_index(drop=True)
+        actual = filter_by_dict(g._nodes, {'node': ['a', 'b']}).reset_index(drop=True)
+        assert actual.equals(expected)
+
+    def test_label_filter_uses_labels_column_membership(self):
+        nodes = pd.DataFrame(
+            {
+                "id": ["a", "b"],
+                "labels": [["Person"], ["Animal", "Pet"]],
+                "name": ["alice", "bear"],
+            }
+        )
+        actual = filter_by_dict(nodes, {"label__Person": True}).reset_index(drop=True)
+        expected = nodes.iloc[[0]].reset_index(drop=True)
+        assert actual.equals(expected)
+
+    def test_label_filter_falls_back_to_node_type_column(self):
+        nodes = pd.DataFrame(
+            {
+                "id": ["a", "b", "c"],
+                "type": ["Person", "Animal", "Person"],
+                "name": ["alice", "bear", "bob"],
+            }
+        )
+        actual = filter_by_dict(nodes, {"label__Person": True}).reset_index(drop=True)
+        expected = nodes.iloc[[0, 2]].reset_index(drop=True)
+        assert actual.equals(expected)
+
+    def test_kv_multiple_good(self):
+        g = hops_graph()
+        assert filter_by_dict(g._nodes, {'node': 'a', 'type': 'n'}).equals(g._nodes[:1])
+
+    def test_kv_multiple_bad(self):
+        g = hops_graph()
+        assert filter_by_dict(g._nodes, {'node': 'bad', 'type': 'n'}).equals(g._nodes[:0])
+
+
+class TestNodeFilterByDict(object):
+
+    def test_kv_multiple_good(self):
+        g = hops_graph()
+        assert g.filter_nodes_by_dict({'node': 'a', 'type': 'n'})._nodes.equals(g._nodes[:1])
+
+    def test_kv_multiple_bad(self):
+        g = hops_graph()
+        assert g.filter_nodes_by_dict({'node': 'bad', 'type': 'n'})._nodes.equals(g._nodes[:0])
+
+class TestEdgeFilterByDict(object):
+
+    def test_kv_multiple_good(self):
+        g = hops_graph()
+        assert g.filter_edges_by_dict({'i': 0, 'type': 'e'})._edges.equals(g._edges[:1])
+
+    def test_kv_multiple_bad(self):
+        g = hops_graph()
+        assert g.filter_edges_by_dict({'i': -100, 'type': 'e'})._edges.equals(g._edges[:0])
+
+class TestPredicateIsIn(object):
+
+    def test_standalone(self):
+        g = hops_graph()
+        assert g.filter_nodes_by_dict({'node': is_in(['a'])})._nodes.equals(g._nodes[:1])
+        assert g.filter_nodes_by_dict({'node': is_in(['a', 'b'])})._nodes.equals(g._nodes[:2])
+    
+    def test_combined(self):
+        g = hops_graph()
+        assert g.filter_nodes_by_dict({'node': is_in(['a', 'b']), 'type': 'n'})._nodes.equals(g._nodes[:2])
+        assert g.filter_nodes_by_dict({'node': is_in(['a', 'b']), 'type': 'bad'})._nodes.equals(g._nodes[:0])
+        assert g.filter_nodes_by_dict({'node': is_in(['a', 'bad']), 'type': 'n'})._nodes.equals(g._nodes[:1])
+        assert g.filter_nodes_by_dict({'node': is_in(['a', 'bad']), 'type': 'bad'})._nodes.equals(g._nodes[:0])
+
+
+class TestThreeValuedLogicNull(object):
+    """openCypher/SQL 3-valued logic: a NULL cell is NEVER a match for ne()/<> or membership
+    (`null <> x` and `null IN [...]` are both NULL -> excluded). pandas `NaN != x` is True and
+    cuDF `isin` matches a null against a None list element, so both used to KEEP the null; these
+    assert the fix in filter_by_dict / the NE predicate. Generic (pandas oracle here; the polars
+    engine + 4-engine parity are asserted in the gfql polars suite)."""
+
+    def test_ne_excludes_null(self):
+        # numeric column so the comparison-on-string guard (a separate fix higher in the stack) is
+        # not in play — this isolates the NE 3VL null-masking. score=None -> NaN; `NaN != 20` is
+        # True on pandas (would KEEP), so the row must be excluded by the `& notna()` fix.
+        from graphistry.compute.ast import ne
+        df = pd.DataFrame({"id": ["n0", "n1", "n2", "n3"], "score": [10.0, 20.0, None, 40.0]})
+        out = filter_by_dict(df, {"score": ne(20)})
+        assert sorted(out["id"].tolist()) == ["n0", "n3"]   # n1 fails ne(20); n2 (null) excluded by 3VL
+
+    def test_membership_excludes_null(self):
+        df = pd.DataFrame({"id": ["n0", "n1", "n2", "n3"], "kind": ["x", "y", None, "z"]})
+        out = filter_by_dict(df, {"kind": ["x", "z", None]})
+        assert sorted(out["id"].tolist()) == ["n0", "n3"]   # x,z match; null excluded despite None in list

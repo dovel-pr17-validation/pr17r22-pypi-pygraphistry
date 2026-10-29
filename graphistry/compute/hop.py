@@ -1,0 +1,1220 @@
+"""
+Graph hop/traversal operations for PyGraphistry.
+
+NOTE: Excluded from pyre (.pyre_configuration) - hop() complexity causes hang. Use mypy.
+"""
+import os
+from typing import Any, Callable, Dict, Hashable, List, Optional, Set, Tuple, TYPE_CHECKING, Union, cast
+import pandas as pd
+
+from graphistry.Engine import (
+    EngineAbstract, POLARS_ENGINES, align_shared_column_dtypes, df_concat, df_cons, df_to_engine, resolve_engine, safe_map_series, safe_row_concat, s_series, s_to_numeric, s_na, Engine
+)
+from graphistry.Plottable import Plottable
+from graphistry.otel import otel_traced, otel_detail_enabled
+from .filter_by_dict import filter_by_dict
+from graphistry.Engine import safe_merge
+from .typing import DataFrameT, DomainT, SeriesT
+from .endpoint_utils import drop_null_endpoint_edges
+from .dataframe_utils import column_frame, column_values
+from .gfql.seed_rediscovery import rediscovered_seed_ids
+from .util import generate_safe_column_name
+
+
+def _hop_otel_attrs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    hops = kwargs.get("hops")
+    if hops is None and len(args) > 2:
+        hops = args[2]
+    attrs: Dict[str, Any] = {
+        "gfql.hops": hops if hops is not None else 1,
+        "gfql.direction": kwargs.get("direction", "forward"),
+        "gfql.to_fixed_point": kwargs.get("to_fixed_point", False),
+    }
+    if otel_detail_enabled():
+        attrs["gfql.engine"] = str(kwargs.get("engine", EngineAbstract.AUTO))
+        attrs["gfql.has_edge_match"] = kwargs.get("edge_match") is not None
+        attrs["gfql.has_source_match"] = kwargs.get("source_node_match") is not None
+        attrs["gfql.has_destination_match"] = kwargs.get("destination_node_match") is not None
+        attrs["gfql.has_edge_query"] = kwargs.get("edge_query") is not None
+        attrs["gfql.has_source_query"] = kwargs.get("source_node_query") is not None
+        attrs["gfql.has_destination_query"] = kwargs.get("destination_node_query") is not None
+    return attrs
+
+
+def query_if_not_none(query: Optional[str], df: DataFrameT) -> DataFrameT:
+    if query is None:
+        return df
+    return df.query(query)
+
+
+def resolve_hop_bounds(
+    hops: Optional[int],
+    min_hops: Optional[int],
+    max_hops: Optional[int],
+    output_min_hops: Optional[int],
+    output_max_hops: Optional[int],
+    to_fixed_point: bool,
+) -> Tuple[Optional[int], int, Optional[int], Optional[int]]:
+    """ONE bound contract for every hop engine.
+
+    Returns ``(max_hops, min_hops, output_min_hops, output_max_hops)`` resolved, raising
+    ``ValueError`` on any contradictory argument. Lives here, called by BOTH the pandas/cuDF
+    hop below and the native polars hop, which previously validated only ``direction`` and
+    the integer-ness of ``hops``: ``min_hops=1, max_hops=0`` and ``hops=-1`` answered EMPTY
+    instead of raising, and ``min_hops=-1, hops=1`` RETURNED AN ANSWER (the polars loop reads
+    ``min_hops`` only when >1, so the contradictory argument was silently ignored).
+
+    ``hops=None`` (legal for ``Optional[int] = 1``) resolves to an unbounded max, i.e.
+    run-to-closure -- the incumbent pandas behavior, adopted as the cross-engine contract
+    rather than polars' ``ValueError``: it is the released default-engine semantics, and the
+    signature admits None, so raising would break callers that pass an unbounded max through.
+    """
+    resolved_max_hops = max_hops if max_hops is not None else hops
+    resolved_min_hops = min_hops
+
+    if not to_fixed_point:
+        if resolved_max_hops is not None and not isinstance(resolved_max_hops, int):
+            raise ValueError(f'Must provide integer hops when to_fixed_point is False, received: {resolved_max_hops}')
+    else:
+        resolved_max_hops = None
+
+    if resolved_min_hops is None:
+        resolved_min_hops = 0 if resolved_max_hops == 0 else 1
+
+    if resolved_min_hops < 0:
+        raise ValueError(f'min_hops must be >= 0, received: {resolved_min_hops}')
+
+    if resolved_max_hops is not None and resolved_max_hops < 0:
+        raise ValueError(f'max_hops must be >= 0, received: {resolved_max_hops}')
+
+    if resolved_max_hops is not None and resolved_min_hops > resolved_max_hops:
+        raise ValueError(f'min_hops ({resolved_min_hops}) cannot exceed max_hops ({resolved_max_hops})')
+
+    resolved_output_min = output_min_hops
+    resolved_output_max = output_max_hops
+
+    if resolved_output_min is not None and resolved_output_min < 0:
+        raise ValueError(f'output_min_hops must be >= 0, received: {resolved_output_min}')
+    if resolved_output_max is not None and resolved_output_max < 0:
+        raise ValueError(f'output_max_hops must be >= 0, received: {resolved_output_max}')
+    if resolved_output_min is not None and resolved_output_max is not None and resolved_output_min > resolved_output_max:
+        raise ValueError(f'output_min_hops ({resolved_output_min}) cannot exceed output_max_hops ({resolved_output_max})')
+
+    if resolved_output_max is None:
+        resolved_output_max = resolved_max_hops
+
+    if resolved_output_min is not None and resolved_max_hops is not None and resolved_output_min > resolved_max_hops:
+        raise ValueError(f'output_min_hops ({resolved_output_min}) cannot exceed max_hops traversal bound ({resolved_max_hops})')
+    if resolved_output_max is not None and resolved_min_hops is not None and resolved_output_max < resolved_min_hops:
+        raise ValueError(f'output_max_hops ({resolved_output_max}) cannot be below min_hops traversal bound ({resolved_min_hops})')
+
+    return resolved_max_hops, resolved_min_hops, resolved_output_min, resolved_output_max
+
+
+def _host_list(series: SeriesT) -> List[Hashable]:
+    """Column -> python list, engine-uniformly. cuDF REFUSES ``.tolist()`` outright ("Consider
+    using .to_arrow().to_pylist()"), polars spells it ``.to_list()``, pandas ``.tolist()``."""
+    if hasattr(series, "to_arrow"):
+        return cast(List[Hashable], series.to_arrow().to_pylist())
+    if hasattr(series, "tolist"):
+        return cast(List[Hashable], series.tolist())
+    return cast(List[Hashable], series.to_list())
+
+
+def _reached_node_ids(matches_nodes: Optional[DataFrameT], node_col: str) -> Set[Hashable]:
+    if matches_nodes is None or len(matches_nodes) == 0:
+        return set()
+    reached = column_values(matches_nodes, node_col)
+    reached = reached.to_pandas() if hasattr(reached, "to_pandas") else reached
+    return set(reached.tolist())
+
+
+def _nodes_with_hop_label_column(nodes: DataFrameT, hop_label_col: str) -> DataFrameT:
+    if hop_label_col in nodes.columns:
+        return nodes
+    return nodes.assign(**{hop_label_col: float('nan')})
+
+
+def _endpoint_ids_without_node_rows(
+    g: Plottable, engine_bound_concat: Callable[..., DataFrameT],
+) -> DataFrameT:
+    """Endpoint ids the node table does not back."""
+    concat = engine_bound_concat
+    endpoints = concat(
+        [
+            g._edges[[g._source]].rename(columns={g._source: g._node}),
+            g._edges[[g._destination]].rename(columns={g._destination: g._node}),
+        ],
+        ignore_index=True,
+        sort=False,
+    ).drop_duplicates(subset=[g._node])
+    return endpoints[~endpoints[g._node].isin(g._nodes[g._node])]
+
+
+@otel_traced("gfql.hop", attrs_fn=_hop_otel_attrs)
+def hop(self: Plottable,
+    nodes: Optional[DataFrameT] = None,  # chain: incoming wavefront
+    hops: Optional[int] = 1,
+    *,
+    min_hops: Optional[int] = None,
+    max_hops: Optional[int] = None,
+    output_min_hops: Optional[int] = None,
+    output_max_hops: Optional[int] = None,
+    label_node_hops: Optional[str] = None,
+    label_edge_hops: Optional[str] = None,
+    label_seeds: bool = False,
+    to_fixed_point: bool = False,
+    direction: str = 'forward',
+    edge_match: Optional[dict] = None,
+    source_node_match: Optional[dict] = None,
+    destination_node_match: Optional[dict] = None,
+    source_node_query: Optional[str] = None,
+    destination_node_query: Optional[str] = None,
+    edge_query: Optional[str] = None,
+    return_as_wave_front: bool = False,
+    include_zero_hop_seed: bool = False,
+    target_wave_front: Optional[DataFrameT] = None,  # chain: limit hits to these for reverse pass
+    engine: Union[EngineAbstract, str] = EngineAbstract.AUTO
+) -> Plottable:
+    """
+    Given a graph and some source nodes, return subgraph of all paths within k-hops from the sources
+
+    See chain() examples for examples of many of the parameters
+
+    g: Plotter
+    nodes: dataframe with id column matching g._node. None signifies all nodes (default).
+    hops: consider paths of length 1 to 'hops' steps, if any (default 1). Shorthand for max_hops.
+    min_hops/max_hops: inclusive traversal bounds; defaults preserve legacy behavior (min=1 unless max=0; max defaults to hops).
+    output_min_hops/output_max_hops: optional output slice applied after traversal; defaults keep all traversed hops up to max_hops. Useful for showing a subrange (e.g., min/max = 2..4 but display only hops 3..4).
+    label_node_hops/label_edge_hops: optional column names for hop numbers (omit or None to skip). Nodes record the first retained hop step they are reached (1 = first expansion); when min_hops prunes shorter branches, labels reflect the shortest retained path. Edges record the hop step that traversed them.
+    label_seeds: when True and labeling, also write hop 0 for seed nodes in the node label column.
+    to_fixed_point: keep hopping until no new nodes are found (ignores hops)
+    direction: 'forward', 'reverse', 'undirected'
+    edge_match: dict of kv-pairs to exact match (see also: filter_edges_by_dict)
+    source_node_match: dict of kv-pairs to match nodes before hopping (including intermediate)
+    destination_node_match: dict of kv-pairs to match nodes after hopping (including intermediate)
+    source_node_query: dataframe query to match nodes before hopping (including intermediate)
+    destination_node_query: dataframe query to match nodes after hopping (including intermediate)
+    edge_query: dataframe query to match edges before hopping (including intermediate)
+    return_as_wave_front: Exclude starting node(s) in return, returning only encountered nodes
+    include_zero_hop_seed: internal Cypher opt-in for exact zero-hop path semantics
+    Note: chain() reverse passes set return_as_wave_front=True and use target_wave_front to constrain reachability.
+    target_wave_front: Only consider these nodes + self._nodes for reachability
+    engine: 'auto', 'pandas', 'cudf' (GPU)
+    """
+
+    if isinstance(engine, str):
+        engine = EngineAbstract(engine)
+
+    # Resolve the engine from the ORIGINAL data before coercing, so cuDF input stays cuDF.
+    engine_concrete = resolve_engine(engine, self)
+    from graphistry.compute.ComputeMixin import _coerce_input_formats  # lazy — avoids circular import
+    self = _coerce_input_formats(self, engine_concrete)
+
+    # GFQL physical index path; returns None to fall back. Coercion above is a no-op when already
+    # in-engine, so the index fingerprint (keyed on the live edge frame) still matches.
+    from graphistry.compute.gfql.index import get_index_policy, get_registry, maybe_index_hop
+    from graphistry.compute.gfql.index.types import HopDirection
+    _idx_policy = get_index_policy(self)
+    if (not get_registry(self).is_empty()) or _idx_policy in ("auto", "force"):
+        _idx_nodes = df_to_engine(nodes, engine_concrete) if nodes is not None else None
+        _indexed = maybe_index_hop(
+            self, engine_concrete, nodes=_idx_nodes, hops=hops, direction=cast(HopDirection, direction),
+            return_as_wave_front=return_as_wave_front, to_fixed_point=to_fixed_point,
+            policy=_idx_policy,
+            min_hops=min_hops, max_hops=max_hops,
+            output_min_hops=output_min_hops, output_max_hops=output_max_hops,
+            label_node_hops=label_node_hops, label_edge_hops=label_edge_hops,
+            label_seeds=label_seeds, edge_match=edge_match,
+            source_node_match=source_node_match, destination_node_match=destination_node_match,
+            source_node_query=source_node_query, destination_node_query=destination_node_query,
+            edge_query=edge_query, include_zero_hop_seed=include_zero_hop_seed,
+            target_wave_front=target_wave_front,
+        )
+        if _indexed is not None:
+            return _indexed
+
+    if engine_concrete in POLARS_ENGINES:
+        # Lazy engine first; it returns None for shapes it does not cover -> eager hop.
+        _hop_kwargs = dict(
+            min_hops=min_hops, max_hops=max_hops,
+            output_min_hops=output_min_hops, output_max_hops=output_max_hops,
+            label_node_hops=label_node_hops, label_edge_hops=label_edge_hops,
+            label_seeds=label_seeds, to_fixed_point=to_fixed_point,
+            direction=direction, edge_match=edge_match,
+            source_node_match=source_node_match, destination_node_match=destination_node_match,
+            source_node_query=source_node_query, destination_node_query=destination_node_query,
+            edge_query=edge_query, return_as_wave_front=return_as_wave_front,
+            include_zero_hop_seed=include_zero_hop_seed, target_wave_front=target_wave_front,
+        )
+        from graphistry.compute.gfql.lazy.engine.polars.hop import hop_lazy_or_eager
+        from graphistry.compute.gfql.lazy import target_mode, ExecutionTarget
+        _tgt = ExecutionTarget.GPU if engine_concrete == Engine.POLARS_GPU else ExecutionTarget.CPU
+        with target_mode(_tgt):
+            return hop_lazy_or_eager(self, nodes, hops, **_hop_kwargs)
+
+    def _combine_first_no_warn(target, fill):
+        """Avoid pandas concat warning when combine_first sees empty inputs."""
+        if target is None or len(target) == 0:
+            return target
+        return target.where(target.notna(), fill)
+    if not TYPE_CHECKING:
+        DataFrameT = df_cons(engine_concrete)
+    concat = df_concat(engine_concrete)
+
+    def _domain_unique(series: Any) -> DomainT:
+        if engine_concrete == Engine.PANDAS:
+            return pd.Index(series.dropna().unique())
+        return series.dropna().unique()
+
+    def _domain_is_empty(domain: Optional[DomainT]) -> bool:
+        return domain is None or len(domain) == 0
+
+    def _domain_diff(candidates: DomainT, visited: Optional[DomainT]) -> DomainT:
+        if visited is None or len(candidates) == 0 or len(visited) == 0:
+            return candidates
+        return candidates[~candidates.isin(visited)]
+
+    def _domain_union(left: Optional[DomainT], right: Optional[DomainT]) -> Optional[DomainT]:
+        if left is None or len(left) == 0:
+            return right
+        if right is None or len(right) == 0:
+            return left
+        if engine_concrete == Engine.PANDAS and isinstance(left, pd.Index) and isinstance(right, pd.Index):
+            return left.append(right)
+        return concat([left, right], ignore_index=True)
+    
+    nodes = df_to_engine(nodes, engine_concrete) if nodes is not None else None
+    target_wave_front = df_to_engine(target_wave_front, engine_concrete) if target_wave_front is not None else None
+
+    if direction not in ['forward', 'reverse', 'undirected']:
+        raise ValueError(f'Invalid direction: "{direction}", must be one of: "forward" (default), "reverse", "undirected"')
+    
+    if target_wave_front is not None and nodes is None:
+        raise ValueError('target_wave_front requires nodes to target against (for intermediate hops)')
+
+    resolved_max_hops, resolved_min_hops, resolved_output_min, resolved_output_max = resolve_hop_bounds(
+        hops, min_hops, max_hops, output_min_hops, output_max_hops, to_fixed_point)
+
+    final_output_min = resolved_output_min
+    final_output_max = resolved_output_max
+
+    if destination_node_match == {}:
+        destination_node_match = None
+
+    g2 = self.materialize_nodes(engine=EngineAbstract(engine_concrete.value))
+
+    if g2._node is None:
+        raise ValueError('Node binding cannot be None, please set g._node via bind() or nodes()')
+    assert g2._node is not None, "Node binding checked above"
+    node_col = g2._node
+
+    if g2._source is None or g2._destination is None:
+        raise ValueError('Source and destination binding cannot be None, please set g._source and g._destination via bind() or edges()')
+
+    assert g2._source is not None, "Source binding checked above"
+    assert g2._destination is not None, "Destination binding checked above"
+    source_col = g2._source
+    destination_col = g2._destination
+
+    seeds_provided = nodes is not None
+    starting_nodes = nodes if seeds_provided else g2._nodes
+    if starting_nodes is None:
+        raise ValueError('hop requires a node DataFrame; starting_nodes is None')
+
+    if g2._edge is None:
+        pre_indexed_edges = query_if_not_none(edge_query, g2.filter_edges_by_dict(edge_match)._edges)
+
+        GFQL_EDGE_INDEX = generate_safe_column_name('edge_index', pre_indexed_edges, prefix='__gfql_', suffix='__')
+
+        # Shallow-copy edge-id attach (#1670): ids are a dedup/join key only, never used
+        # positionally. Mirrors the chain.py edge-index attach.
+        edges_indexed = pre_indexed_edges.copy(deep=False)
+        edges_indexed[GFQL_EDGE_INDEX] = edges_indexed.index
+        EDGE_ID = GFQL_EDGE_INDEX
+    else:
+        edges_indexed = query_if_not_none(edge_query, g2.filter_edges_by_dict(edge_match)._edges)
+        EDGE_ID = g2._edge
+        if EDGE_ID not in edges_indexed.columns:
+            raise ValueError(f"Edge binding column '{EDGE_ID}' (from g._edge='{g2._edge}') not found in edges. Available columns: {list(edges_indexed.columns)}")
+
+    edges_indexed = drop_null_endpoint_edges(edges_indexed, source_col, destination_col)
+
+    def resolve_label_col(requested: Optional[str], df, default_base: str) -> Optional[str]:
+        if requested is None:
+            return generate_safe_column_name(default_base, df, prefix='__gfqlhop_', suffix='__')
+        if requested not in df.columns:
+            return requested
+        counter = 1
+        candidate = f"{requested}_{counter}"
+        while candidate in df.columns:
+            counter = counter + 1
+            candidate = f"{requested}_{counter}"
+        return candidate
+
+    # Track hop labels when requested or required for output slicing/min_hops pruning.
+    needs_min_hop_pruning = resolved_min_hops is not None and resolved_min_hops > 1
+    track_hops = bool(
+        label_node_hops
+        or label_edge_hops
+        or label_seeds
+        or output_min_hops is not None
+        or output_max_hops is not None
+        or needs_min_hop_pruning
+    )
+    track_node_hops = track_hops or bool(label_node_hops or label_seeds)
+    track_edge_hops = track_hops or label_edge_hops is not None
+
+    edge_hop_col = None
+    node_hop_col = None
+    if track_edge_hops:
+        edge_hop_col = resolve_label_col(label_edge_hops, edges_indexed, '_hop')
+    if track_node_hops:
+        node_hop_col = resolve_label_col(label_node_hops, g2._nodes, '_hop')
+
+    wave_front = starting_nodes[[node_col]][:0]
+
+    matches_nodes = None
+    matches_edges = edges_indexed[[EDGE_ID]][:0]
+
+    if target_wave_front is None:
+        base_target_nodes = g2._nodes
+    else:
+        # Allow intermediate hops to traverse graph nodes while constraining final targets.
+        base_target_nodes = concat([target_wave_front, g2._nodes], ignore_index=True, sort=False).drop_duplicates(subset=[node_col])
+
+    node_table_bound = self._nodes is not None
+    ids_an_endpoint_may_resolve_to = base_target_nodes[node_col]
+    closure_rides_traversal = (
+        node_table_bound and seeds_provided and not to_fixed_point and resolved_max_hops == 1)
+    if node_table_bound and not closure_rides_traversal:
+        edges_indexed = edges_indexed[
+            edges_indexed[source_col].isin(ids_an_endpoint_may_resolve_to)
+            & edges_indexed[destination_col].isin(ids_an_endpoint_may_resolve_to)
+        ]
+
+    def _drop_unresolvable_endpoints(frame: DataFrameT, endpoint_col: str) -> DataFrameT:
+        if not closure_rides_traversal:
+            return frame
+        return frame[frame[endpoint_col].isin(ids_an_endpoint_may_resolve_to)]
+
+    # Only caller seeds can name an id the node table lacks.
+    traversal_seeds = (
+        _drop_unresolvable_endpoints(starting_nodes, node_col) if seeds_provided else starting_nodes)
+
+    def _build_allowed_ids(
+        base_nodes: DataFrameT,
+        match_dict: Optional[dict],
+        match_query: Optional[str],
+    ) -> Optional[DataFrameT]:
+        if match_dict is None and match_query is None:
+            return None
+        filtered = query_if_not_none(match_query, filter_by_dict(base_nodes, match_dict))
+        return filtered[[node_col]].drop_duplicates()
+
+    allowed_source_ids: Optional[DataFrameT] = None
+    if source_node_match is not None or source_node_query is not None:
+        source_base_nodes = g2._nodes
+        only_seeds_can_be_sources = (
+            seeds_provided and not to_fixed_point and resolved_max_hops == 1)
+        if only_seeds_can_be_sources:
+            source_base_nodes = g2._nodes[g2._nodes[node_col].isin(starting_nodes[node_col])]
+        allowed_source_ids = _build_allowed_ids(source_base_nodes, source_node_match, source_node_query)
+
+    allowed_dest_ids = _build_allowed_ids(base_target_nodes, destination_node_match, destination_node_query)
+    allowed_source_series = allowed_source_ids[node_col] if allowed_source_ids is not None else None
+    allowed_dest_series = allowed_dest_ids[node_col] if allowed_dest_ids is not None else None
+    allowed_target_intermediate = None
+    allowed_target_final = None
+    if target_wave_front is not None:
+        allowed_target_intermediate = base_target_nodes[node_col]
+        allowed_target_final = target_wave_front[[node_col]].drop_duplicates()[node_col]
+
+    node_hop_records = None
+    edge_hop_records = None
+    seen_node_ids = None
+    seen_edge_ids = None
+
+    if track_node_hops and label_seeds and node_hop_col is not None:
+        seed_nodes = starting_nodes[[node_col]].drop_duplicates()
+        node_hop_records = seed_nodes.assign(**{node_hop_col: 0})
+        seen_node_ids = _domain_unique(seed_nodes[node_col])
+
+    # Fast path: no hop tracking, no predicates, no target_wave_front.
+    fast_path_enabled = (
+        not track_hops
+        and target_wave_front is None
+        and allowed_source_ids is None
+        and allowed_dest_ids is None
+    )
+    fast_path_override = os.environ.get("GRAPHISTRY_HOP_FAST_PATH", "").strip().lower()
+    if fast_path_override in {"0", "false", "off", "no"}:
+        fast_path_enabled = False
+
+    simple_single_hop_undirected_fast_path = (
+        fast_path_enabled
+        and direction == 'undirected'
+        and not to_fixed_point
+        and resolved_max_hops == 1
+        and resolved_min_hops is not None
+        and resolved_min_hops <= 1
+    )
+
+    def _concat_node_frames(frames: List[DataFrameT]) -> DataFrameT:
+        non_empty = [df for df in frames if len(df) > 0]
+        if len(non_empty) == 0:
+            return starting_nodes[[node_col]][:0]
+        if len(non_empty) == 1:
+            return non_empty[0].drop_duplicates(subset=[node_col])
+        return concat(non_empty, ignore_index=True, sort=False).drop_duplicates(subset=[node_col])
+
+    first_iter = True
+    combined_node_ids = None
+    current_hop = 0
+    max_reached_hop = 0
+    skip_full_loop = False
+
+    pairs: DataFrameT
+    FROM_COL: str
+    TO_COL: str
+    FROM_COL = generate_safe_column_name('__gfql_from__', edges_indexed, prefix='__gfql_', suffix='__')
+    TO_COL = generate_safe_column_name('__gfql_to__', edges_indexed, prefix='__gfql_', suffix='__')
+
+    if include_zero_hop_seed and not to_fixed_point and resolved_min_hops == 0 and resolved_max_hops == 0:
+        zero_hop_nodes = starting_nodes[[node_col]].drop_duplicates()
+        if allowed_source_series is not None:
+            zero_hop_nodes = zero_hop_nodes[zero_hop_nodes[node_col].isin(allowed_source_series)]
+        if allowed_dest_series is not None:
+            zero_hop_nodes = zero_hop_nodes[zero_hop_nodes[node_col].isin(allowed_dest_series)]
+        if allowed_target_final is not None:
+            zero_hop_nodes = zero_hop_nodes[zero_hop_nodes[node_col].isin(allowed_target_final)]
+        matches_nodes = zero_hop_nodes
+        matches_edges = edges_indexed[[EDGE_ID]][:0]
+        if track_node_hops and node_hop_col is not None:
+            node_hop_records = zero_hop_nodes.assign(**{node_hop_col: 0})
+        skip_full_loop = True
+        pairs = edges_indexed[[EDGE_ID]][:0]
+        max_reached_hop = 0
+    elif simple_single_hop_undirected_fast_path:
+        seed_ids = _domain_unique(traversal_seeds[node_col])
+        if _domain_is_empty(seed_ids):
+            matches_nodes = starting_nodes[[node_col]][:0]
+            matches_edges = edges_indexed[[EDGE_ID]][:0]
+        else:
+            incident_mask = edges_indexed[source_col].isin(seed_ids) | edges_indexed[destination_col].isin(seed_ids)
+            incident_edges = _drop_unresolvable_endpoints(
+                _drop_unresolvable_endpoints(edges_indexed[incident_mask], source_col),
+                destination_col)
+            src_hits = incident_edges[incident_edges[source_col].isin(seed_ids)]
+            dst_hits = incident_edges[incident_edges[destination_col].isin(seed_ids)]
+
+            node_frames: List[DataFrameT] = [
+                src_hits[[destination_col]].rename(columns={destination_col: node_col}),
+                dst_hits[[source_col]].rename(columns={source_col: node_col}),
+            ]
+            if not return_as_wave_front:
+                node_frames.extend([
+                    src_hits[[source_col]].rename(columns={source_col: node_col}),
+                    dst_hits[[destination_col]].rename(columns={destination_col: node_col}),
+                ])
+
+            matches_nodes = _concat_node_frames(node_frames)
+            matches_edges = incident_edges[[EDGE_ID]]
+            if len(matches_nodes) > 0:
+                max_reached_hop = 1
+        skip_full_loop = True
+        pairs = edges_indexed[[EDGE_ID]][:0]
+    else:
+        def _build_pairs(src_col: str, dst_col: str) -> DataFrameT:
+            return edges_indexed[[src_col, dst_col, EDGE_ID]].rename(
+                columns={src_col: FROM_COL, dst_col: TO_COL}
+            )
+
+        if direction == 'forward':
+            pairs = _build_pairs(g2._source, g2._destination)
+        elif direction == 'reverse':
+            pairs = _build_pairs(g2._destination, g2._source)
+        else:
+            # both orientations, as the polars twin does; consumers dedup on EDGE_ID
+            pairs = concat(
+                [_build_pairs(g2._source, g2._destination), _build_pairs(g2._destination, g2._source)],
+                ignore_index=True,
+                sort=False,
+            )
+
+    if fast_path_enabled and not skip_full_loop:
+        frontier_ids = _domain_unique(traversal_seeds[node_col])
+        visited_node_ids = None
+        visited_edge_ids = None
+        while True:
+            if not to_fixed_point and resolved_max_hops is not None and current_hop >= resolved_max_hops:
+                break
+            if _domain_is_empty(frontier_ids):
+                break
+
+            current_hop += 1
+
+            hop_edges = _drop_unresolvable_endpoints(
+                pairs[pairs[FROM_COL].isin(frontier_ids)], TO_COL)
+            cand_nodes = _domain_unique(hop_edges[TO_COL])
+            seed_ids_domain = None
+            if visited_node_ids is None and not return_as_wave_front:
+                seed_ids_domain = _domain_unique(hop_edges[FROM_COL])
+
+            cand_edges = _domain_unique(hop_edges[EDGE_ID])
+
+            if len(cand_nodes) > 0:
+                max_reached_hop = current_hop
+
+            if visited_node_ids is None and not return_as_wave_front:
+                visited_node_ids = seed_ids_domain
+
+            new_frontier = _domain_diff(cand_nodes, visited_node_ids)
+            if not _domain_is_empty(new_frontier):
+                visited_node_ids = _domain_union(visited_node_ids, new_frontier)
+            frontier_ids = new_frontier
+
+            new_edges = _domain_diff(cand_edges, visited_edge_ids)
+            if not _domain_is_empty(new_edges):
+                visited_edge_ids = _domain_union(visited_edge_ids, new_edges)
+
+            if _domain_is_empty(frontier_ids):
+                break
+
+        if _domain_is_empty(visited_node_ids):
+            matches_nodes = starting_nodes[[node_col]][:0]
+        else:
+            matches_nodes = DataFrameT({node_col: visited_node_ids})
+        if _domain_is_empty(visited_edge_ids):
+            matches_edges = edges_indexed[[EDGE_ID]][:0]
+        else:
+            matches_edges = DataFrameT({EDGE_ID: visited_edge_ids})
+
+        skip_full_loop = True
+
+    while True and not skip_full_loop:
+
+        if not to_fixed_point and resolved_max_hops is not None and current_hop >= resolved_max_hops:
+            break
+
+        current_hop += 1
+
+        assert len(wave_front.columns) == 1, "just indexes"
+        wave_front_base = traversal_seeds[[node_col]] if first_iter else wave_front
+        if allowed_source_series is None:
+            wave_front_iter = wave_front_base
+        else:
+            wave_front_iter = wave_front_base[wave_front_base[node_col].isin(allowed_source_series)]
+        first_iter = False
+
+        # isin() dedups internally; wavefront_ids feeds only isin -> skip the
+        # explicit .unique() dedup pass (a kernel launch on GPU). Byte-identical.
+        wavefront_ids = wave_front_iter[node_col]
+        hop_edges = _drop_unresolvable_endpoints(
+            pairs[pairs[FROM_COL].isin(wavefront_ids)], TO_COL)
+
+        if allowed_target_intermediate is not None:
+            has_more_hops_planned = to_fixed_point or resolved_max_hops is None or current_hop < resolved_max_hops
+            target_ids = allowed_target_intermediate if has_more_hops_planned else allowed_target_final
+            if target_ids is not None:
+                hop_edges = hop_edges[hop_edges[TO_COL].isin(target_ids)]
+
+        new_node_ids = hop_edges[[TO_COL]].rename(columns={TO_COL: node_col}).drop_duplicates()
+
+        if allowed_dest_series is not None:
+            new_node_ids = new_node_ids[new_node_ids[node_col].isin(allowed_dest_series)]
+            hop_edges = hop_edges[hop_edges[TO_COL].isin(allowed_dest_series)]
+
+        matches_edges = concat(
+            [matches_edges, hop_edges[[EDGE_ID]]],
+            ignore_index=True,
+            sort=False
+        ).drop_duplicates(subset=[EDGE_ID])
+
+        if len(new_node_ids) > 0:
+            max_reached_hop = current_hop
+
+        if track_edge_hops and edge_hop_col is not None:
+            if len(hop_edges) > 0:
+                # `pairs` holds both orientations: one undirected edge, two rows, one EDGE_ID.
+                labeled_edges = hop_edges[[EDGE_ID]].drop_duplicates(
+                    subset=[EDGE_ID]).assign(**{edge_hop_col: current_hop})
+                if edge_hop_records is None:
+                    edge_hop_records = labeled_edges
+                    seen_edge_ids = _domain_unique(labeled_edges[EDGE_ID])
+                else:
+                    seen_edge_ids = (
+                        seen_edge_ids
+                        if seen_edge_ids is not None
+                        else _domain_unique(edge_hop_records[EDGE_ID])
+                    )
+                    if _domain_is_empty(seen_edge_ids):
+                        new_edge_labels = labeled_edges
+                    else:
+                        new_mask = ~labeled_edges[EDGE_ID].isin(seen_edge_ids)
+                        new_edge_labels = labeled_edges[new_mask]
+                    if len(new_edge_labels) > 0:
+                        edge_hop_records = concat(
+                            [edge_hop_records, new_edge_labels],
+                            ignore_index=True,
+                            sort=False
+                        ).drop_duplicates(subset=[EDGE_ID])
+                        new_edge_ids = _domain_unique(new_edge_labels[EDGE_ID])
+                        seen_edge_ids = _domain_union(seen_edge_ids, new_edge_ids)
+
+        if track_node_hops and node_hop_col is not None:
+            if node_hop_records is None:
+                node_hop_records = new_node_ids.assign(**{node_hop_col: current_hop})
+                seen_node_ids = _domain_unique(node_hop_records[node_col])
+            else:
+                seen_node_ids = (
+                    seen_node_ids
+                    if seen_node_ids is not None
+                    else _domain_unique(node_hop_records[node_col])
+                )
+                if _domain_is_empty(seen_node_ids):
+                    new_node_labels = new_node_ids
+                else:
+                    new_mask = ~new_node_ids[node_col].isin(seen_node_ids)
+                    new_node_labels = new_node_ids[new_mask]
+                if len(new_node_labels) > 0:
+                    node_hop_records = concat(
+                        [node_hop_records, new_node_labels.assign(**{node_hop_col: current_hop})],
+                        ignore_index=True,
+                        sort=False
+                    ).drop_duplicates(subset=[node_col])
+                    new_node_ids_domain = _domain_unique(new_node_labels[node_col])
+                    seen_node_ids = _domain_union(seen_node_ids, new_node_ids_domain)
+
+        if matches_nodes is None:  # first iteration
+            if return_as_wave_front:
+                matches_nodes = new_node_ids[:0]
+            else:
+                matches_nodes = hop_edges[[FROM_COL]].rename(
+                    columns={FROM_COL: node_col}
+                ).drop_duplicates(subset=[node_col])
+
+        if len(matches_nodes) > 0:
+            combined_node_ids = concat(
+                [matches_nodes, new_node_ids],
+                ignore_index=True,
+                sort=False
+            ).drop_duplicates()
+        else:
+            combined_node_ids = new_node_ids
+
+        # A saturated node set still admits longer WALKS; the finite max_hops keeps this finite.
+        min_bound_unmet = (
+            resolved_min_hops is not None
+            and resolved_min_hops > 1
+            and max_reached_hop < resolved_min_hops
+            and not to_fixed_point
+            and resolved_max_hops is not None
+        )
+        if len(combined_node_ids) == len(matches_nodes) and not min_bound_unmet:
+            break
+
+        wave_front = new_node_ids
+        matches_nodes = combined_node_ids
+
+    if resolved_min_hops is not None and max_reached_hop < resolved_min_hops:
+        matches_nodes = starting_nodes[[node_col]][:0]
+        matches_edges = edges_indexed[[EDGE_ID]][:0]
+        if node_hop_records is not None:
+            node_hop_records = node_hop_records[:0]
+        if edge_hop_records is not None:
+            edge_hop_records = edge_hop_records[:0]
+
+    # Prune dead-end branches that do not reach min_hops.
+    # Use edge endpoints rather than node hop records to avoid lossy per-node min hop labels.
+    min_hop_prune_applied = False
+    if (
+        resolved_min_hops is not None
+        and resolved_min_hops > 1
+        and node_hop_records is not None
+        and edge_hop_records is not None
+        and node_hop_col is not None
+        and edge_hop_col is not None
+        and max_reached_hop >= resolved_min_hops
+    ):
+        valid_endpoint_edges = edge_hop_records[edge_hop_records[edge_hop_col] >= resolved_min_hops]
+        valid_endpoint_edges_with_nodes = safe_merge(
+            valid_endpoint_edges,
+            edges_indexed[[EDGE_ID, g2._source, g2._destination]],
+            on=EDGE_ID,
+            how='inner',
+            engine=engine_concrete,
+        )
+        if direction == 'forward':
+            goal_node_series = valid_endpoint_edges_with_nodes[g2._destination].drop_duplicates()
+        elif direction == 'reverse':
+            goal_node_series = valid_endpoint_edges_with_nodes[g2._source].drop_duplicates()
+        else:
+            goal_node_series = concat([
+                valid_endpoint_edges_with_nodes[g2._source],
+                valid_endpoint_edges_with_nodes[g2._destination]
+            ], ignore_index=True, sort=False).drop_duplicates()
+
+        if len(goal_node_series) > 0:
+            edge_records_with_endpoints = safe_merge(
+                edge_hop_records,
+                edges_indexed[[EDGE_ID, g2._source, g2._destination]],
+                on=EDGE_ID,
+                how='inner',
+                engine=engine_concrete,
+            )
+
+            valid_node_series = goal_node_series
+            valid_edge_list = []
+            valid_node_hop_frames: List[DataFrameT] = []
+            current_targets = goal_node_series
+
+            rebuild_node_hops_from_retained_paths = direction in ('forward', 'reverse')
+
+            max_edge_hop = int(edge_hop_records[edge_hop_col].max()) if len(edge_hop_records) > 0 else max_reached_hop
+            for hop_level in range(max_edge_hop, 0, -1):
+                hop_edges = edge_records_with_endpoints[
+                    edge_records_with_endpoints[edge_hop_col] == hop_level
+                ]
+
+                # An edge at >= min_hops ends a qualifying walk itself; only sub-min levels feed one.
+                level_is_goal = hop_level >= resolved_min_hops  # fixes #1944
+                new_node_hops = None
+                if direction == 'forward':
+                    reaching_edges = hop_edges if level_is_goal else hop_edges[hop_edges[g2._destination].isin(current_targets)]
+                    new_source_series = reaching_edges[g2._source]
+                    new_node_hops = reaching_edges[[g2._source]].rename(columns={g2._source: node_col})
+                elif direction == 'reverse':
+                    reaching_edges = hop_edges if level_is_goal else hop_edges[hop_edges[g2._source].isin(current_targets)]
+                    new_source_series = reaching_edges[g2._destination]
+                    new_node_hops = reaching_edges[[g2._destination]].rename(columns={g2._destination: node_col})
+                else:
+                    reaching_fwd = hop_edges if level_is_goal else hop_edges[hop_edges[g2._destination].isin(current_targets)]
+                    reaching_rev = hop_edges if level_is_goal else hop_edges[hop_edges[g2._source].isin(current_targets)]
+                    reaching_edges = concat([reaching_fwd, reaching_rev], ignore_index=True, sort=False).drop_duplicates(subset=[EDGE_ID])
+                    new_source_series = concat([
+                        reaching_fwd[g2._source],
+                        reaching_rev[g2._destination]
+                    ], ignore_index=True, sort=False)
+                    new_node_hops = concat([
+                        reaching_fwd[[g2._source]].rename(columns={g2._source: node_col}),
+                        reaching_rev[[g2._destination]].rename(columns={g2._destination: node_col}),
+                    ], ignore_index=True, sort=False)
+
+                valid_edge_list.append(reaching_edges[EDGE_ID])
+                valid_node_series = concat([valid_node_series, new_source_series], ignore_index=True, sort=False)
+                if (
+                    rebuild_node_hops_from_retained_paths
+                    and new_node_hops is not None
+                    and len(new_node_hops) > 0
+                    and (label_seeds or hop_level > 1)
+                ):
+                    valid_node_hop_frames.append(new_node_hops.assign(**{node_hop_col: hop_level - 1}))
+                current_targets = new_source_series.drop_duplicates()
+
+            valid_node_series = valid_node_series.drop_duplicates()
+            valid_edge_series = concat(valid_edge_list, ignore_index=True, sort=False).drop_duplicates() if valid_edge_list else goal_node_series[:0]
+
+            # Goal labels feed a groupby on node_hop_col: rename, or distinct-name arms read a dead column (all-NULL labels)
+            if rebuild_node_hops_from_retained_paths:
+                goal_endpoint_col = g2._destination if direction == 'forward' else g2._source
+                goal_label_rows = (
+                    valid_endpoint_edges_with_nodes[[goal_endpoint_col, EDGE_ID, edge_hop_col]]
+                    .rename(columns={goal_endpoint_col: node_col, edge_hop_col: node_hop_col}))
+                if node_hop_col != edge_hop_col:
+                    # Goals off the retained walk keep their row but a NULL label (net membership unchanged)
+                    unretained_mask = ~goal_label_rows[EDGE_ID].isin(valid_edge_series)
+                    goal_label_rows.loc[unretained_mask, node_hop_col] = s_na(engine_concrete)
+                valid_node_hop_frames.append(goal_label_rows[[node_col, node_hop_col]])
+
+            edge_hop_records = edge_hop_records[edge_hop_records[EDGE_ID].isin(valid_edge_series)]
+            if valid_node_hop_frames:
+                node_hop_records = (
+                    concat(valid_node_hop_frames, ignore_index=True, sort=False)
+                    .dropna(subset=[node_col])
+                    .groupby(node_col, as_index=False)[node_hop_col]
+                    .min()
+                )
+            else:
+                node_hop_records = node_hop_records[node_hop_records[node_col].isin(valid_node_series)]
+            min_hop_prune_applied = True
+            if (
+                not label_seeds
+                and seeds_provided
+                and starting_nodes is not None
+                and node_col in starting_nodes.columns
+                and rebuild_node_hops_from_retained_paths
+            ):
+                seed_ids_for_labels = starting_nodes[node_col].dropna()
+                retained_edges_with_endpoints = edge_records_with_endpoints[
+                    edge_records_with_endpoints[EDGE_ID].isin(valid_edge_series)
+                ]
+                if direction == 'forward':
+                    retained_seed_hops = (
+                        retained_edges_with_endpoints[
+                            retained_edges_with_endpoints[g2._destination].isin(seed_ids_for_labels)
+                        ][[g2._destination, edge_hop_col]]
+                        .rename(columns={g2._destination: node_col, edge_hop_col: node_hop_col})
+                    )
+                else:
+                    retained_seed_hops = (
+                        retained_edges_with_endpoints[
+                            retained_edges_with_endpoints[g2._source].isin(seed_ids_for_labels)
+                        ][[g2._source, edge_hop_col]]
+                        .rename(columns={g2._source: node_col, edge_hop_col: node_hop_col})
+                    )
+                if len(retained_seed_hops) > 0:
+                    nonzero_seed_mask = (
+                        node_hop_records[node_col].isin(seed_ids_for_labels)
+                        & (node_hop_records[node_hop_col] == 0)
+                    )
+                    node_hop_records = concat(
+                        [node_hop_records[~nonzero_seed_mask], retained_seed_hops],
+                        ignore_index=True,
+                        sort=False,
+                    ).groupby(node_col, as_index=False)[node_hop_col].min()
+            matches_edges = matches_edges[matches_edges[EDGE_ID].isin(valid_edge_series)]
+            if matches_nodes is not None:
+                matches_nodes = matches_nodes[matches_nodes[node_col].isin(valid_node_series)]
+
+    if track_edge_hops and edge_hop_col is not None:
+        edge_labels_source = edge_hop_records
+        if edge_labels_source is None:
+            edge_labels_source = edges_indexed[[EDGE_ID]][:0].assign(**{edge_hop_col: []})
+
+        edge_mask = None
+        if final_output_min is not None:
+            edge_mask = edge_labels_source[edge_hop_col] >= final_output_min
+        if final_output_max is not None:
+            max_mask = edge_labels_source[edge_hop_col] <= final_output_max
+            edge_mask = max_mask if edge_mask is None else edge_mask & max_mask
+
+        if edge_mask is not None:
+            edge_labels_source = edge_labels_source[edge_mask]
+
+        final_edges = safe_merge(
+            edges_indexed,
+            edge_labels_source,
+            on=EDGE_ID,
+            how='inner',
+            engine=engine_concrete,
+        )
+        if label_edge_hops is None and edge_hop_col in final_edges:
+            # Preserve hop labels when output slicing is requested so callers can filter.
+            if output_min_hops is None and output_max_hops is None:
+                final_edges = final_edges.drop(columns=[edge_hop_col])
+    else:
+        final_edges = safe_merge(
+            edges_indexed,
+            matches_edges,
+            on=EDGE_ID,
+            how='inner',
+            engine=engine_concrete,
+        )
+
+    if EDGE_ID not in self._edges:
+        final_edges = final_edges.drop(columns=[EDGE_ID])
+    g_out = g2.edges(final_edges)
+
+    # UNCONDITIONAL, matching polars: gating on `self._nodes` left edges-only graphs inconsistent.
+    rich_nodes = self._nodes if self._nodes is not None else g2._nodes
+    assert rich_nodes is not None, "materialize_nodes guarantees a node frame"
+    if target_wave_front is not None:
+        rich_nodes = concat([rich_nodes, target_wave_front], ignore_index=True, sort=False).drop_duplicates(subset=[node_col])
+
+    base_nodes = matches_nodes if matches_nodes is not None else wave_front[:0]
+
+    if track_node_hops and node_hop_col is not None:
+        node_labels_source = node_hop_records
+        if node_labels_source is None:
+            node_labels_source = base_nodes.assign(**{node_hop_col: []})
+
+        node_labels_source = node_labels_source.copy()
+        unfiltered_node_labels_source = node_labels_source.copy()
+        node_mask = None
+        if final_output_min is not None:
+            node_mask = node_labels_source[node_hop_col] >= final_output_min
+        if final_output_max is not None:
+            max_node_mask = node_labels_source[node_hop_col] <= final_output_max
+            node_mask = max_node_mask if node_mask is None else node_mask & max_node_mask
+
+        if node_mask is not None:
+            node_labels_source.loc[~node_mask, node_hop_col] = s_na(engine_concrete)
+
+        if label_seeds:
+            if node_hop_records is not None:
+                seed_rows = node_hop_records[node_hop_col] == 0
+                if seed_rows.any():
+                    seeds_for_output = node_hop_records[seed_rows]
+                    node_labels_source = concat(
+                        [node_labels_source, seeds_for_output],
+                        ignore_index=True,
+                        sort=False
+                    ).drop_duplicates(subset=[node_col])
+            elif starting_nodes is not None and node_col in starting_nodes.columns:
+                seed_nodes = starting_nodes[[node_col]].drop_duplicates()
+                node_labels_source = concat(
+                    [node_labels_source, seed_nodes.assign(**{node_hop_col: 0})],
+                    ignore_index=True,
+                    sort=False
+                ).drop_duplicates(subset=[node_col])
+
+        # Hop labels are a left-join on the traversal result, never a filter.
+        filtered_nodes = base_nodes
+        if min_hop_prune_applied:
+            # Here the label set IS the retained-path set: dropping is how dead ends leave.
+            filtered_nodes = safe_merge(
+                base_nodes,
+                node_labels_source[[node_col]],
+                on=node_col,
+                how='inner')
+
+        final_nodes = safe_merge(
+            rich_nodes,
+            filtered_nodes,
+            on=node_col,
+            how='inner')
+
+        final_nodes = safe_merge(
+            final_nodes,
+            node_labels_source,
+            on=node_col,
+            how='left')
+
+        if node_hop_col in final_nodes and unfiltered_node_labels_source is not None:
+            fallback_map = (
+                unfiltered_node_labels_source[[node_col, node_hop_col]]
+                .drop_duplicates(subset=[node_col])
+                .set_index(node_col)[node_hop_col]
+            )
+            try:
+                final_nodes[node_hop_col] = _combine_first_no_warn(
+                    final_nodes[node_hop_col],
+                    safe_map_series(final_nodes[node_col], fallback_map)
+                )
+            except Exception:
+                pass
+
+            try:
+                if final_nodes[node_hop_col].notna().all():
+                    final_nodes[node_hop_col] = final_nodes[node_hop_col].astype('int64')
+            except Exception:
+                pass
+
+        if label_node_hops is None and node_hop_col in final_nodes:
+            final_nodes = final_nodes.drop(columns=[node_hop_col])
+    else:
+        final_nodes = safe_merge(
+            rich_nodes,
+            base_nodes,
+            on=node_col,
+            how='inner')
+
+    g_out = g_out.nodes(final_nodes)
+
+    if g_out._edges is not None and len(g_out._edges) > 0 and g_out._nodes is not None:
+        unbacked_endpoints = _endpoint_ids_without_node_rows(g_out, concat)
+        # Unlabeled min_hops>1 excludes pruned seed rows; labeled hops keep the NULL-labeled stub the chain wavefront contract expects
+        if min_hop_prune_applied and label_node_hops is None and not label_seeds \
+                and seeds_provided and node_col in starting_nodes.columns:  # 1918 F2 seed residue
+            unbacked_endpoints = unbacked_endpoints[
+                ~unbacked_endpoints[g_out._node].isin(starting_nodes[node_col])]
+        nodes_out = g_out._nodes
+        if track_node_hops and node_hop_records is not None and node_hop_col is not None:
+            nodes_out = _nodes_with_hop_label_column(nodes_out, node_hop_col)
+        if len(unbacked_endpoints) > 0:
+            if track_node_hops and node_hop_records is not None and node_hop_col is not None:
+                unbacked_endpoints = safe_merge(
+                    unbacked_endpoints,
+                    node_hop_records[[g_out._node, node_hop_col]].drop_duplicates(subset=[g_out._node]),
+                    on=g_out._node,
+                    how='left'
+                )
+            unbacked_endpoints = align_shared_column_dtypes(nodes_out, unbacked_endpoints)
+            nodes_out = safe_row_concat(
+                [nodes_out, unbacked_endpoints], ignore_index=True, sort=False)
+        g_out = g_out.nodes(nodes_out.drop_duplicates(subset=[g_out._node]))
+
+    if track_node_hops and node_hop_records is not None and node_hop_col is not None and g_out._nodes is not None:
+        hop_map = (
+            node_hop_records[[node_col, node_hop_col]]
+            .drop_duplicates(subset=[node_col])
+            .set_index(node_col)[node_hop_col]
+        )
+        if node_col in g_out._nodes.columns and node_hop_col in g_out._nodes.columns:
+            try:
+                mapped = safe_map_series(g_out._nodes[node_col], hop_map)
+                g_out._nodes[node_hop_col] = g_out._nodes[node_hop_col].where(
+                    g_out._nodes[node_hop_col].notna(),
+                    mapped
+                )
+            except Exception:
+                pass
+            seeds_mask = None
+            if seeds_provided and not label_seeds and starting_nodes is not None and node_col in starting_nodes.columns:
+                seed_ids_df = cast(DataFrameT, column_frame(starting_nodes, node_col).drop_duplicates())
+                seeds_mask = g_out._nodes[node_col].isin(column_values(seed_ids_df, node_col))
+            missing_mask = g_out._nodes[node_hop_col].isna()
+            if seeds_mask is not None:
+                missing_mask = missing_mask & ~seeds_mask
+            if g_out._edges is not None and edge_hop_col is not None and edge_hop_col in g_out._edges.columns:
+                edge_map_df = concat(
+                    [
+                        g_out._edges[[g_out._source, edge_hop_col]].rename(columns={g_out._source: node_col}),
+                        g_out._edges[[g_out._destination, edge_hop_col]].rename(columns={g_out._destination: node_col}),
+                    ],
+                    ignore_index=True,
+                    sort=False,
+                )
+                if len(edge_map_df) > 0:
+                    edge_map = edge_map_df.groupby(node_col)[edge_hop_col].min()
+                else:
+                    SeriesCls = s_series(engine_concrete)
+                    edge_map = SeriesCls([], dtype='float64')
+                mapped_edge_hops = safe_map_series(g_out._nodes[node_col], edge_map)
+                if seeds_mask is not None:
+                    mapped_edge_hops = mapped_edge_hops.mask(seeds_mask)
+                g_out._nodes[node_hop_col] = _combine_first_no_warn(
+                    g_out._nodes[node_hop_col],
+                    mapped_edge_hops
+                )
+            if missing_mask.any() and edge_hop_col is not None and g_out._edges is not None and edge_hop_col in g_out._edges.columns:
+                missing_nodes = g_out._nodes.loc[missing_mask]
+                g_out._nodes.loc[missing_mask, node_hop_col] = safe_map_series(missing_nodes[node_col], edge_map)
+            if seeds_mask is not None:
+                zero_seed_mask = seeds_mask & g_out._nodes[node_hop_col].fillna(-1).eq(0)
+                g_out._nodes.loc[zero_seed_mask, node_hop_col] = s_na(engine_concrete)
+            try:
+                to_numeric = s_to_numeric(engine_concrete)
+                g_out._nodes[node_hop_col] = to_numeric(g_out._nodes[node_hop_col], errors='coerce')
+                col = g_out._nodes[node_hop_col]
+                if hasattr(col, 'dtype') and hasattr(col.dtype, 'kind') and col.dtype.kind in ('i', 'f'):
+                    g_out._nodes[node_hop_col] = col.astype('Int64')
+            except Exception:
+                pass
+
+    if (
+        not label_seeds
+        and seeds_provided
+        and g_out._nodes is not None
+        and len(g_out._nodes) > 0
+        and node_hop_records is not None
+        and node_col in g_out._nodes.columns
+        and starting_nodes is not None
+        and node_col in starting_nodes.columns
+        and node_hop_col is not None
+    ):
+        def _ensure_node_hop_col() -> None:
+            assert node_hop_col is not None and g_out._nodes is not None
+            g_out._nodes = _nodes_with_hop_label_column(g_out._nodes, node_hop_col)
+
+        seed_mask_all = g_out._nodes[node_col].isin(starting_nodes[node_col])
+        if direction == 'undirected':
+            _ensure_node_hop_col()
+            g_out._nodes.loc[seed_mask_all, node_hop_col] = s_na(engine_concrete)
+        else:
+            seen_nodes_series = node_hop_records[node_col].dropna()
+            seed_ids_series = starting_nodes[node_col].dropna()
+            unreached_mask = ~seed_ids_series.isin(seen_nodes_series)
+            unreached_seed_ids = seed_ids_series[unreached_mask]
+            if len(unreached_seed_ids) > 0:
+                mask = g_out._nodes[node_col].isin(unreached_seed_ids)
+                _ensure_node_hop_col()
+                g_out._nodes.loc[mask, node_hop_col] = s_na(engine_concrete)
+            if (
+                direction in ('forward', 'reverse')
+                and g_out._edges is not None
+                and edge_hop_col is not None
+                and edge_hop_col in g_out._edges.columns
+            ):
+                endpoint_col = g_out._destination if direction == 'forward' else g_out._source
+                seed_endpoint_hops = g_out._edges[
+                    g_out._edges[endpoint_col].isin(seed_ids_series)
+                ][[endpoint_col, edge_hop_col]].rename(columns={endpoint_col: node_col})
+                if len(seed_endpoint_hops) > 0:
+                    # Non-empty edges here, so the backfill above already added node_hop_col.
+                    seed_endpoint_hop_map = seed_endpoint_hops.groupby(node_col)[edge_hop_col].min()
+                    seed_reached_mask = g_out._nodes[node_col].isin(seed_ids_series)
+                    seed_node_ids = g_out._nodes[node_col]
+                    seed_node_hops = g_out._nodes[node_hop_col]
+                    reached_seed_hops = safe_map_series(
+                        seed_node_ids[seed_reached_mask],
+                        seed_endpoint_hop_map,
+                    )
+                    g_out._nodes.loc[seed_reached_mask, node_hop_col] = _combine_first_no_warn(
+                        seed_node_hops[seed_reached_mask],
+                        reached_seed_hops,
+                    )
+
+    if g_out._nodes is not None and (final_output_min is not None or final_output_max is not None):
+        try:
+            SeriesCls = s_series(engine_concrete)
+            mask = SeriesCls(True, index=g_out._nodes.index)
+            if node_hop_col is not None and node_hop_col in g_out._nodes.columns:
+                # fillna BEFORE combining: cuDF &/| are non-Kleene and NULL-masked rows drop (1798 self-loop seeds)
+                if final_output_min is not None:
+                    mask = mask & (g_out._nodes[node_hop_col] >= final_output_min).fillna(False)
+                if final_output_max is not None:
+                    mask = mask & (g_out._nodes[node_hop_col] <= final_output_max).fillna(False)
+            endpoint_ids = None
+            if g_out._edges is not None:
+                endpoint_ids = concat(
+                    [
+                        g_out._edges[[g_out._source]].rename(columns={g_out._source: node_col}),
+                        g_out._edges[[g_out._destination]].rename(columns={g_out._destination: node_col}),
+                    ],
+                    ignore_index=True,
+                    sort=False,
+                ).drop_duplicates(subset=[node_col])
+                mask = mask | g_out._nodes[node_col].isin(endpoint_ids[node_col])
+            if label_seeds and seeds_provided and starting_nodes is not None and node_col in starting_nodes.columns:
+                label_seed_ids_df = cast(DataFrameT, column_frame(starting_nodes, node_col).drop_duplicates())
+                mask = mask | g_out._nodes[node_col].isin(column_values(label_seed_ids_df, node_col))
+            g_out = g_out.nodes(g_out._nodes[mask].drop_duplicates(subset=[node_col]))
+        except Exception:
+            pass
+
+    if (
+        return_as_wave_front
+        and resolved_min_hops is not None
+        and resolved_min_hops >= 1
+        and seeds_provided
+        # NOT gated on label_seeds: a LABEL contract must not change WHICH nodes come back.
+        and g_out._nodes is not None
+        and starting_nodes is not None
+        and node_col in starting_nodes.columns
+    ):
+        wavefront_seed_ids_df = cast(DataFrameT, column_frame(starting_nodes, node_col).drop_duplicates())
+        # ONE rule, both arms: survive iff REACHED and edge-disjointly rediscovered.
+        single_edge_window = (
+            not to_fixed_point and resolved_max_hops is not None and resolved_max_hops <= 1
+        )
+        # A one-edge window is edge-disjoint by construction, so reached alone is already exact.
+        if direction == 'undirected' and not single_edge_window:
+            keep_seeds = rediscovered_seed_ids(
+                final_edges, source_col, destination_col, wavefront_seed_ids_df, node_col)
+            if matches_nodes is None or len(matches_nodes) == 0:
+                keep_seeds = keep_seeds.iloc[:0]
+            else:
+                keep_seeds = keep_seeds[keep_seeds[node_col].isin(column_values(matches_nodes, node_col))]
+            seed_mask = g_out._nodes[node_col].isin(column_values(wavefront_seed_ids_df, node_col))
+            keep_mask = g_out._nodes[node_col].isin(column_values(keep_seeds, node_col))
+            filtered_nodes = g_out._nodes[~seed_mask | keep_mask]
+        else:
+            seeds_not_reached_df = wavefront_seed_ids_df
+            if matches_nodes is not None and node_col in matches_nodes.columns:
+                seeds_not_reached_df = wavefront_seed_ids_df[
+                    ~column_values(wavefront_seed_ids_df, node_col).isin(column_values(matches_nodes, node_col))
+                ]
+            filtered_nodes = g_out._nodes[~g_out._nodes[node_col].isin(column_values(seeds_not_reached_df, node_col))]
+        g_out = g_out.nodes(filtered_nodes)
+
+    # Internal tracking columns must never reach user output; backfills above re-add them after the mid-function drops
+    if label_node_hops is None and node_hop_col is not None \
+            and g_out._nodes is not None and node_hop_col in g_out._nodes.columns:
+        g_out = g_out.nodes(g_out._nodes.drop(columns=[node_hop_col]))
+    if label_edge_hops is None and edge_hop_col is not None \
+            and g_out._edges is not None and edge_hop_col in g_out._edges.columns:
+        g_out = g_out.edges(g_out._edges.drop(columns=[edge_hop_col]))
+
+    return g_out

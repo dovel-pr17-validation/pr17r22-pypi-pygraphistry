@@ -1,0 +1,392 @@
+"""Known cross-engine divergences on DEGENERATE inputs, pinned as strict xfails.
+
+Each of these is a real, pre-existing divergence (verified to reproduce on
+masters predating the current release) on input the data model treats as
+malformed -- dangling edge endpoints, duplicate node ids. They are pinned
+executable so (a) the release notes can point at exactly what diverges, and
+(b) the fix PR flips a strict xfail instead of rediscovering the shape.
+"""
+import os
+
+import pandas as pd
+import pytest
+
+import graphistry
+
+try:
+    import polars as pl
+    _HAS_POLARS = True
+except ImportError:
+    _HAS_POLARS = False
+
+polars_only = pytest.mark.skipif(not _HAS_POLARS, reason="polars not installed")
+
+
+@polars_only
+def test_1808_dangling_destination_pandas_matches_polars():
+    """#1808 (fixed by #1888 endpoint closure): an edge whose DESTINATION id has
+    no node row was matched by pandas/cuDF and dropped by polars (a dangling
+    SOURCE was dropped by all). polars was the Cypher-correct side --
+    `(a)-[]->(b)` binds b to a NODE. The pandas/cuDF endpoint gate is now
+    symmetric: both dangling sides are dropped on every engine."""
+    nodes = pd.DataFrame({"id": [0, 1, 2]})
+    edges = pd.DataFrame({"s": [0, 1], "d": [1, 9]})  # 1 -> 9 dangles
+    q = "MATCH (a)-[]->(b) RETURN count(*) AS c"
+    c_pandas = (graphistry.nodes(nodes, "id").edges(edges, "s", "d")
+                .gfql(q, engine="pandas")._nodes["c"].iloc[0])
+    g_pl = graphistry.nodes(pl.from_pandas(nodes), "id").edges(
+        pl.from_pandas(edges), "s", "d")
+    c_polars = g_pl.gfql(q, engine="polars")._nodes.to_pandas()["c"].iloc[0]
+    assert int(c_polars) == 1  # the Cypher-correct answer, already served
+    assert int(c_pandas) == int(c_polars)
+
+
+@polars_only
+def test_1739_has_label_aggregate_on_duplicate_ids_converges():
+    """#1739 (fixed): duplicate node id across Tag/Forum rows; the aggregating
+    single-MATCH shape serves BOTH engines via the grouped-aggregate fast path,
+    where pandas kept one row per id by frame order (an accident, not the row
+    pipeline's label narrowing) and polars kept both. The fast path now applies
+    the `_gfql_disambiguate_has_edge_destination_nodes` conditional to the
+    destination domain before its property joins
+    (`_has_edge_destination_disambiguated_nodes`), so every engine answers the
+    label-narrowed row set — see test_has_label_dup_id_fast_path.py for the
+    order-flip and no-narrowing pins."""
+    nodes = pd.DataFrame({
+        "id": [601, 400, 400],
+        "label__Post": [True, False, False],
+        "label__Tag": [False, True, False],
+        "label__Forum": [False, False, True],
+        "name": [None, "t4", "f4"],
+    })
+    edges = pd.DataFrame({"src": [601], "dst": [400], "type": ["HAS_TAG"]})
+    q = ("MATCH (post:Post {id: 601})-[:HAS_TAG]->(tag) "
+         "RETURN tag.name AS tagName, count(post) AS c")
+    out_pd = (graphistry.nodes(nodes, "id").edges(edges, "src", "dst")
+              .gfql(q, engine="pandas")._nodes.to_dict("records"))
+    g_pl = graphistry.nodes(pl.from_pandas(nodes), "id").edges(
+        pl.from_pandas(edges), "src", "dst")
+    out_pl = sorted(g_pl.gfql(q, engine="polars")._nodes.to_pandas().to_dict("records"),
+                    key=str)
+    narrowed = [{"tagName": "t4", "c": 1}]
+    assert out_pd == narrowed
+    assert out_pl == narrowed
+
+
+@pytest.mark.route_engaged("cypher-fast")
+@polars_only
+@pytest.mark.xfail(strict=True, reason="#1824: fast paths serve CPU work under engine='polars-gpu'")
+def test_1824_polars_gpu_fast_path_serve_is_gpu_or_decline():
+    """#1824: the fast paths run before the chain route establishes the GPU
+    execution target, and their eager arms (dense kernel, eager twins) never
+    collect -- so engine='polars-gpu' serves CPU work labeled as GPU. On a
+    GPU-less box this query must NOT be answered by a fast path: the honest
+    outcomes are a decline (chain route raises its install error) or a
+    GPU-executed serve. dgx measured 86 polars-gpu tests green only via the
+    mislabel, so the fix (per-arm GPU-or-decline) is next-cycle scoped; the
+    collect routing + NIE-decline plumbing already landed with this pin.
+    """
+    from graphistry.tests.compute.gfql.engagement import fast_path_decisions
+
+    nodes = pl.DataFrame({"id": [0, 1, 2], "kind": ["P"] * 3})
+    edges = pl.DataFrame({"s": [0, 1, 2], "d": [1, 2, 0], "rel": ["F"] * 3})
+    g = graphistry.nodes(nodes, "id").edges(edges, "s", "d")
+    q = ("MATCH (a {kind:'P'})-[{rel:'F'}]->(b {kind:'P'})-[{rel:'F'}]->(c {kind:'P'}) "
+         "RETURN count(*) AS n")
+    try:
+        decisions = fast_path_decisions(g, q, engine="polars-gpu")
+    except (NotImplementedError, ImportError):
+        return  # honest: GPU stack absent and nothing served on CPU
+    assert not any(decisions.values()), (
+        f"fast path served CPU work under polars-gpu: {decisions}")
+
+
+@polars_only
+def test_1888_unconstrained_chain_respects_endpoint_closure():
+    """#1888 F-01 (fixed): with nodes bound, a pattern edge matches only if BOTH
+    endpoints resolve to node rows (the converged contract). The polars
+    unconstrained chain fast path now applies the node-universe semi-join on
+    both endpoints, so attaching a policy no longer flips the value."""
+    from graphistry.compute.ast import n, e_forward
+
+    nodes = pd.DataFrame({"id": [0, 1]})
+    edges = pd.DataFrame({"s": [0, 1, 5], "d": [1, 2, 6]})
+    g_pl = graphistry.nodes(pl.from_pandas(nodes), "id").edges(pl.from_pandas(edges), "s", "d")
+    out = g_pl.gfql([n(), e_forward(), n()], engine="polars")._edges
+    n_edges = len(out.to_pandas() if hasattr(out, "to_pandas") else out)
+    assert n_edges == 1, f"dangling edges matched: {n_edges} (contract: endpoint closure)"
+
+
+@polars_only
+def test_1888_projection_and_count_agree_on_dangling():
+    """#1888 F-02 (fixed): within ONE engine, the projection and count(*) of the
+    same pattern must agree; with endpoint closure both serve the closed answer.
+    The projection is pinned via property columns (`RETURN a.v, b.v`) -- the
+    whole-entity multi-alias form (`RETURN a, b`) is an honest NIE on the polars
+    projector (separate gap, not an endpoint-gate divergence). Pinned on BOTH
+    engines: #1808's pandas asymmetry made pandas project the dangling row."""
+    nodes = pd.DataFrame({"id": [0, 1], "v": [10, 20]})
+    edges = pd.DataFrame({"s": [0, 1], "d": [1, 2]})
+    g_pd = graphistry.nodes(nodes, "id").edges(edges, "s", "d")
+    g_pl = graphistry.nodes(pl.from_pandas(nodes), "id").edges(pl.from_pandas(edges), "s", "d")
+    for engine, g in [("pandas", g_pd), ("polars", g_pl)]:
+        rows = g.gfql("MATCH (a)-[r]->(b) RETURN a.v AS av, b.v AS bv", engine=engine)._nodes
+        n_rows = len(rows.to_pandas() if hasattr(rows, "to_pandas") else rows)
+        cnt = g.gfql("MATCH (a)-[]->(b) RETURN count(*) AS c", engine=engine)._nodes
+        c = int((cnt.to_pandas() if hasattr(cnt, "to_pandas") else cnt)["c"].iloc[0])
+        assert n_rows == c == 1, f"{engine}: projection {n_rows} vs count {c} (closed answer: 1)"
+
+
+# --- #1888 endpoint-closure invariant pins -------------------------------------------------
+# THE CONTRACT (one rule, all surfaces/engines/policy states): when a node table is
+# bound, a pattern edge matches only if BOTH endpoints resolve to node rows.
+# Fixture (findings round-002 agent-01): nodes id=[0,1]; edges 0->1 valid, 1->2
+# dangling-destination, 5->6 both-endpoints-missing. Closed answer everywhere: 1 edge.
+
+_1888_NODES = pd.DataFrame({"id": [0, 1], "v": [10, 20]})
+_1888_EDGES = pd.DataFrame({"s": [0, 1, 5], "d": [1, 2, 6]})
+_1888_POLICY = {"preload": (lambda ctx: None)}  # disables fast paths / flips serving lane
+
+
+def _1888_g(engine):
+    if engine == "polars":
+        return graphistry.nodes(pl.from_pandas(_1888_NODES), "id").edges(
+            pl.from_pandas(_1888_EDGES), "s", "d")
+    return graphistry.nodes(_1888_NODES, "id").edges(_1888_EDGES, "s", "d")
+
+
+def _height(df):
+    return len(df.to_pandas() if hasattr(df, "to_pandas") else df)
+
+
+@pytest.mark.parametrize("engine", ["pandas", pytest.param("polars", marks=polars_only)])
+def test_1888_chain_closed_answer_policy_invariant(engine):
+    """Chain surface: 1 edge, endpoints ⊆ node table, policy on/off identical."""
+    from graphistry.compute.ast import n, e_forward
+
+    g = _1888_g(engine)
+    ops = [n(), e_forward(), n()]
+    out = g.gfql(ops, engine=engine)
+    out_policy = g.gfql(ops, engine=engine, policy=_1888_POLICY)
+    assert _height(out._edges) == 1
+    assert _height(out_policy._edges) == 1
+    nodes_df = out._nodes.to_pandas() if hasattr(out._nodes, "to_pandas") else out._nodes
+    assert set(nodes_df["id"]) <= {0, 1}
+
+
+@pytest.mark.parametrize("engine", ["pandas", pytest.param("polars", marks=polars_only)])
+def test_1888_cypher_rows_and_count_closed_answer(engine):
+    """Cypher surface: property projection rows == count(*) == 1 on the closed answer."""
+    g = _1888_g(engine)
+    rows = g.gfql("MATCH (a)-[r]->(b) RETURN a.v AS av, b.v AS bv", engine=engine)._nodes
+    cnt = g.gfql("MATCH (a)-[]->(b) RETURN count(*) AS c", engine=engine)._nodes
+    c = int((cnt.to_pandas() if hasattr(cnt, "to_pandas") else cnt)["c"].iloc[0])
+    assert _height(rows) == 1
+    assert c == 1
+
+
+@pytest.mark.parametrize("engine", ["pandas", pytest.param("polars", marks=polars_only)])
+def test_1888_hop_closed_answer_no_phantom_nodes(engine):
+    """Hop surface (F-03): 1 edge, node set == the real node rows reached — no
+    synthesized NaN-attribute phantom rows, no int64 -> float64 upcast."""
+    g = _1888_g(engine)
+    out = g.hop()
+    assert _height(out._edges) == 1
+    nodes_df = out._nodes.to_pandas() if hasattr(out._nodes, "to_pandas") else out._nodes
+    assert sorted(nodes_df["id"].tolist()) == [0, 1]
+    assert not nodes_df["v"].isna().any()
+    assert str(nodes_df["v"].dtype) == "int64"
+
+
+def test_optional_match_aggregate_keeps_unmatched_seeds_polars_and_pandas():
+    """Cypher: OPTIONAL MATCH keeps unmatched rows with NULLs, so
+    `RETURN p.name, count(x)` must include zero-count seeds. Fixed by routing
+    the single-node-seed shape onto the connected optional-match left-join
+    lowering (#1891); formerly the aggregate projection bypassed the
+    validator gate and inner-joined on BOTH engines."""
+    nodes = pd.DataFrame({"id": [0, 1], "name": ["alice", "bob"], "t": ["P", "P"]})
+    edges = pd.DataFrame({"s": [0], "d": [1]})
+    q = ("MATCH (p {t:'P'}) OPTIONAL MATCH (p)-[]->(x) "
+         "RETURN p.name AS name, count(x) AS c ORDER BY name")
+    out = (graphistry.nodes(nodes, "id").edges(edges, "s", "d")
+           .gfql(q, engine="pandas")._nodes.to_dict("records"))
+    assert out == [{"name": "alice", "c": 1}, {"name": "bob", "c": 0}], out
+
+
+def test_with_carried_scalar_projects_next_to_aggregate():
+    """The carry survives filtering (WHERE q.score > s answers) and plain
+    projection; RETURN s, count(q) used to die with a raw KeyError on pandas
+    (round-002 BUG-3) because the grouped-aggregate fast path let the carried
+    output name collide with the edge source column ('s') and suffixed it
+    away. The fast path now declines on that collision and the row pipeline
+    serves it."""
+    nodes = pd.DataFrame({"id": [0, 1], "kind": ["person", "person"], "score": [5, 9]})
+    edges = pd.DataFrame({"s": [0], "d": [1], "t": ["KNOWS"]})
+    q = ("MATCH (p {kind:'person'}) WITH p, p.score AS s "
+         "MATCH (p)-[{t:'KNOWS'}]->(q) RETURN s, count(q) AS c")
+    out = (graphistry.nodes(nodes, "id").edges(edges, "s", "d")
+           .gfql(q, engine="pandas")._nodes.to_dict("records"))
+    assert out == [{"s": 5, "c": 1}], out
+
+
+def test_sum_over_empty_match_is_zero():
+    """FIXED by #1909: was xfail(strict) for round-002 BUG-4. openCypher 9 s3.2
+    ("sum() ... returns 0 if there were no matching rows") -- the empty-match
+    identity row now carries sum -> 0, not null, on every lowering path."""
+    nodes = pd.DataFrame({"id": [0], "v": [1], "t": ["A"]})
+    edges = pd.DataFrame({"s": [], "d": []})
+    q = "MATCH (a {t:'ZZZ'}) RETURN sum(a.v) AS s"
+    out = (graphistry.nodes(nodes, "id").edges(edges, "s", "d")
+           .gfql(q, engine="pandas")._nodes.to_dict("records"))
+    assert out == [{"s": 0}], out
+
+
+cudf_only = pytest.mark.skipif(
+    __import__("importlib.util", fromlist=["util"]).find_spec("cudf") is None,
+    reason="cudf lane requires a GPU box (--gpus all)")
+
+
+# --- OPTIONAL MATCH grouped aggregates: served on every engine, including cuDF ---------------
+# Hand oracle on nodes alice(id 0, w 5) / bob(id 1, w 7) and the single edge 0->1:
+#   alice matches x=bob  -> count(x)=1, sum(x.w)=7
+#   bob matches nothing  -> count(x)=0, and openCypher's sum over an empty group is 0
+_OM_AGG_ORACLE = [
+    ("count(x) AS c", "c", [{"name": "alice", "c": 1}, {"name": "bob", "c": 0}]),
+    ("sum(x.w) AS s", "s", [{"name": "alice", "s": 7}, {"name": "bob", "s": 0}]),
+]
+
+_needs_cudf = pytest.mark.skipif(
+    os.environ.get("TEST_CUDF", "0") != "1", reason="cudf tests need TEST_CUDF=1 and a GPU")
+
+
+@pytest.mark.parametrize("engine", [
+    "pandas", pytest.param("polars", marks=polars_only),
+    pytest.param("cudf", marks=_needs_cudf)])
+@pytest.mark.parametrize("agg,col,want", _OM_AGG_ORACLE)
+def test_optional_match_grouped_aggregate_is_served_on_every_engine(engine, agg, col, want):
+    nodes = pd.DataFrame({"id": [0, 1], "name": ["alice", "bob"], "t": ["P", "P"], "w": [5, 7]})
+    edges = pd.DataFrame({"s": [0], "d": [1]})
+    if engine == "polars":
+        g = graphistry.nodes(pl.from_pandas(nodes), "id").edges(pl.from_pandas(edges), "s", "d")
+    elif engine == "cudf":
+        import cudf
+        g = graphistry.nodes(cudf.from_pandas(nodes), "id").edges(cudf.from_pandas(edges), "s", "d")
+    else:
+        g = graphistry.nodes(nodes, "id").edges(edges, "s", "d")
+    q = f"MATCH (p {{t:'P'}}) OPTIONAL MATCH (p)-[]->(x) RETURN p.name AS name, {agg}"
+    out = g.gfql(q, engine=engine)._nodes
+    out = out.to_pandas() if hasattr(out, "to_pandas") else out
+    got = sorted(({"name": r["name"], col: int(r[col])} for r in out.to_dict("records")),
+                 key=lambda r: r["name"])
+    assert got == want
+
+
+@cudf_only
+def test_output_hop_window_backfills_the_source_node_row_on_cudf():
+    """RESOLVED divergence (#1798 family): the output-window node mask now fills NULL hop
+    labels to False BEFORE combining (cuDF's &/| are not Kleene, so `NULL | endpoint` stayed
+    NULL and cuDF dropped the row that the endpoint OR rescued on pandas). Both engines now
+    keep the sliced edge's source node row: endpoint closure holds on the OUTPUT.
+    """
+    import cudf
+
+    nodes = pd.DataFrame({"id": [0, 1, 2, 3], "v": [10, 20, 30, 40]})
+    edges = pd.DataFrame({"s": [0, 1, 2], "d": [1, 2, 3]})
+    seed = pd.DataFrame({"id": [0]})
+
+    def _hop(mk, engine):
+        g = graphistry.nodes(mk(nodes), "id").edges(mk(edges), "s", "d")
+        out = g.hop(nodes=mk(seed), max_hops=4, output_max_hops=1,
+                    direction="forward", engine=engine)
+        to_pd = (lambda d: d.to_pandas()) if engine == "cudf" else (lambda d: d)
+        return set(to_pd(out._edges)["s"]), set(to_pd(out._nodes)["id"])
+
+    src_pandas, ids_pandas = _hop(lambda d: d, "pandas")
+    src_cudf, ids_cudf = _hop(cudf.from_pandas, "cudf")
+    assert src_pandas <= ids_pandas  # pandas is the correct side
+    assert src_cudf <= ids_cudf, "cuDF left an edge source with no node row"
+
+
+def test_1695_searchany_float_half_boundary_renders_differently_per_engine():
+    """searchAny renders floats the way the viz inspector does, and the engines cannot all
+    round identically. Pinned executable so the exact shape is discoverable.
+
+    The inspector uses ``sprintf('%.4f')``, i.e. JS ``toFixed``, which rounds half-AWAY
+    from zero on the exact decimal expansion of the double. Python's formatter reproduces
+    that, so pandas matches the UI. polars and cuDF have no column-wide equivalent, and their
+    ``round`` is half-to-EVEN on the binary value, so a value whose 5th decimal is exactly
+    5 can render one unit lower there. Measured on 26,008 realistic column values against a
+    JS reference: pandas 100%, cuDF 99.996%, polars 99.931% (#1695).
+
+    polars is additionally VERSION-dependent at this boundary -- 1.21 agrees with pandas,
+    1.35 does not -- so the polars arm accepts either and fails only on a malformed render.
+
+    The consequence for a user is narrow and worth stating: typing the string the UI shows
+    finds the row on pandas, and misses it on polars/cuDF, for that value class only.
+    """
+    from graphistry.compute.gfql.wysiwyg import render_float_pandas
+
+    # 0.12345 is the canonical case: the double sits just above the half, so JS/pandas
+    # round up to '0.1235' while an engine round() lands on '0.1234'.
+    assert render_float_pandas(pd.Series([0.12345], dtype="float64")).tolist() == ["0.1235"]
+
+    if _HAS_POLARS:
+        from graphistry.compute.gfql.wysiwyg import float_render_expr_polars
+        got = (pl.DataFrame({"x": pl.Series([0.12345], dtype=pl.Float64)})
+               .select(float_render_expr_polars(pl.col("x"), pl.Float64).alias("o"))
+               .to_series().to_list())
+        # WHICH side polars lands on is polars-VERSION-dependent, discovered by this pin
+        # failing on the RAPIDS 25.02 lane: polars 1.21 agrees with pandas here ('0.1235')
+        # while 1.35 does not ('0.1234'). Both are accepted; anything else is a real
+        # regression in the render (wrong width, dropped padding, exponent leaking in).
+        assert got in (["0.1235"], ["0.1234"]), f"polars float render is malformed: {got}"
+
+
+def test_1695_searchany_float_ordinary_values_agree_across_engines():
+    """The counterpart to the pin above: away from half-boundaries the engines DO agree,
+    so the divergence is genuinely narrow rather than a general float mismatch."""
+    from graphistry.compute.gfql.wysiwyg import render_float_pandas
+
+    vals = [0.5, 7.25, -3.125, 0.0, 42.0, 1234.5678]
+    expected = ["0.5000", "7.2500", "-3.1250", "0", "42", "1234.5678"]
+    assert render_float_pandas(pd.Series(vals, dtype="float64")).tolist() == expected
+
+    if _HAS_POLARS:
+        from graphistry.compute.gfql.wysiwyg import float_render_expr_polars
+        got = (pl.DataFrame({"x": pl.Series(vals, dtype=pl.Float64)})
+               .select(float_render_expr_polars(pl.col("x"), pl.Float64).alias("o"))
+               .to_series().to_list())
+        assert got == expected
+
+
+@polars_only
+def test_datetime_render_follows_each_engines_timezone_database():
+    """polars and pandas can disagree about a zone's FUTURE rules, not about arithmetic.
+
+    The WYSIWYG datetime render reads whichever timezone database its engine ships.
+    ``Africa/Casablanca`` schedules DST around Ramadan and its future transitions are
+    revised often, so chrono's bundled copy and Python's ``tzdata`` disagree on instants
+    years out while agreeing on present ones. Pinned rather than hidden: it is a data
+    disagreement, and the fix is aligning the databases, not the code.
+    """
+    from zoneinfo import ZoneInfo
+    import datetime as dt
+
+    zone = "Africa/Casablanca"
+
+    def wall(stamp):
+        inst = dt.datetime.fromisoformat(stamp).replace(tzinfo=dt.timezone.utc)
+        py = inst.astimezone(ZoneInfo(zone)).strftime("%Y-%m-%d %H:%M:%S")
+        got = (pl.DataFrame({"t": pl.Series([stamp]).str.to_datetime()})
+               .select(pl.col("t").dt.replace_time_zone("UTC").dt.convert_time_zone(zone)
+                       .dt.strftime("%Y-%m-%d %H:%M:%S").alias("o"))["o"][0])
+        return py, got
+
+    present_py, present_pl = wall("2024-01-05T03:04:05")
+    assert present_py == present_pl, "a present-day instant must not diverge"
+
+    future_py, future_pl = wall("2034-10-07T22:13:12")
+    if future_py == future_pl:
+        pytest.fail(
+            "the timezone databases now AGREE on Casablanca in 2034 -- delete this pin "
+            f"and the caveat in wysiwyg.render_datetime_pandas ({future_py})")

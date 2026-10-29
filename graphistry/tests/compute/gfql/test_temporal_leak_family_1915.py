@@ -1,0 +1,718 @@
+"""Pins for the temporal/error-leak family: #1915 B-5/B-7/B-8 + A-4, #1880 temporal half.
+
+Oracles are hand-computed from openCypher CIP2016-06-14 ("Comparability and equality"):
+
+- "Temporal instant values with timezone (`DateTime` and `LocalTime`) are compared on a
+  global timeline, as if the instants were normalized to UTC." -> same instant under
+  different offsets IS equal (B-5).
+- "Two given instants `a` and `b` are equal if any only if they are of the same type and
+  neither of them is _before_ or _after_ the other." and "Temporal instant values are
+  only comparable within types." -> `datetime(...) = localdatetime(...)` is false and
+  their ordering is null (B-5, the both-engines-wrong case).
+
+B-7/#1880: temporal-vs-string comparisons must never leak raw backend errors
+(polars InvalidOperationError, numpy ufunc TypeError) — they either answer with the
+pandas-parity row set or raise a typed GFQL error / typed engine decline.
+
+B-8: non-reserved keywords are valid property names (`n.when`, `n.order`, ...).
+
+A-4: UNION branches projecting the SAME names in a different order align by name
+(Neo4j semantics; output keeps the first branch's order); different name sets stay
+a typed decline.
+"""
+from __future__ import annotations
+
+import os
+
+import pandas as pd
+import pytest
+
+import graphistry
+from graphistry.compute.exceptions import ErrorCode, GFQLSchemaError, GFQLSyntaxError, GFQLValidationError
+
+try:
+    import polars as pl
+except ImportError:  # pragma: no cover - polars-lane file also runs in core lane
+    pl = None  # type: ignore[assignment]
+
+try:
+    import cudf
+except ImportError:
+    cudf = None  # type: ignore[assignment]
+
+CUDF_GPU_MARK = pytest.mark.skipif(
+    cudf is None or os.getenv("TEST_CUDF") != "1",
+    reason="cudf installed with GPU execution required (set TEST_CUDF=1)",
+)
+
+
+def _nodes_pd() -> pd.DataFrame:
+    ts = pd.to_datetime([
+        "2020-06-15T08:30:00", "2021-06-15T08:30:00",
+        "2022-01-01T00:00:00", "2019-01-01T00:00:00", None,
+    ])
+    return pd.DataFrame({
+        "id": ["p", "q", "r", "s", "t"],
+        "ts": ts,
+        "ts_aw": ts.tz_localize("UTC"),
+        "ts_aw_lag": ts.tz_localize("UTC") - pd.Timedelta(hours=1),
+        "dur": pd.to_timedelta(["1 days", "2 days", "3 days", "4 days", None]),
+        "when": [1, 2, 3, 4, 5],
+        "i": [7, 8, 9, 10, 11],
+    })
+
+
+def _edges_pd() -> pd.DataFrame:
+    return pd.DataFrame({"s": ["p"], "d": ["q"]})
+
+
+def _graph(engine: str):
+    nodes, edges = _nodes_pd(), _edges_pd()
+    if engine == "polars":
+        assert pl is not None
+        return graphistry.nodes(pl.from_pandas(nodes), "id").edges(pl.from_pandas(edges), "s", "d")
+    if engine == "cudf":
+        assert cudf is not None
+        return graphistry.nodes(cudf.from_pandas(nodes), "id").edges(cudf.from_pandas(edges), "s", "d")
+    return graphistry.nodes(nodes, "id").edges(edges, "s", "d")
+
+
+def _rows(g, query: str, engine: str) -> pd.DataFrame:
+    out = g.gfql(query, engine=engine)._nodes
+    if pl is not None and isinstance(out, pl.LazyFrame):
+        out = out.collect()
+    if hasattr(out, "to_pandas"):
+        out = out.to_pandas()
+    return out.reset_index(drop=True)
+
+
+def _ids(g, query: str, engine: str) -> list:
+    out = _rows(g, query, engine)
+    col = "n.id" if "n.id" in out.columns else out.columns[0]
+    return sorted(out[col].tolist())
+
+
+ENGINES = [
+    "pandas",
+    pytest.param("polars", marks=pytest.mark.skipif(pl is None, reason="polars not installed")),
+    pytest.param("cudf", marks=pytest.mark.skipif(cudf is None, reason="cudf not installed")),
+]
+
+
+# ---------------------------------------------------------------------------
+# B-5: literal temporal comparisons
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("engine", ENGINES)
+class TestB5LiteralTemporalComparison:
+    def test_same_instant_different_offsets_equal(self, engine):
+        """CIP: zoned values compare 'on a global timeline'. Red-at-master on polars
+        (text equality on rendered literals gave False)."""
+        g = _graph(engine)
+        out = _rows(g, "MATCH (n) WHERE n.id = 'p' RETURN "
+                       "datetime('2020-01-02T05:00:00+05:00') = datetime('2020-01-02T00:00:00Z') AS eq", engine)
+        assert out["eq"].tolist() == [True]
+
+    def test_same_instant_different_offsets_not_unequal(self, engine):
+        g = _graph(engine)
+        out = _rows(g, "MATCH (n) WHERE n.id = 'p' RETURN "
+                       "datetime('2020-01-02T05:00:00+05:00') <> datetime('2020-01-02T00:00:00Z') AS eq", engine)
+        assert out["eq"].tolist() == [False]
+
+    def test_offset_vs_offset_same_instant_equal(self, engine):
+        g = _graph(engine)
+        out = _rows(g, "MATCH (n) WHERE n.id = 'p' RETURN "
+                       "datetime('2020-01-02T05:00:00+05:00') = datetime('2020-01-01T19:00:00-05:00') AS eq", engine)
+        assert out["eq"].tolist() == [True]
+
+    def test_distinct_instants_stay_unequal(self, engine):
+        """Anti-vacuity: the fold is a real instant comparison, not a constant True."""
+        g = _graph(engine)
+        out = _rows(g, "MATCH (n) WHERE n.id = 'p' RETURN "
+                       "datetime('2020-01-02T05:00:00+05:00') = datetime('2020-01-02T00:00:01Z') AS eq", engine)
+        assert out["eq"].tolist() == [False]
+
+    def test_same_type_ordering_answers(self, engine):
+        """Ordering two zoned literals compares instants (polars declined this NIE before)."""
+        g = _graph(engine)
+        out = _rows(g, "MATCH (n) WHERE n.id = 'p' RETURN "
+                       "datetime('2020-01-02T05:00:00+05:00') < datetime('2020-01-02T00:00:01Z') AS eq", engine)
+        assert out["eq"].tolist() == [True]
+
+    def test_zoned_vs_local_equality_is_false(self, engine):
+        """CIP: equal 'if any only if they are of the same type ...'. Red-at-master on
+        BOTH pandas and polars (each answered True)."""
+        g = _graph(engine)
+        out = _rows(g, "MATCH (n) WHERE n.id = 'p' RETURN "
+                       "datetime('2020-01-02T00:00:00Z') = localdatetime('2020-01-02T00:00:00') AS eq", engine)
+        assert out["eq"].tolist() == [False]
+        out = _rows(g, "MATCH (n) WHERE n.id = 'p' RETURN "
+                       "localdatetime('2020-01-02T00:00:00') = datetime('2020-01-02T00:00:00Z') AS eq", engine)
+        assert out["eq"].tolist() == [False]
+
+    def test_zoned_vs_local_inequality_is_true(self, engine):
+        g = _graph(engine)
+        out = _rows(g, "MATCH (n) WHERE n.id = 'p' RETURN "
+                       "datetime('2020-01-02T00:00:00Z') <> localdatetime('2020-01-02T00:00:00') AS eq", engine)
+        assert out["eq"].tolist() == [True]
+
+    def test_zoned_vs_local_ordering_is_null(self, engine):
+        """CIP: 'Temporal instant values are only comparable within types.'"""
+        g = _graph(engine)
+        out = _rows(g, "MATCH (n) WHERE n.id = 'p' RETURN "
+                       "datetime('2020-01-02T00:00:00Z') < localdatetime('2020-01-03T00:00:00') AS eq", engine)
+        assert out["eq"].isna().tolist() == [True]
+
+    def test_where_form_is_row_set_visible(self, engine):
+        """The audit's B-5 wrong answer changed row sets, not just projections."""
+        g = _graph(engine)
+        ids = _ids(g, "MATCH (n) WHERE datetime('2020-01-02T05:00:00+05:00') = datetime('2020-01-02T00:00:00Z') "
+                      "RETURN n.id", engine)
+        assert ids == ["p", "q", "r", "s", "t"]  # anti-vacuity: all 5 rows survive a true WHERE
+        ids = _ids(g, "MATCH (n) WHERE datetime('2020-01-02T00:00:00Z') = localdatetime('2020-01-02T00:00:00') "
+                      "RETURN n.id", engine)
+        assert ids == []
+
+    def test_plain_string_equality_untouched(self, engine):
+        """Mutation guard: non-temporal string literals keep plain string semantics."""
+        g = _graph(engine)
+        out = _rows(g, "MATCH (n) WHERE n.id = 'p' RETURN 'a' = 'b' AS eq, 'a' = 'a' AS eq2", engine)
+        assert out["eq"].tolist() == [False]
+        assert out["eq2"].tolist() == [True]
+
+
+class TestB5FoldUnits:
+    """Direct pins on the fold — the arms end-to-end queries cannot isolate."""
+
+    def _fold(self, op: str, left: str, right: str):
+        from graphistry.compute.gfql.expr_parser import BinaryOp, Literal
+        from graphistry.compute.gfql.temporal.folding import _fold_temporal_comparison
+        return _fold_temporal_comparison(BinaryOp(op=op, left=Literal(left), right=Literal(right)))
+
+    def test_same_type_instant_comparison(self):
+        assert self._fold("=", "2020-01-02T05:00:00+05:00", "2020-01-02T00:00:00Z").value is True
+        assert self._fold("<", "2020-01-01", "2020-01-02").value is True
+        assert self._fold(">=", "12:00:00", "12:00:01").value is False
+
+    def test_cross_type_matrix(self):
+        """Every distinct-kind pair: eq false, neq true, ordering null."""
+        exemplars = {
+            "datetime": "2020-01-02T00:00:00Z",
+            "localdatetime": "2020-01-02T00:00:00",
+            "date": "2020-01-02",
+            "time": "12:00:00Z",
+            "localtime": "12:00:00",
+        }
+        kinds = list(exemplars)
+        checked = 0
+        for i, a in enumerate(kinds):
+            for b in kinds[i + 1:]:
+                assert self._fold("=", exemplars[a], exemplars[b]).value is False, (a, b)
+                assert self._fold("<>", exemplars[a], exemplars[b]).value is True, (a, b)
+                assert self._fold("<", exemplars[a], exemplars[b]).value is None, (a, b)
+                checked += 1
+        assert checked == 10  # anti-vacuity: all C(5,2) pairs exercised
+
+    def test_zone_name_without_offset_declines_fold(self):
+        from graphistry.compute.gfql.temporal.values import _parse_temporal_value
+        from graphistry.compute.gfql.temporal.folding import _temporal_instant_key
+        value = _parse_temporal_value("2020-01-02T00:00:00[Europe/Paris]")
+        assert value is not None and _temporal_instant_key(value) is None
+        assert self._fold("=", "2020-01-02T00:00:00[Europe/Paris]", "2020-01-02T00:00:00Z") is None
+
+    def test_non_string_literals_do_not_fold(self):
+        from graphistry.compute.gfql.expr_parser import BinaryOp, Literal
+        from graphistry.compute.gfql.temporal.folding import _fold_temporal_comparison
+        assert _fold_temporal_comparison(BinaryOp(op="=", left=Literal(5), right=Literal("2020-01-02"))) is None
+        assert _fold_temporal_comparison(BinaryOp(op="and", left=Literal("2020-01-02"), right=Literal("2020-01-02"))) is None
+
+    def test_offset_with_zone_name_still_folds(self):
+        assert self._fold("=", "2020-01-02T02:00:00+02:00[Europe/Paris]", "2020-01-02T00:00:00Z").value is True
+
+    def test_non_temporal_strings_do_not_fold(self):
+        assert self._fold("=", "hello", "2020-01-02") is None
+        assert self._fold("=", "2020-01-02", "world") is None
+
+    def test_durations_do_not_fold(self):
+        assert self._fold("=", "P1D", "PT24H") is None
+
+    def test_seconds_offset_parsed(self):
+        assert self._fold("=", "2020-01-02T00:00:30+00:00:30", "2020-01-02T00:00:00Z").value is True
+
+
+# ---------------------------------------------------------------------------
+# B-7 / #1880: temporal-vs-string never leaks raw backend errors
+# ---------------------------------------------------------------------------
+
+class TestB7TemporalStringLeaks:
+    def test_pandas_zoned_string_vs_naive_column_answers(self):
+        """Red-at-master: raw numpy `ufunc 'bitwise_and'` TypeError from the pushdown."""
+        g = _graph("pandas")
+        assert _ids(g, "MATCH (n) WHERE n.ts > '2021-01-01T00:00:00Z' RETURN n.id", "pandas") == ["q", "r"]
+
+    def test_pandas_zoned_string_equality_matches_instant(self):
+        """Red-at-master: the pushed equality silently matched ZERO rows."""
+        g = _graph("pandas")
+        assert _ids(g, "MATCH (n) WHERE n.ts = '2021-06-15T08:30:00Z' RETURN n.id", "pandas") == ["q"]
+
+    @pytest.mark.skipif(cudf is None, reason="cudf not installed")
+    def test_cudf_zoned_string_vs_naive_column_answers(self):
+        g = _graph("cudf")
+        assert _ids(g, "MATCH (n) WHERE n.ts > '2021-01-01T00:00:00Z' RETURN n.id", "cudf") == ["q", "r"]
+
+    @pytest.mark.skipif(pl is None, reason="polars not installed")
+    def test_polars_zoned_string_vs_naive_column_typed_decline(self):
+        """The where_rows residual declines typed on polars — never the raw
+        InvalidOperationError this leaked at master."""
+        g = _graph("polars")
+        with pytest.raises(NotImplementedError, match="where_rows"):
+            g.gfql("MATCH (n) WHERE n.ts > '2021-01-01T00:00:00Z' RETURN n.id", engine="polars")
+
+    @pytest.mark.parametrize("engine", [
+        "pandas",
+        pytest.param("polars", marks=pytest.mark.skipif(pl is None, reason="polars not installed")),
+    ])
+    def test_naive_string_vs_datetime_column_parity(self, engine):
+        """#1880: `a.dt = '...'` leaked a raw polars InvalidOperationError; both engines
+        must answer the same rows."""
+        g = _graph(engine)
+        assert _ids(g, "MATCH (n) WHERE n.ts = '2021-06-15T08:30:00' RETURN n.id", engine) == ["q"]
+        assert _ids(g, "MATCH (n) WHERE n.ts > '2021-01-01T00:00:00' RETURN n.id", engine) == ["q", "r"]
+
+    @pytest.mark.parametrize("engine", [
+        "pandas",
+        pytest.param("cudf", marks=CUDF_GPU_MARK),
+        pytest.param("polars", marks=pytest.mark.skipif(pl is None, reason="polars not installed")),
+    ])
+    def test_string_vs_duration_column_equality_parity(self, engine):
+        """#1880: `a.dur = '1 days'` leaked a raw polars cast InvalidOperationError."""
+        g = _graph(engine)
+        assert _ids(g, "MATCH (n) WHERE n.dur = '1 days' RETURN n.id", engine) == ["p"]
+
+    @pytest.mark.parametrize("engine", [
+        "pandas",
+        pytest.param("cudf", marks=CUDF_GPU_MARK),
+        pytest.param("polars", marks=pytest.mark.skipif(pl is None, reason="polars not installed")),
+    ])
+    def test_naive_timestamp_string_column_equality_answers(self, engine):
+        """The proved AST seam must answer parseable naive timestamp equality."""
+        from graphistry.compute.ast import n
+        g = _graph(engine)
+        assert _ids(g, [n({"ts": "2021-06-15T08:30:00"})], engine) == ["q"]
+
+    def test_aware_timestamp_plain_date_string_answers(self):
+        """A naive scalar must not lose an aware-column equality comparison (#2233)."""
+        from graphistry.compute.ast import ASTNode
+        g = _graph("pandas")
+        chain = ASTNode.from_json({"filter_dict": {"ts_aw": "2020-06-15T08:30:00"}})
+        assert _ids(g, [chain], "pandas") == ["p"]
+        assert _ids(g, "MATCH (n) WHERE n.ts_aw = '2020-06-15T08:30:00' RETURN n.id", "pandas") == ["p"]
+
+    def test_aware_timestamp_non_utc_local_date_answers(self):
+        """Plain strings follow the column's local timeline; offsets compare instants."""
+        nodes = pd.DataFrame({
+            "id": ["a", "b"],
+            "ts_zone": pd.to_datetime([
+                "2020-06-15", "2020-06-16",
+            ]).tz_localize("America/New_York"),
+        })
+        g = graphistry.nodes(nodes, "id").edges(_edges_pd(), "s", "d")
+        assert _ids(g, "MATCH (n) WHERE n.ts_zone = '2020-06-15' RETURN n.id", "pandas") == ["a"]
+        assert _ids(g, "MATCH (n) WHERE n.ts_zone = '2020-06-15T04:00:00Z' RETURN n.id", "pandas") == ["a"]
+
+    def test_aware_timezone_boundary_matrix(self):
+        """A date is column-local midnight; equivalent offsets compare as instants."""
+        import json
+        from graphistry.compute.ast import n
+        from graphistry.compute.filter_by_dict import _coerce_temporal_filter_scalar
+        nodes = pd.DataFrame({
+            "id": ["local_midnight", "local_noon", "utc_midnight", "next_day"],
+            "ts_zone": pd.to_datetime([
+                "2024-01-01T05:00:00", "2024-01-01T12:00:00", "2024-01-01T00:00:00", "2024-01-02T05:00:00",
+            ], utc=True).tz_convert("America/New_York"),
+        })
+        nodes.loc[nodes["id"] == "local_noon", "ts_zone"] = pd.Timestamp(
+            "2024-01-01T12:00:00", tz="America/New_York"
+        )
+        g = graphistry.nodes(nodes, "id").edges(_edges_pd(), "s", "d")
+        cases = [
+            ("2024-01-01", ["local_midnight"]),
+            ("2024-01-01T00:00:00-05:00", ["local_midnight"]),
+            ("2024-01-01T06:00:00+01:00", ["local_midnight"]),
+            ("2024-01-01T00:00:00Z", ["utc_midnight"]),
+            ("2024-01-02", ["next_day"]),
+        ]
+        for bound, expected in cases:
+            assert _ids(g, f"MATCH (n) WHERE n.ts_zone = '{bound}' RETURN n.id", "pandas") == expected
+            out = g.gfql("MATCH (n) WHERE n.ts_zone = $bound RETURN n.id",
+                         engine="pandas", params={"bound": bound})._nodes
+            assert sorted(out["n.id"].tolist()) == expected
+            assert _ids(g, [json.loads(json.dumps(n({"ts_zone": bound}).to_json()))],
+                        "pandas") == expected
+
+    def test_aware_dst_bound_does_not_guess_a_fold(self):
+        """Unresolvable local bounds fail closed; explicit offsets select one instant."""
+        nodes = pd.DataFrame({
+            "id": ["fall_early", "fall_late"],
+            "ts_zone": pd.to_datetime([
+                "2024-11-03T01:30:00", "2024-11-03T01:30:00",
+            ]).tz_localize("America/New_York", ambiguous=[True, False]),
+        })
+        g = graphistry.nodes(nodes, "id").edges(_edges_pd(), "s", "d")
+        for bound in ("2024-11-03T01:30:00", "2024-03-10T02:30:00"):
+            with pytest.raises(GFQLSchemaError) as excinfo:
+                g.gfql(f"MATCH (n) WHERE n.ts_zone = '{bound}' RETURN n.id", engine="pandas")
+            assert excinfo.value.code == ErrorCode.E302
+        assert _ids(g, "MATCH (n) WHERE n.ts_zone = '2024-11-03T01:30:00-04:00' RETURN n.id", "pandas") == ["fall_early"]
+        assert _ids(g, "MATCH (n) WHERE n.ts_zone = '2024-11-03T01:30:00-05:00' RETURN n.id", "pandas") == ["fall_late"]
+
+    def test_aware_utc_date_only_answers_and_propagates_runtime_failure(self, monkeypatch):
+        """Date-only bounds select column-local midnight across public forms."""
+        import json
+        from graphistry.compute.ast import n
+        from graphistry.compute.filter_by_dict import _coerce_temporal_filter_scalar
+        nodes = pd.DataFrame({
+            "id": ["utc_midnight", "utc_noon"],
+            "ts_aw": pd.to_datetime([
+                "2024-01-01T00:00:00", "2024-01-01T12:00:00",
+            ], utc=True),
+        })
+        g = graphistry.nodes(nodes, "id").edges(_edges_pd(), "s", "d")
+        expected = ["utc_midnight"]
+        runtime_failure = RuntimeError("boom")
+
+        assert _ids(g, "MATCH (n) WHERE n.ts_aw = '2024-01-01' RETURN n.id", "pandas") == expected
+        out = g.gfql(
+            "MATCH (n) WHERE n.ts_aw = $bound RETURN n.id",
+            engine="pandas", params={"bound": "2024-01-01"},
+        )._nodes
+        assert sorted(out["n.id"].tolist()) == expected
+        chain = json.loads(json.dumps(n({"ts_aw": "2024-01-01"}).to_json()))
+        assert _ids(g, [chain], "pandas") == expected
+
+        def fail_localize(self, tz):
+            raise runtime_failure
+
+        dtype = pd.DatetimeTZDtype("ns", "UTC")
+        runtime_failure = RuntimeError("boom")
+        monkeypatch.setattr(pd.Timestamp, "tz_localize", fail_localize)
+        with pytest.raises(RuntimeError) as excinfo:
+            _coerce_temporal_filter_scalar("2024-01-01", dtype, field="ts_aw")
+        assert excinfo.value is runtime_failure
+
+    def test_aware_null_empty_and_malformed_boundaries(self):
+        """Empty/null-only supported frames return values; malformed bounds stay E302."""
+        from graphistry.compute.ast import n
+        empty_nodes = pd.DataFrame({"id": pd.Series([], dtype="string"), "ts_aw": pd.Series([], dtype="datetime64[ns, UTC]")})
+        null_nodes = pd.DataFrame({"id": ["x"], "ts_aw": pd.to_datetime([None], utc=True)})
+        empty = graphistry.nodes(empty_nodes, "id").edges(_edges_pd(), "s", "d")
+        null_only = graphistry.nodes(null_nodes, "id").edges(_edges_pd(), "s", "d")
+        assert _ids(empty, "MATCH (n) WHERE n.ts_aw = '2020-06-15' RETURN n.id", "pandas") == []
+        assert _ids(null_only, "MATCH (n) WHERE n.ts_aw = '2020-06-15' RETURN n.id", "pandas") == []
+        with pytest.raises(GFQLSchemaError) as excinfo:
+            null_only.gfql([n({"ts_aw": "not-a-timestamp"})], engine="pandas")
+        assert excinfo.value.code == ErrorCode.E302
+
+    @pytest.mark.parametrize(("column", "bound"), [
+        ("ts_aw", ""),
+        ("dur", ""),
+    ])
+    def test_empty_temporal_bound_is_typed_schema_error(self, column: str, bound: str):
+        from graphistry.compute.ast import n
+        g = _graph("pandas")
+        with pytest.raises(GFQLSchemaError) as excinfo:
+            g.gfql([n({column: bound})], engine="pandas")
+        assert excinfo.value.code == ErrorCode.E302
+
+    @pytest.mark.parametrize("public_form", ["string", "json", "param"])
+    def test_aware_dst_error_contract_without_pytz(self, monkeypatch, public_form):
+        """Optional exception discovery falls back to ValueError without pytz."""
+        import json
+        from graphistry.compute.ast import n
+        from graphistry.compute.filter_by_dict import _coerce_temporal_filter_scalar
+        from graphistry.compute.filter_by_dict import _timezone_resolution_errors
+        from graphistry.compute import filter_by_dict
+        from importlib import import_module as real_import_module
+
+        _timezone_resolution_errors.cache_clear()
+        try:
+            import_calls = []
+            def no_pytz(name: str, *args: object, **kwargs: object):
+                import_calls.append(name)
+                if name == "pytz.exceptions":
+                    raise ModuleNotFoundError("No module named 'pytz.exceptions'")
+                return real_import_module(name, *args, **kwargs)
+
+            monkeypatch.setattr(filter_by_dict, "import_module", no_pytz)
+            assert _timezone_resolution_errors() == (ValueError,)
+            assert "pytz.exceptions" in import_calls
+            _timezone_resolution_errors.cache_clear()
+
+            zone_nodes = pd.DataFrame({
+                "id": ["fall_early", "fall_late"],
+                "ts_zone": pd.to_datetime([
+                    "2024-11-03T01:30:00", "2024-11-03T01:30:00",
+                ]).tz_localize("America/New_York", ambiguous=[True, False]),
+            })
+            graph = graphistry.nodes(zone_nodes, "id").edges(_edges_pd(), "s", "d")
+            bound = "2024-11-03T01:30:00"
+            def fail_localize(value, tz):
+                raise ValueError("no pytz fallback")
+
+            monkeypatch.setattr(pd.Timestamp, "tz_localize", fail_localize)
+            if public_form == "param":
+                query = "MATCH (n) WHERE n.ts_zone = $bound RETURN n.id"
+                with pytest.raises(GFQLSchemaError) as excinfo:
+                    graph.gfql(query, engine="pandas", params={"bound": bound})
+            elif public_form == "json":
+                query = [json.loads(json.dumps(n({"ts_zone": bound}).to_json()))]
+                with pytest.raises(GFQLSchemaError) as excinfo:
+                    graph.gfql(query, engine="pandas")
+            else:
+                query = f"MATCH (n) WHERE n.ts_zone = '{bound}' RETURN n.id"
+                with pytest.raises(GFQLSchemaError) as excinfo:
+                    graph.gfql(query, engine="pandas")
+            assert excinfo.value.code == ErrorCode.E302
+            assert excinfo.value.context["field"] == "ts_zone"
+            assert excinfo.value.context["value"] == bound
+        finally:
+            _timezone_resolution_errors.cache_clear()
+
+    def test_duration_does_not_discover_optional_timezone_exceptions(self, monkeypatch):
+        from graphistry.compute.filter_by_dict import _timezone_resolution_errors
+        _timezone_resolution_errors.cache_clear()
+        real_import = __import__
+
+        import_calls = []
+
+        def tracked_import(name: str, *args: object, **kwargs: object):
+            import_calls.append(name)
+            if name == "pytz.exceptions":
+                raise ModuleNotFoundError("No module named 'pytz.exceptions'")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(
+            "graphistry.compute.filter_by_dict.import_module",
+            tracked_import,
+        )
+        g = _graph("pandas")
+        assert _ids(g, "MATCH (n) WHERE n.dur = '1 days' RETURN n.id", "pandas") == ["p"]
+        assert "pytz.exceptions" not in import_calls
+        _timezone_resolution_errors.cache_clear()
+
+    @pytest.mark.parametrize("engine", [
+        "pandas",
+        pytest.param("polars", marks=pytest.mark.skipif(pl is None, reason="polars not installed")),
+    ])
+    def test_string_vs_duration_column_ordering_parity(self, engine):
+        g = _graph(engine)
+        assert _ids(g, "MATCH (n) WHERE n.dur > '2 days' RETURN n.id", engine) == ["r", "s"]
+
+    @pytest.mark.parametrize("engine", [
+        "pandas",
+        pytest.param("cudf", marks=CUDF_GPU_MARK),
+    ])
+    def test_unparseable_temporal_string_typed_schema_error(self, engine):
+        """Fail closed on pandas/cuDF instead of silently treating incompatible text as empty."""
+        from graphistry.compute.ast import n
+        g = _graph(engine)
+        for filter_dict in ({"dur": "not-a-duration"}, {"ts": "not-a-timestamp"}):
+            with pytest.raises(GFQLSchemaError) as excinfo:
+                g.gfql([n(filter_dict)], engine=engine)
+            assert excinfo.value.code == ErrorCode.E302
+
+    @pytest.mark.skipif(pl is None, reason="polars not installed")
+    def test_polars_unparseable_string_typed_schema_error(self):
+        """Fail-closed (#1880): what cannot compare declines with the SAME typed error
+        family the scalar half raises (E302), never a raw polars exception."""
+        from graphistry.compute.ast import n
+        from graphistry.compute.predicates.comparison import gt
+        g = _graph("polars")
+        for chain in ([n({"ts": "not-a-timestamp"})], [n({"ts": gt("not-a-timestamp")})],
+                      [n({"dur": "not-a-duration"})], [n({"ts": gt("2021-01-01T00:00:00Z")})]):
+            with pytest.raises(GFQLSchemaError) as excinfo:
+                g.gfql(chain, engine="polars")
+            assert excinfo.value.code == ErrorCode.E302
+
+    @pytest.mark.skipif(pl is None, reason="polars not installed")
+    def test_polars_chain_predicate_parity_rows(self):
+        """Anti-vacuity for the parse-and-compare lowering: real rows, pandas-identical."""
+        from graphistry.compute.ast import n
+        from graphistry.compute.predicates.comparison import gt, le
+        for chain, expect in (
+            ([n({"ts": gt("2021-01-01T00:00:00")})], ["q", "r"]),
+            ([n({"ts": le("2020-06-15T08:30:00")})], ["p", "s"]),
+            ([n({"dur": "2 days"})], ["q"]),
+        ):
+            got = {}
+            for engine in ("pandas", "polars"):
+                out = _graph(engine).gfql(chain, engine=engine)._nodes
+                if isinstance(out, pl.LazyFrame):
+                    out = out.collect()
+                if hasattr(out, "to_pandas"):
+                    out = out.to_pandas()
+                got[engine] = sorted(out["id"].tolist())
+            assert got["pandas"] == got["polars"] == expect
+
+    def test_pandas_connected_join_zoned_string_answers(self):
+        """The connected-join lowering must also keep tz-suffixed text a residual."""
+        g = _graph("pandas")
+        out = _rows(g, "MATCH (a)-[]->(b) WHERE b.ts > '2021-01-01T00:00:00Z' RETURN a.id, b.id",
+                    "pandas")
+        assert out.to_dict("records") == [{"a.id": "p", "b.id": "q"}]
+
+    def test_pandas_optional_match_zoned_string_answers(self):
+        """Red-at-master: the connected OPTIONAL MATCH lowering pushed the tz-suffixed
+        literal into a filter dict too, leaking the same raw numpy TypeError."""
+        g = _graph("pandas")
+        out = _rows(g, "MATCH (a) WHERE a.id IN ['p', 'q'] OPTIONAL MATCH (a)-[]->(b) "
+                       "WHERE b.ts > '2021-01-01T00:00:00Z' RETURN a.id, b.id", "pandas")
+        got = sorted(out.to_dict("records"), key=lambda r: r["a.id"])
+        got = [{k: (None if isinstance(v, float) and v != v else v) for k, v in r.items()} for r in got]
+        assert got == [{"a.id": "p", "b.id": "q"}, {"a.id": "q", "b.id": None}]
+
+    @pytest.mark.parametrize("engine", [
+        "pandas",
+        pytest.param("cudf", marks=pytest.mark.skipif(cudf is None, reason="cudf not installed")),
+    ])
+    def test_naive_vs_aware_columns_answer(self, engine):
+        """Red-at-master: raw pandas TypeError ('Invalid comparison ...') from the
+        same-path WHERE. GFQL's extension reads naive datetimes as UTC, so the
+        equal-instant pair yields no rows and the lagged pair yields all non-null rows."""
+        g = _graph(engine)
+        assert _ids(g, "MATCH (n) WHERE n.ts > n.ts_aw RETURN n.id", engine) == []
+        # mutation guard: the comparison is real, not constant-empty
+        assert _ids(g, "MATCH (n) WHERE n.ts > n.ts_aw_lag RETURN n.id", engine) == ["p", "q", "r", "s"]
+
+    @pytest.mark.skipif(pl is None, reason="polars not installed")
+    def test_polars_naive_vs_aware_columns_typed_decline(self):
+        g = _graph("polars")
+        with pytest.raises(NotImplementedError, match="polars engine does not yet natively support"):
+            g.gfql("MATCH (n) WHERE n.ts > n.ts_aw RETURN n.id", engine="polars")
+
+
+class TestB7Units:
+    def test_zoned_iso_regex_accepts_and_rejects(self):
+        from graphistry.compute.gfql.cypher.lowering import _ZONED_ISO_TEMPORAL_TEXT_RE as rx
+        for text in ("2021-01-01T00:00:00Z", "2021-01-01T00:00:00+05:00", "2021-01-01 00:00:00-0500",
+                     "2021-01-01T00:00Z", "12:30:00Z", "12:30:00.5+02:00"):
+            assert rx.match(text), text
+        for text in ("2021-01-01T00:00:00", "2021-01-01", "1 days", "P1D", "hello",
+                     "12:30:00", "2021-01-01T00:00:00Zx"):
+            assert not rx.match(text), text
+
+    def test_align_mixed_tz_converts_only_mixed_datetime_pairs(self):
+        from graphistry.compute.gfql.same_path.df_utils import _align_mixed_tz_datetimes
+        naive = pd.Series(pd.to_datetime(["2021-01-01"]))
+        aware = pd.Series(pd.to_datetime(["2021-01-01"]).tz_localize("US/Eastern"))
+        left, right = _align_mixed_tz_datetimes(naive, aware)
+        assert right.dt.tz is None and right.iloc[0] == pd.Timestamp("2021-01-01T05:00:00")
+        assert left is naive
+        left, right = _align_mixed_tz_datetimes(aware, naive)
+        assert left.dt.tz is None and right is naive
+        ints = pd.Series([1])
+        assert _align_mixed_tz_datetimes(ints, naive) == (ints, naive)
+        left, right = _align_mixed_tz_datetimes(naive, naive)
+        assert left is naive and right is naive
+
+    @pytest.mark.skipif(pl is None, reason="polars not installed")
+    def test_parse_temporal_filter_scalar_safe_subset(self):
+        import datetime as dt
+        from graphistry.compute.gfql.lazy.engine.polars.predicates import _parse_temporal_filter_scalar
+        assert _parse_temporal_filter_scalar("2021-01-01T00:00:00", pl.Datetime("ns")) == dt.datetime(2021, 1, 1)
+        assert _parse_temporal_filter_scalar("2021-01-01T00:00:00Z", pl.Datetime("ns")) is None  # tz-suffixed
+        assert _parse_temporal_filter_scalar("2021-01-01T00:00:00.000000001", pl.Datetime("ns")) is None  # sub-us
+        assert _parse_temporal_filter_scalar("junk", pl.Datetime("ns")) is None
+        assert _parse_temporal_filter_scalar("2021-01-01", pl.Datetime("ns", "UTC")) is None  # aware column
+        assert _parse_temporal_filter_scalar("1 days", pl.Duration("ns")) == dt.timedelta(days=1)
+        assert _parse_temporal_filter_scalar("junk", pl.Duration("ns")) is None
+        assert _parse_temporal_filter_scalar("0 days 00:00:00.000000001", pl.Duration("ns")) is None  # sub-us
+        assert _parse_temporal_filter_scalar("2021-01-01", pl.Date) == dt.date(2021, 1, 1)
+        assert _parse_temporal_filter_scalar("12:30:00", pl.Time) == dt.time(12, 30)
+        assert _parse_temporal_filter_scalar("2021-01-01", pl.Int64()) is None
+
+
+# ---------------------------------------------------------------------------
+# B-8: non-reserved keywords as property names
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("engine", ENGINES)
+class TestB8KeywordPropertyNames:
+    def test_where_on_keyword_property(self, engine):
+        """Red-at-master: `n.when > 3` raised GFQLSyntaxError."""
+        g = _graph(engine)
+        assert _ids(g, "MATCH (n) WHERE n.when > 3 RETURN n.id", engine) == ["s", "t"]
+
+    def test_return_and_order_by_keyword_property(self, engine):
+        g = _graph(engine)
+        out = _rows(g, "MATCH (n) RETURN n.when AS w ORDER BY n.when DESC LIMIT 2", engine)
+        assert out["w"].tolist() == [5, 4]
+
+    def test_property_map_keyword_key(self, engine):
+        g = _graph(engine)
+        assert _ids(g, "MATCH (n {when: 4}) RETURN n.id", engine) == ["s"]
+
+
+class TestB8Grammar:
+    def test_composite_root_property_access_accepts_keywords(self):
+        """The expr grammar's property_access rule (composite roots) also takes PROP_NAME."""
+        from graphistry.compute.gfql.expr_parser import PropertyAccessExpr, parse_expr
+        node = parse_expr("(n).when")
+        assert isinstance(node, PropertyAccessExpr) and node.property == "when"
+
+    @pytest.mark.parametrize("prop", ["when", "then", "end", "order", "is", "all", "any", "contains"])
+    def test_issue_keywords_parse_in_where(self, prop):
+        """Every keyword the audit listed parses as a property name (pandas run)."""
+        nodes = pd.DataFrame({"id": ["a", "b"], prop: [1, 5]})
+        g = graphistry.nodes(nodes, "id").edges(_edges_pd(), "s", "d")
+        out = g.gfql(f"MATCH (n) WHERE n.{prop} > 3 RETURN n.id", engine="pandas")._nodes
+        assert out["n.id"].tolist() == ["b"]
+
+    def test_keyword_property_keeps_filter_pushdown(self):
+        """The WHERE-chain grammar (property_ref) must also accept keyword property
+        names, or the conjunct silently loses its filter_dict pushdown."""
+        import warnings
+        from graphistry.compute.ast import ASTNode
+        from graphistry.compute.gfql.cypher.api import compile_cypher
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            compiled = compile_cypher("MATCH (n) WHERE n.when > 3 RETURN n.id")
+        node_ops = [op for op in compiled.chain.chain if isinstance(op, ASTNode)]
+        assert node_ops and node_ops[0].filter_dict and "when" in node_ops[0].filter_dict
+
+    def test_keywords_stay_reserved_outside_property_position(self):
+        """Mutation guard: only the dot/map-key position was unreserved."""
+        g = _graph("pandas")
+        with pytest.raises(GFQLSyntaxError):
+            g.gfql("MATCH (n) RETURN when", engine="pandas")
+
+
+# ---------------------------------------------------------------------------
+# A-4: UNION name alignment
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("engine", ENGINES)
+class TestA4UnionNameAlignment:
+    def test_same_names_different_order_align(self, engine):
+        """Red-at-master: typed decline. Neo4j aligns by name; the output keeps the
+        first branch's column order."""
+        g = _graph(engine)
+        out = _rows(g, "MATCH (n) WHERE n.id='p' RETURN n.id AS a, n.i AS b "
+                       "UNION MATCH (n) WHERE n.id='q' RETURN n.i AS b, n.id AS a", engine)
+        assert list(out.columns) == ["a", "b"]
+        assert sorted(out.to_dict("records"), key=lambda r: r["a"]) == [
+            {"a": "p", "b": 7}, {"a": "q", "b": 8},
+        ]
+
+    def test_union_all_alignment(self, engine):
+        g = _graph(engine)
+        out = _rows(g, "MATCH (n) WHERE n.id='p' RETURN n.id AS a, n.i AS b "
+                       "UNION ALL MATCH (n) WHERE n.id='p' RETURN n.i AS b, n.id AS a", engine)
+        assert list(out.columns) == ["a", "b"]
+        assert out.to_dict("records") == [{"a": "p", "b": 7}, {"a": "p", "b": 7}]
+
+    def test_different_name_sets_stay_typed_decline(self, engine):
+        """The genuine error half of the old message survives, by name."""
+        g = _graph(engine)
+        with pytest.raises(GFQLValidationError, match="must project the same output names"):
+            g.gfql("MATCH (n) RETURN n.id AS a UNION MATCH (n) RETURN n.i AS c", engine=engine)

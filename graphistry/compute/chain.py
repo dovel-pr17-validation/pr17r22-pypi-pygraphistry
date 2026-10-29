@@ -1,0 +1,1606 @@
+import logging
+from typing import Any, Dict, Union, cast, List, Tuple, Sequence, Optional, TYPE_CHECKING
+from graphistry.Engine import Engine, EngineAbstract, POLARS_ENGINES, align_shared_column_dtypes, df_concat, df_cons, df_to_engine, resolve_engine, safe_map_series, safe_row_concat, s_na
+from graphistry.compute.dataframe_utils import dbg_df
+
+from graphistry.Plottable import Plottable
+from graphistry.compute.ASTSerializable import ASTSerializable
+from graphistry.Engine import safe_merge
+from graphistry.util import setup_logger
+from graphistry.utils.json import JSONVal
+from .ast import ASTObject, ASTNode, ASTEdge, ASTCall, Direction, from_json as ASTObject_from_json, serialize_binding_ops
+from .typing import DataFrameT, SeriesT
+from .util import generate_safe_column_name
+from .chain_specializations.hotpaths import _try_chain_fast_path
+from .chain_specializations.point_rows import _try_point_rows
+from .engine_coercion import ensure_local_engine_match
+from graphistry.compute.validate.validate_schema import validate_chain_schema, validate_graph_shape
+from graphistry.compute.gfql.strictness import StrictInput
+from graphistry.compute.gfql.same_path_types import (
+    WhereComparison,
+    normalize_where_entries,
+    parse_where_json,
+    where_to_json,
+)
+from .gfql.policy import PolicyContext, PolicyException, PolicyFunction
+from .gfql.policy.stats import extract_graph_stats
+from graphistry.otel import otel_traced, otel_detail_enabled
+
+if TYPE_CHECKING:
+    from .execution_context import ExecutionContext
+    from graphistry.compute.exceptions import GFQLSchemaError, GFQLValidationError
+    from graphistry.compute.gfql.index.handoff import IndexedBindingsHandoff
+
+logger = setup_logger(__name__)
+
+
+def _filter_edges_by_endpoint(
+    edges_df: DataFrameT, nodes_df: Optional[DataFrameT], node_id: Optional[str], edge_col: Optional[str]
+) -> DataFrameT:
+    if nodes_df is None or not node_id or not edge_col or edge_col not in edges_df.columns:
+        return edges_df
+    # isin() is set-membership, so the dropped .unique() is redundant (byte-identical).
+    return edges_df[edges_df[edge_col].isin(nodes_df[node_id])]
+
+
+from .chain_lean_combine import (
+    _lean_combine_enabled, _is_unique_ids, _lean_engine_ok,
+    _lean_intersect_full, _lean_prefilter_right,
+)
+
+
+
+def _is_index_op_json(op: object) -> bool:
+    from graphistry.compute.gfql.index.wire import is_index_op_json
+    return is_index_op_json(op)
+
+
+def _index_op_json_as_call(op: Dict[str, JSONVal]) -> ASTCall:
+    from graphistry.compute.gfql.index.wire import index_op_from_json, index_op_to_call
+    return index_op_to_call(index_op_from_json(dict(op)))
+
+
+def _index_ops_as_calls(ops: List[ASTObject]) -> List[ASTObject]:
+    """Index DDL wire ops (CreateIndex/DropIndex) in an op list become their call() form."""
+    if not isinstance(ops, list):
+        return ops  # validate() names the offending type
+    from graphistry.compute.gfql.index.wire import index_op_to_call, is_index_op
+    if not any(is_index_op(op) for op in ops):
+        return ops  # the caller's own list: a later mutation is still seen and re-validated on execute
+    return [index_op_to_call(op) if is_index_op(op) else op for op in ops]
+
+
+class Chain(ASTSerializable):
+
+    def __init__(
+        self,
+        chain: List[ASTObject],
+        where: Optional[Sequence[WhereComparison]] = None,
+        validate: bool = True,
+    ) -> None:
+        self.chain = _index_ops_as_calls(chain)
+        self.where = normalize_where_entries(where or [])
+        self._constructor_validated: bool = validate
+        self._gfql_validated_in_call: bool = False
+        if validate:
+            self.validate(collect_all=False)
+
+    def gfql_validated(self) -> "Chain":
+        """Mark a Chain that `gfql` built and is executing in the same call."""
+        self._gfql_validated_in_call = self._constructor_validated
+        return self
+
+    @staticmethod
+    def ops_were_validated_in_this_call(ops: Union[List[ASTObject], "Chain"]) -> bool:
+        return isinstance(ops, Chain) and ops._gfql_validated_in_call
+
+    def validate(self, collect_all: bool = False) -> Optional[List['GFQLValidationError']]:
+        from graphistry.compute.exceptions import ErrorCode, GFQLTypeError, GFQLValidationError
+        
+        if not collect_all:
+            return super().validate(collect_all=False)
+        
+        errors: List[GFQLValidationError] = []
+        
+        if not isinstance(self.chain, list):
+            errors.append(GFQLTypeError(
+                ErrorCode.E101,
+                f"Chain must be a list, but got {type(self.chain).__name__}. Wrap your operations in a list []."
+            ))
+            return errors
+        
+        for i, op in enumerate(self.chain):
+            if not isinstance(op, ASTObject):
+                errors.append(GFQLTypeError(
+                    ErrorCode.E101,
+                    f"Chain operation at index {i} is not a valid GFQL operation. Got {type(op).__name__} instead of an ASTObject.",
+                    operation_index=i,
+                    actual_type=type(op).__name__,
+                    suggestion="Use n() for nodes, e() for edges, or other GFQL operations"
+                ))
+        
+        for child in self._get_child_validators():
+            child_errors = child.validate(collect_all=True)
+            if child_errors:
+                errors.extend(child_errors)
+        
+        return errors
+    
+    def _validate_fields(self) -> None:
+        from graphistry.compute.exceptions import ErrorCode, GFQLTypeError
+        
+        if not isinstance(self.chain, list):
+            raise GFQLTypeError(
+                ErrorCode.E101,
+                f"Chain must be a list, but got {type(self.chain).__name__}. Wrap your operations in a list []."
+            )
+        
+        for i, op in enumerate(self.chain):
+            if not isinstance(op, ASTObject):
+                raise GFQLTypeError(
+                    ErrorCode.E101,
+                    f"Chain operation at index {i} is not a valid GFQL operation. Got {type(op).__name__} instead of an ASTObject.",
+                    operation_index=i,
+                    actual_type=type(op).__name__,
+                    suggestion="Use n() for nodes, e() for edges, or other GFQL operations"
+                )
+    
+    def _get_child_validators(self) -> List[ASTSerializable]:
+        return [op for op in self.chain if isinstance(op, ASTObject)]
+
+    @classmethod
+    def from_json(cls, d: Dict[str, JSONVal], validate: bool = True) -> 'Chain':
+        """
+        Convert a JSON AST into a list of ASTObjects
+        """
+        from graphistry.compute.exceptions import ErrorCode, GFQLSyntaxError
+        
+        if not isinstance(d, dict):
+            raise GFQLSyntaxError(
+                ErrorCode.E101,
+                f"Chain JSON must be a dictionary, got {type(d).__name__}"
+            )
+        
+        if 'chain' not in d:
+            raise GFQLSyntaxError(
+                ErrorCode.E105,
+                "Chain JSON missing required 'chain' field"
+            )
+        
+        if not isinstance(d['chain'], list):
+            raise GFQLSyntaxError(
+                ErrorCode.E101,
+                f"Chain field must be a list, got {type(d['chain']).__name__}"
+            )
+        
+        where = parse_where_json(d.get('where'))
+        out = cls(
+            [_index_op_json_as_call(op) if isinstance(op, dict) and _is_index_op_json(op) else ASTObject_from_json(op, validate=validate) for op in d['chain']],
+            where=where,
+            validate=validate,
+        )
+        return out
+
+    def to_json(self, validate=True) -> Dict[str, JSONVal]:
+        """
+        Convert a list of ASTObjects into a JSON AST
+        """
+        if validate:
+            self.validate()
+        data: Dict[str, JSONVal] = {
+            'type': self.__class__.__name__,
+            'chain': [op.to_json() for op in self.chain]
+        }
+        if self.where:
+            data['where'] = where_to_json(self.where)
+        return data
+
+    def validate_schema(self, g: Plottable, collect_all: bool = False) -> Optional[List['GFQLValidationError']]:
+        """Validate this chain against a graph's schema without executing.
+
+        Args:
+            g: Graph to validate against
+            collect_all: If True, collect all errors. If False, raise on first.
+
+        Returns:
+            If collect_all=True: List of errors (empty if valid)  
+            If collect_all=False: None if valid
+
+        Raises:
+            GFQLValidationError: If collect_all=False and validation fails
+        """
+        return validate_chain_schema(g, self, collect_all)
+
+
+def combine_steps(
+    g: Plottable,
+    kind: str,
+    steps: List[Tuple[ASTObject, Plottable]],
+    engine: Engine,
+    label_steps: Optional[List[Tuple[ASTObject, Plottable]]] = None
+) -> DataFrameT:
+    """
+    Collect nodes and edges, taking care to deduplicate and tag any names
+    """
+
+    id = (g._node if kind == 'nodes' else g._edge)
+    op_type = ASTNode if kind == 'nodes' else ASTEdge
+
+    if id is None:
+        raise ValueError(f'Cannot combine steps with empty id for kind {kind}')
+
+    logger.debug('combine_steps ops pre: %s', [op for (op, _) in steps])
+    if kind == 'edges':
+        node_id = g._node
+        src_col = g._source
+        dst_col = g._destination
+        full_nodes = g._nodes
+
+        has_multihop = any(
+            isinstance(op, ASTEdge) and not op.is_simple_single_hop()
+            for op, _ in steps
+        )
+
+        if has_multihop:
+            logger.debug('EDGES << recompute forwards given reduced set (multihop)')
+            new_steps = []
+            for idx, (op, g_step) in enumerate(steps):
+                prev_src = label_steps[idx - 1][1]._nodes if label_steps and idx > 0 else g_step._nodes
+                prev_wf = (safe_merge(full_nodes, prev_src[[node_id]], on=node_id, how='inner', engine=engine)
+                           if full_nodes is not None and node_id and prev_src is not None else prev_src)
+                new_steps.append((op, op.execute(g=g.edges(g_step._edges), prev_node_wavefront=prev_wf, target_wave_front=None, engine=engine)))
+            steps = new_steps
+        else:
+            logger.debug('EDGES << filter by valid endpoints (optimized)')
+            new_steps = []
+            for idx, (op, g_step) in enumerate(steps):
+                edges_df = g_step._edges
+                if edges_df is None or len(edges_df) == 0:
+                    new_steps.append((op, g_step))
+                    continue
+
+                prev_nodes = label_steps[idx - 1][1]._nodes if label_steps and idx > 0 else g._nodes
+                next_nodes = label_steps[idx + 1][1]._nodes if label_steps and idx + 1 < len(label_steps) else None
+                direction = op.direction if isinstance(op, ASTEdge) else 'forward'
+
+                if direction == 'undirected' and prev_nodes is not None and next_nodes is not None and node_id:
+                    # isin() dedups internally -> the .unique() pass is redundant
+                    prev_ids = prev_nodes[node_id]
+                    next_ids = next_nodes[node_id]
+                    fwd_mask = edges_df[src_col].isin(prev_ids) & edges_df[dst_col].isin(next_ids)
+                    rev_mask = edges_df[dst_col].isin(prev_ids) & edges_df[src_col].isin(next_ids)
+                    edges_df = edges_df[fwd_mask | rev_mask]
+                else:
+                    prev_col, next_col = (dst_col, src_col) if direction == 'reverse' else (src_col, dst_col)
+                    edges_df = _filter_edges_by_endpoint(edges_df, prev_nodes, node_id, prev_col)
+                    edges_df = _filter_edges_by_endpoint(edges_df, next_nodes, node_id, next_col)
+
+                new_steps.append((op, g_step.edges(edges_df)))
+            steps = new_steps
+
+    logger.debug('-----------[ combine %s ---------------]', kind)
+
+    if label_steps is None:
+        label_steps = steps
+
+    def apply_output_slice(op: ASTObject, op_label: ASTObject, df):
+        if not isinstance(op_label, ASTEdge):
+            return df
+        out_min = (op.output_min_hops if isinstance(op, ASTEdge) else None) or op_label.output_min_hops
+        out_max = (op.output_max_hops if isinstance(op, ASTEdge) else None) or op_label.output_max_hops
+        if out_min is None and out_max is None:
+            return df
+        label_col = op_label.label_node_hops if kind == 'nodes' else op_label.label_edge_hops
+        if label_col is None:
+            hop_like = [c for c in df.columns if 'hop' in c]
+            label_col = hop_like[0] if hop_like else None
+        if not label_col or label_col not in df.columns:
+            return df
+        is_seed = (df[label_col] == 0) | df[label_col].isna()
+        in_range = df[label_col].notna() & (df[label_col] > 0)
+        if out_min is not None:
+            in_range &= df[label_col] >= out_min
+        if out_max is not None:
+            in_range &= df[label_col] <= out_max
+        return df[is_seed | in_range]
+
+    dfs_to_concat = []
+    extra_step_dfs = []
+    base_cols = set((g._nodes if kind == "nodes" else g._edges).columns)
+    for idx, (op, g_step) in enumerate(steps):
+        op_label = label_steps[idx][0] if idx < len(label_steps) else op
+        step_df = apply_output_slice(op, op_label, (g_step._nodes if kind == "nodes" else g_step._edges))
+        if id not in step_df.columns:
+            step_id = (g_step._node if kind == "nodes" else g_step._edge)
+            raise ValueError(f"Column '{id}' not found in {kind} step DataFrame. "
+                           f"Step has id='{step_id}', available columns: {list(step_df.columns)}. "
+                           f"Operation: {op}")
+        dfs_to_concat.append(step_df[[id]])
+
+    for _, (_, g_step) in enumerate(label_steps):
+        step_df = (g_step._nodes if kind == "nodes" else g_step._edges)
+        if id not in step_df.columns:
+            continue
+        extra_cols = [c for c in step_df.columns if c != id and c not in base_cols and 'hop' in c]
+        if extra_cols:
+            extra_step_dfs.append(step_df[[id] + extra_cols])
+
+    if len(dfs_to_concat) > 0:
+        actual_engine = resolve_engine(EngineAbstract.AUTO, dfs_to_concat[0])
+        if actual_engine != engine:
+            logger.debug('Engine mismatch detected: param=%s, actual=%s. Converting data to match requested engine.', actual_engine, engine)
+            dfs_to_concat = [df_to_engine(df, engine) for df in dfs_to_concat]
+
+    concat = df_concat(engine)
+    out_df = concat(dfs_to_concat).drop_duplicates(subset=[id])
+
+    label_cols = set()
+    for step_df in extra_step_dfs:
+        if len(step_df.columns) <= 1:  # only id column
+            continue
+        label_cols.update([c for c in step_df.columns if c != id])
+        out_df = safe_merge(out_df, step_df, on=id, how='left', engine=engine)
+        for col in step_df.columns:
+            if col == id:
+                continue
+            col_x, col_y = f'{col}_x', f'{col}_y'
+            if col_x in out_df.columns and col_y in out_df.columns:
+                out_df[col] = out_df[col_x].fillna(out_df[col_y])
+                out_df = out_df.drop(columns=[col_x, col_y])
+
+    for idx, (op, _) in enumerate(steps):
+        op_label = label_steps[idx][0] if idx < len(label_steps) else op
+        if isinstance(op, ASTEdge):
+            out_df = apply_output_slice(op, op_label, out_df)
+
+    if kind == 'nodes' and label_cols:
+        label_seeds_requested = any(isinstance(op, ASTEdge) and op.label_seeds for op, _ in label_steps)
+        if label_seeds_requested and label_steps:
+            seed_df = (label_steps[0][1]._nodes if kind == "nodes" else label_steps[0][1]._edges)
+            if seed_df is not None and id in seed_df.columns:
+                seed_ids = seed_df[[id]].drop_duplicates()
+                if resolve_engine(EngineAbstract.AUTO, seed_ids) != resolve_engine(EngineAbstract.AUTO, out_df):
+                    seed_ids = df_to_engine(seed_ids, resolve_engine(EngineAbstract.AUTO, out_df))
+                try:
+                    seed_mask = out_df[id].isin(seed_ids[id])
+                except Exception:
+                    seed_mask = None
+                if seed_mask is not None:
+                    for col in label_cols:
+                        if col in out_df.columns:
+                            out_df.loc[seed_mask, col] = out_df.loc[seed_mask, col].fillna(0)
+    if logger.isEnabledFor(logging.DEBUG):
+        for (op, g_step) in steps:
+            if kind == 'edges':
+                logger.debug('adding edges to concat: %s', dbg_df(g_step._edges))
+            else:
+                logger.debug('adding nodes to concat: %s', dbg_df(g_step._nodes))
+
+    logger.debug('combine_steps ops: %s', [op for (op, _) in steps])
+
+    # Reject duplicate alias names — silent overwrite would lose data
+    seen_names: Dict[str, int] = {}
+    for idx, (op, _) in enumerate(steps):
+        if op._name is not None and isinstance(op, op_type):
+            if op._name in seen_names:
+                from graphistry.compute.exceptions import GFQLValidationError, ErrorCode
+                raise GFQLValidationError(
+                    code=ErrorCode.E201,
+                    message=(
+                        f"Duplicate alias name '{op._name}' in chain "
+                        f"(steps {seen_names[op._name]} and {idx})"
+                    ),
+                    suggestion="Use distinct alias names for each step in the chain",
+                )
+            seen_names[op._name] = idx
+
+    for idx, (op, g_step) in enumerate(steps):
+        if op._name is not None and isinstance(op, op_type):
+            logger.debug('tagging kind [%s] name %s', op_type, op._name)
+            step_df = (g_step._nodes if kind == "nodes" else g_step._edges)[[id, op._name]]
+            out_df = safe_merge(out_df, step_df, on=id, how='left', engine=engine)
+            x_name, y_name = f'{op._name}_x', f'{op._name}_y'
+            if x_name in out_df.columns and y_name in out_df.columns:
+                out_df[op._name] = out_df[x_name].where(out_df[x_name].notna(), out_df[y_name])
+                out_df = out_df.drop(columns=[x_name, y_name])
+            label_col = out_df[op._name]
+            if engine == Engine.PANDAS:
+                label_col = label_col.astype('boolean').fillna(False).astype('bool')
+            else:
+                label_col = label_col.fillna(False).astype('bool')
+            out_df[op._name] = label_col
+
+            if kind == 'nodes' and idx + 1 < len(steps):
+                next_op, next_step = steps[idx + 1]
+                if isinstance(next_op, ASTEdge):
+                    allowed_ids = None
+                    try:
+                        if next_op.direction == 'forward':
+                            allowed_ids = next_step._edges[next_step._source]
+                        elif next_op.direction == 'reverse':
+                            allowed_ids = next_step._edges[next_step._destination]
+                        else:  # undirected
+                            allowed_ids = df_concat(engine)(
+                                [
+                                    next_step._edges[next_step._source],
+                                    next_step._edges[next_step._destination],
+                                ],
+                                ignore_index=True,
+                            )
+                    except Exception:
+                        allowed_ids = None
+
+                    if allowed_ids is not None and id in out_df.columns:
+                        out_df[op._name] = out_df[op._name] & out_df[id].isin(allowed_ids)
+
+    if kind == 'nodes':
+        hop_cols = [c for c in out_df.columns if 'hop' in c.lower()]
+        edge_ops = [op for op, _ in steps if isinstance(op, ASTEdge)]
+        has_output_min = any(op.output_min_hops is not None for op in edge_ops)
+        has_output_max = any(op.output_max_hops is not None for op in edge_ops)
+        if (has_output_min or has_output_max) and hop_cols:
+            hop_col = hop_cols[0]
+            has_na = out_df[hop_col].isna()
+            if has_output_min:
+                out_df = out_df[~has_na]
+            elif has_na.any():
+                tag_cols = [c for c in out_df.columns if c not in [id, 'id'] + hop_cols]
+                has_tag = out_df[id].isin([])  # engine-agnostic all-False boolean Series
+                for col in tag_cols:
+                    try:
+                        vals = out_df[col].fillna(False)
+                        if vals.dtype == 'bool' or vals.dtype == 'object':
+                            has_tag |= vals.astype(bool)
+                    except (TypeError, ValueError):
+                        pass
+                out_df = out_df[~has_na | has_tag]
+
+    g_df = (g._nodes if kind == "nodes" else g._edges)
+    # slice 5 (#1755): a seeded result attaches the full node/edge frame via a
+    # how='left' merge whose big side (g_df) is scanned in full even for a 1-row
+    # out_df. Pre-shrink g_df to the ids actually present (unmatched rows are
+    # dropped by how='left' regardless) so the join runs small-vs-small.
+    g_df_join = _lean_prefilter_right(out_df, g_df, id, engine) if id in out_df.columns else g_df
+    out_df = safe_merge(out_df, g_df_join, on=id, how='left', engine=engine)
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug('COMBINED[%s] >> %s', kind, dbg_df(out_df))
+
+    if kind == 'nodes' and label_cols:
+        seeds_df = label_steps[0][1]._nodes if label_steps and label_steps[0][1]._nodes is not None else None
+        seed_ids = seeds_df[[id]].drop_duplicates() if seeds_df is not None and id in seeds_df.columns else None
+        label_seeds_true = any(isinstance(op, ASTEdge) and op.label_seeds for op, _ in label_steps)
+        if seed_ids is not None:
+            if label_seeds_true:
+                seeds_with_labels = seed_ids.copy()
+                for col in label_cols:
+                    if col in out_df.columns:
+                        seeds_with_labels[col] = 0
+                out_df = safe_merge(out_df, seeds_with_labels, on=id, how='outer', engine=engine)
+            else:
+                if id in out_df.columns:
+                    mask = out_df[id].isin(seed_ids[id])
+                    for col in label_cols:
+                        if col in out_df.columns:
+                            out_df[col] = out_df[col].where(~mask, s_na(engine))
+        hop_cols = [c for c in out_df.columns if 'hop' in c]
+        if hop_cols:
+            hop_maps = []
+            for _, g_step in label_steps:
+                step_df = (g_step._nodes if kind == "nodes" else g_step._edges)
+                if id in step_df.columns:
+                    for hc in hop_cols:
+                        if hc in step_df.columns:
+                            hop_maps.append(step_df[[id, hc]])
+            hop_maps = [df for df in hop_maps if len(df) > 0]
+            if hop_maps:
+                hop_map_df = df_concat(engine)(hop_maps)
+                for hc in hop_cols:
+                    if hc in hop_map_df.columns:
+                        hop_map = hop_map_df[[id, hc]].dropna(subset=[hc]).drop_duplicates(subset=[id]).set_index(id)[hc]
+                        mapped_vals = safe_map_series(out_df[id], hop_map)
+                        out_df[hc] = out_df[hc].where(out_df[hc].notna(), mapped_vals)
+
+        if hop_cols:
+            for idx, (op, _g_step) in enumerate(steps):
+                if op._name is None or not isinstance(op, ASTNode) or op._name not in out_df.columns or idx == 0:
+                    continue
+                prev_op, _ = steps[idx - 1]
+                if not isinstance(prev_op, ASTEdge):
+                    continue
+                prev_step_nodes = label_steps[idx - 1][1]._nodes if idx - 1 < len(label_steps) else None
+                prev_hop_cols = (
+                    [c for c in prev_step_nodes.columns if 'hop' in c.lower()]
+                    if prev_step_nodes is not None
+                    else []
+                )
+                hop_col = None
+                if prev_hop_cols:
+                    preferred = prev_hop_cols[0]
+                    if preferred in out_df.columns:
+                        hop_col = preferred
+                    elif f'{preferred}_x' in out_df.columns:
+                        hop_col = f'{preferred}_x'
+                    elif f'{preferred}_y' in out_df.columns:
+                        hop_col = f'{preferred}_y'
+                min_hop = (
+                    prev_op.output_min_hops
+                    if prev_op.output_min_hops is not None
+                    else (
+                        prev_op.min_hops
+                        if prev_op.min_hops is not None
+                        else (prev_op.hops if prev_op.hops is not None else 1)
+                    )
+                )
+                max_hop = (
+                    prev_op.output_max_hops
+                    if prev_op.output_max_hops is not None
+                    else (
+                        prev_op.max_hops
+                        if prev_op.max_hops is not None
+                        else prev_op.hops
+                    )
+                )
+                if prev_op.to_fixed_point:
+                    max_hop = None
+                label_mask = out_df[op._name].fillna(False).astype(bool)
+                if hop_col is not None and min_hop > 1:
+                    label_mask = label_mask & out_df[hop_col].notna() & (out_df[hop_col] >= min_hop)
+                if hop_col is not None and max_hop is not None:
+                    label_mask = label_mask & out_df[hop_col].notna() & (out_df[hop_col] <= max_hop)
+                out_df[op._name] = label_mask
+
+    cols = list(out_df.columns)
+    # An alias named like a user column collides here (marker `_x` from the step frames
+    # vs user values `_y` from the base frame). The marker is authoritative (null =
+    # unbound row); user values are restored from the base frame at property-read time,
+    # never coalesced into the marker (mixed bool/user dtypes also crash cuDF).
+    alias_marker_names = {
+        op._name for op, _ in steps
+        if isinstance(op, op_type) and isinstance(op._name, str)
+    }
+    for c in cols:
+        if c.endswith('_x'):
+            base = c[:-2]
+            c_y = base + '_y'
+            if c_y in out_df.columns:
+                if base in alias_marker_names:
+                    out_df[base] = out_df[c].fillna(False).astype(bool)
+                    out_df = out_df.drop(columns=[c, c_y])
+                    continue
+                if len(out_df) > 0:
+                    out_df[base] = out_df[c].where(out_df[c].notna(), out_df[c_y])
+                out_df = out_df.drop(columns=[c, c_y])
+        elif c.endswith('_y'):
+            base = c[:-2]
+            c_x = base + '_x'
+            if c_x in out_df.columns:
+                if len(out_df) > 0:
+                    out_df[base] = out_df[c_x].where(out_df[c_x].notna(), out_df[c])
+                out_df = out_df.drop(columns=[c, c_x])
+
+    # Empty pandas merges can move the binding column behind aliases or properties.
+    if out_df.columns[0] != id:
+        out_df = out_df[[id, *[column for column in out_df.columns if column != id]]]
+    return out_df
+
+
+
+def select_attach_prop_columns(
+    middle: Sequence[ASTObject],
+    calls: Sequence[ASTObject],
+    node_columns: Sequence[str],
+    node_id: Optional[str],
+) -> Optional[Dict[str, List[str]]]:
+    """Projection pushdown for a bare ``rows()`` immediately followed by ``select``.
+
+    Returns, per node alias of ``middle``, the property columns that select reads,
+    so the bindings builder attaches only those. None keeps attach-all: any item
+    that is not a literal, a bare alias id, an edge-alias column, or a plain
+    ``alias.column`` over an existing node column (absent properties keep their
+    3VL verdict on the full table).
+    """
+    from graphistry.compute.ast import ASTCall, ASTEdge, ASTNode
+
+    if len(calls) < 2 or not isinstance(calls[1], ASTCall) or calls[1].function not in ("select", "return_"):
+        return None
+    items = calls[1].params.get("items")
+    if not isinstance(items, list):
+        return None
+    node_aliases = [op._name for op in middle if isinstance(op, ASTNode) and isinstance(op._name, str)]
+    edge_aliases = {op._name for op in middle if isinstance(op, ASTEdge) and isinstance(op._name, str)}
+    if not node_aliases:
+        return None
+    columns = set(map(str, node_columns))
+    requested: Dict[str, List[str]] = {alias: [] for alias in node_aliases}
+    for item in items:
+        if isinstance(item, str):
+            expr: Any = item
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            expr = item[1]
+        else:
+            return None
+        if not isinstance(expr, str):
+            continue  # literal
+        if expr in requested or expr in edge_aliases:
+            continue  # bare id column, always on the state
+        alias, sep, prop = expr.partition(".")
+        if not sep:
+            return None
+        if alias in edge_aliases:
+            continue  # edge payload columns ride on the state
+        if alias not in requested or (prop not in columns and prop != node_id):
+            return None
+        if prop not in requested[alias]:
+            requested[alias].append(prop)
+    return requested
+
+def _get_boundary_calls(ops: List[ASTObject]) -> Tuple[List[ASTObject], List[ASTObject], List[ASTObject]]:
+    """Split ops into call-prefix, traversal middle, and call-suffix segments.
+
+    This helper is intentionally structural only: validation for illegal
+    call/traversal mixing in the middle segment is handled by
+    ``_handle_boundary_calls()``.
+    """
+    from graphistry.compute.ast import ASTCall
+
+    first_traversal = next((i for i, op in enumerate(ops)
+                           if not isinstance(op, ASTCall)), len(ops))
+
+    last_traversal = next((i for i, op in reversed(list(enumerate(ops)))
+                          if not isinstance(op, ASTCall)), -1)
+
+    prefix = ops[:first_traversal]
+    middle = ops[first_traversal:last_traversal + 1] if last_traversal >= 0 else []
+    suffix = ops[last_traversal + 1:] if last_traversal >= 0 else []
+
+    return (prefix, middle, suffix)
+
+
+
+def _plan_indexed_middle(
+    g: Plottable,
+    prefix: List[ASTObject],
+    middle: List[ASTObject],
+    suffix: List[ASTObject],
+    engine: Union[EngineAbstract, str],
+    policy: Optional[Any],
+    start_nodes: Optional[DataFrameT],
+) -> Optional["IndexedBindingsHandoff"]:
+    """Decide ONCE whether the resident indexes can serve this boundary's middle.
+
+    Returns ``None`` when the indexed path does not apply to this shape at all, a
+    handoff carrying a state when it serves, and a handoff without one when it was
+    tried and declined. The twin of ``_try_indexed_middle_polars`` on the polars
+    chain; keeping both as a single predicate-plus-plan keeps the two boundaries
+    comparable instead of two inline condition chains that drift.
+    """
+    from .gfql.index.handoff import IndexedBindingsHandoff
+
+    if not (middle and suffix) or prefix or start_nodes is not None or policy:
+        return None
+    call = suffix[0]
+    if not isinstance(call, ASTCall) or call.function != "rows":
+        return None
+    if (
+        call.params.get("source") is not None
+        or call.params.get("alias_endpoints") is not None
+        or call.params.get("alias_prefilters")
+        # Serving the bypass SKIPS the canonical traversal, so the suffix runs against the
+        # PRE-traversal graph. That is sound for a bindings table (the path bag already is
+        # the answer) but not for `rows(table="edges")`, which would read the whole edge
+        # table instead of the traversal-narrowed one. Non-default `table` therefore keeps
+        # the scan path, for the same reason `source`/`alias_endpoints` do above. Compared
+        # against "nodes", not None: `rows()` defaults `table` to "nodes" and always emits
+        # it, so an `is None` test would disable the bypass outright — the same trap the
+        # named-middle rewrite's guard documents below.
+        or call.params.get("table", "nodes") != "nodes"
+        or not all(isinstance(op, (ASTNode, ASTEdge)) for op in middle)
+    ):
+        return None
+    plan = serialize_binding_ops(middle)
+    # The bypass is only sound when the rows call actually consumes the WHOLE
+    # middle as binding ops: either it already carries them, or the named-middle
+    # rewrite installs exactly them. A rows call with no binding ops over an
+    # UNNAMED middle instead reads the traversal-narrowed node table, which the
+    # bypass would not produce.
+    if not (
+        call.params.get("binding_ops") == plan
+        or (
+            call.params.get("binding_ops") is None
+            and any(op._name is not None for op in middle
+                    if isinstance(op, (ASTNode, ASTEdge)))
+        )
+    ):
+        return None
+
+    engine_concrete = resolve_engine(engine, g)  # type: ignore[arg-type]
+    if engine_concrete not in (Engine.PANDAS, Engine.CUDF):
+        return None
+
+    from .gfql.limit_bindings import record_binding_limit, try_limited_bindings_state
+    limited_state = try_limited_bindings_state(g, middle, suffix, engine_concrete)
+    if limited_state is not None:
+        record_binding_limit(engine_concrete)
+        return IndexedBindingsHandoff(binding_ops=plan, state=limited_state)
+
+    from .gfql.index.bindings import try_indexed_connected_bindings_state
+
+    state = try_indexed_connected_bindings_state(g, middle, engine=engine_concrete)
+    return IndexedBindingsHandoff(
+        binding_ops=plan,
+        state=state,
+        edge_aliases=tuple(
+            op._name for op in middle
+            if isinstance(op, ASTEdge) and isinstance(op._name, str)
+        ) if state is not None else (),
+    )
+
+
+def _handle_boundary_calls(
+    self: Plottable,
+    ops: List[ASTObject],
+    engine: Union[EngineAbstract, str],
+    validate_schema: bool,
+    policy,
+    context,
+    start_nodes: Optional[DataFrameT]
+) -> Optional[Plottable]:
+    """Handle boundary ``call()`` operations around traversal chains.
+
+    Allowed pattern:
+    - ``[call..., traversal..., call...]`` where traversals are ``n()/e()``.
+
+    Rejected pattern:
+    - Any interior segment that mixes ``call()`` with traversal ops.
+
+    Returns:
+    - ``None`` when there is no boundary-call pattern to handle.
+    - A materialized ``Plottable`` when boundary-call execution was applied.
+    """
+    from graphistry.compute.ast import ASTCall, rows as rows_fn
+
+    has_call = any(isinstance(op, ASTCall) for op in ops)
+    has_traversal = any(isinstance(op, (ASTNode, ASTEdge)) for op in ops)
+
+    if not (has_call and has_traversal):
+        return None
+
+    prefix, middle, suffix = _get_boundary_calls(ops)
+
+    if middle:
+        has_call_in_middle = any(isinstance(op, ASTCall) for op in middle)
+        has_traversal_in_middle = any(isinstance(op, (ASTNode, ASTEdge)) for op in middle)
+
+        if has_call_in_middle and has_traversal_in_middle:
+            from graphistry.compute.exceptions import GFQLValidationError, ErrorCode
+            raise GFQLValidationError(
+                code=ErrorCode.E201,
+                message="Cannot mix call() operations with n()/e() traversals in interior of chain",
+                suggestion="call() operations are only allowed at chain boundaries (start/end). "
+                          "For complex patterns, use either: "
+                          "(1) let() composition: let({'filtered': [n(...), e(...)], 'enriched': ref('filtered', [call('get_degrees', {'col': 'degree'})])}, output='enriched'), or "
+                          "(2) explicit cascading: g1 = g.chain([call(...)]); g2 = g1.chain([n(), e()]); g3 = g2.chain([call(...)]). "
+                          "See issues #791, #792"
+            )
+
+    logger.debug('Boundary call pattern detected: prefix=%s, middle=%s, suffix=%s',
+                len(prefix), len(middle), len(suffix))
+
+    # Function-scope import: `gfql.index` transitively imports this module, so a
+    # module-scope import would be a cycle.
+    from .gfql.index.handoff import attach_handoff, clear_handoff, read_handoff
+    from .gfql.exec_context import attach_row_exec_context, clear_row_exec_context
+
+    g_temp = self
+    suffix_base_graph = g_temp
+
+    if prefix:
+        logger.debug('Executing boundary prefix calls: %s', prefix)
+        g_temp = _chain_impl(
+            g_temp,
+            prefix,
+            engine,
+            validate_schema,
+            policy,
+            context,
+            start_nodes
+        )
+        suffix_base_graph = g_temp
+
+    # ONE value carries the whole decision: None = the indexed path does not apply
+    # to this boundary, a handoff WITH state = it serves, a handoff WITHOUT state =
+    # it was tried and declined (which the row materializer must know, so it does
+    # not re-attempt the same plan after the canonical traversal).
+    handoff = _plan_indexed_middle(
+        self, prefix, middle, suffix, engine, policy, start_nodes,
+    )
+    served = handoff is not None and handoff.state is not None
+
+    if served:
+        assert handoff is not None  # narrowed by `served`
+        g_temp = attach_handoff(self, handoff)
+        assert handoff.state is not None
+        if handoff.state.edge_template is not None:
+            g_temp = g_temp.edges(handoff.state.edge_template)
+    else:
+        if middle:
+            logger.debug('Executing middle operations: %s', middle)
+            g_temp = _chain_impl(
+                g_temp,
+                middle,
+                engine,
+                validate_schema,
+                policy,
+                context,
+                start_nodes
+            )
+        if handoff is not None:
+            # attach (not mutate): `g_temp` may still be the caller's graph on
+            # paths where nothing rebuilt it, and this is internal plumbing.
+            g_temp = attach_handoff(g_temp, handoff)
+
+    if suffix:
+        logger.debug('Executing boundary suffix calls: %s', suffix)
+        # #1786: per-execution state rides on an INTERNAL COPY. Without prefix/middle
+        # ops (or a handoff) nothing above rebuilt `g_temp`, so it is still the CALLER's
+        # graph -- assigning here left the WITH re-entry seed on the user's object and
+        # the next, unrelated query was answered against it (silent wrong count).
+        g_temp = attach_row_exec_context(
+            g_temp, start_nodes=start_nodes, rows_base_graph=suffix_base_graph
+        )
+        if (
+            middle
+            and any(op._name is not None for op in middle)
+            and isinstance(suffix[0], ASTCall)
+            and suffix[0].function == "rows"
+            and suffix[0].params.get("binding_ops") is None
+            and suffix[0].params.get("source") is None
+            and suffix[0].params.get("alias_endpoints") is None
+            # A NON-DEFAULT `table` names the table the caller wants. Rewriting that into a
+            # bindings table silently answers a different question — and on an even-length
+            # middle (a path ending on an EDGE, e.g. LDBC IS3's edge lookup) the rewritten
+            # op list is not an alternating node/edge path at all, so it hard-errors. Same
+            # reason `source` and `alias_endpoints` are excluded above.
+            # Tested against `"nodes"` rather than None because `rows()` DEFAULTS table to
+            # "nodes" and always emits it, so `is None` is never true and would disable the
+            # rewrite outright (measured: it breaks the IS6 bindings path). The cost is that
+            # an EXPLICIT `rows(table="nodes")` is indistinguishable from a bare `rows()` at
+            # the params level, so it still rewrites; only a non-default table opts out.
+            and suffix[0].params.get("table", "nodes") == "nodes"
+            and all(isinstance(op, (ASTNode, ASTEdge)) for op in middle)
+        ):
+            # ADD binding_ops to the call the caller wrote; do not build a fresh one. The
+            # rewrite's job is to say WHERE the bindings come from, and every other param
+            # on `rows()` is still the caller's — `attach_prop_aliases` (the #1711
+            # projection pushdown) and the advisory `alias_prefilters` both survive into
+            # the binding_ops builder, which is the only place they are read. Rebuilding
+            # threw them away, so merely naming the middle silently attached every alias's
+            # properties. The excluded params above cannot be present here.
+            prev_params = suffix[0].params
+            attach_prop_columns = prev_params.get("attach_prop_columns")
+            if attach_prop_columns is None and suffix_base_graph._nodes is not None:
+                attach_prop_columns = select_attach_prop_columns(
+                    middle, suffix, list(suffix_base_graph._nodes.columns), suffix_base_graph._node,
+                )
+            suffix = [rows_fn(
+                binding_ops=serialize_binding_ops(middle),
+                alias_prefilters=prev_params.get("alias_prefilters"),
+                attach_prop_aliases=prev_params.get("attach_prop_aliases"),
+                attach_prop_columns=attach_prop_columns,
+            )] + list(suffix[1:])
+        g_temp = _chain_impl(
+            g_temp,
+            suffix,
+            engine,
+            validate_schema,
+            policy,
+            context,
+            start_nodes
+        )
+
+    # Each site that attaches the row context also detaches it: the suffix chain has run,
+    # so the context is spent, and a caller who queries THIS result must not inherit it.
+    result = clear_row_exec_context(g_temp)
+    if read_handoff(result) is not None:
+        result = result.bind()
+        clear_handoff(result)
+    return result
+
+
+def _chain_otel_attrs(
+    self: Plottable,
+    ops: Union[List[ASTObject], "Chain"],
+    engine: Union[EngineAbstract, str] = EngineAbstract.AUTO,
+    validate_schema: bool = True,
+    policy=None,
+    context=None,
+    start_nodes: Optional[DataFrameT] = None,
+) -> Dict[str, Any]:
+    chain_len = len(ops.chain) if isinstance(ops, Chain) else len(ops)
+    attrs: Dict[str, Any] = {"gfql.chain_len": chain_len}
+    if isinstance(ops, Chain):
+        attrs["gfql.has_where"] = bool(ops.where)
+    if otel_detail_enabled():
+        attrs["gfql.engine"] = str(engine)
+        attrs["gfql.validate_schema"] = validate_schema
+        attrs["gfql.has_policy"] = policy is not None
+        attrs["gfql.has_start_nodes"] = start_nodes is not None
+    return attrs
+
+
+def _step_with_source_edge_columns(g: Plottable, g_step: Plottable, op: ASTObject) -> Plottable:
+    """``g_step`` with its edge rows re-read from ``g``'s edge table when the step's alias
+    marker shares a name with an edge column: the backward re-execution filters on the
+    graph's values for that column, never on the marker stamped by the forward pass."""
+    name = op._name
+    edges, step_edges, edge_id = g._edges, g_step._edges, g._edge
+    if (name is None or edges is None or step_edges is None or edge_id is None
+            or name not in edges.columns or edge_id not in step_edges.columns):
+        return g_step
+    return g_step.edges(edges[edges[edge_id].isin(step_edges[edge_id])])
+
+
+def reject_alias_named_like_binding(
+    g: Plottable, chain_obj: "Chain", *, include_edge_endpoint_aliases: bool = False
+) -> None:
+    """Typed decline for an alias named after a binding column: a node alias equal to the
+    node-ID binding, and (native chains and Cypher alike) an edge alias equal to the source,
+    destination or edge-ID binding.
+
+    The alias marker is stamped as ``<alias> = True``, so an alias equal to the node-id
+    column overwrites the ids themselves: pandas then died with a raw
+    ``ValueError: The column label 'id' is not unique`` from the chain's own merge while
+    polars answered ``True``. Neither is a usable result; decline the same way on both.
+    """
+    from graphistry.compute.exceptions import ErrorCode, GFQLValidationError
+    node_id = g._node
+    endpoint_cols = {
+        col for col in (g._source, g._destination, g._edge)
+        if isinstance(col, str)
+    }
+    for op in chain_obj.chain:
+        if isinstance(node_id, str) and isinstance(op, ASTNode) and op._name == node_id:
+            raise GFQLValidationError(
+                ErrorCode.E108,
+                "A node alias cannot be named after the node-ID binding column",
+                field="chain.name",
+                value=node_id,
+                suggestion=(
+                    f"The alias flag is materialized as a column named '{node_id}', which would "
+                    f"overwrite the node-ID binding. Rename the alias."
+                ),
+            )
+        if (
+            include_edge_endpoint_aliases
+            and isinstance(op, ASTEdge)
+            and op._name in endpoint_cols
+        ):
+            raise GFQLValidationError(
+                ErrorCode.E108,
+                "An edge alias cannot be named after an edge endpoint binding column",
+                field="chain.name",
+                value=op._name,
+                suggestion=(
+                    "The alias flag is materialized as a column named like the edge "
+                    "source, destination or edge-ID binding, which would overwrite it. "
+                    "Rename the alias."
+                ),
+            )
+
+
+@otel_traced("gfql.chain", attrs_fn=_chain_otel_attrs)
+def chain(
+    self: Plottable,
+    ops: Union[List[ASTObject], Chain],
+    engine: Union[EngineAbstract, str] = EngineAbstract.AUTO,
+    validate_schema: bool = True,
+    policy=None,
+    context=None,
+    start_nodes: Optional[DataFrameT] = None,
+    strict: StrictInput = None,
+) -> Plottable:
+    """
+    Chain a list of ASTObject (node/edge) traversal operations
+
+    Return subgraph of matches according to the list of node & edge matchers
+    If any matchers are named, add a correspondingly named boolean-valued column to the output
+
+    For direct calls, exposes convenience `List[ASTObject]`. Internal operational should prefer `Chain`.
+
+    Use `engine='cudf'` to force automatic GPU acceleration mode
+
+    :param ops: List[ASTObject] Various node and edge matchers
+    :param validate_schema: Whether to validate the chain against the graph schema before executing
+    :param policy: Optional policy dict for hooks
+    :param context: Optional ExecutionContext for tracking execution state
+    :param start_nodes: Optional node wavefront for the first traversal step
+    :param strict: Absent-name strictness: ``"strict"`` raises, ``"warn"`` (default) warns
+        once per absent name and resolves it to null, ``"quiet"`` resolves silently.
+        ``True``/``False`` map to ``"strict"``/``"quiet"``. ``None`` consults
+        ``bind(schema=...)``, then the ``"warn"`` default.
+
+    :returns: Plotter
+    :rtype: Plotter
+    """
+    from graphistry.compute.gfql.strictness import (
+        resolve_strict_level, schema_declared_names, strictness_scope)
+
+    with strictness_scope(
+        resolve_strict_level(self, strict=strict), declared=schema_declared_names(self)
+    ):
+        return _chain_with_strictness(
+            self, ops, engine, validate_schema, policy, context, start_nodes)
+
+
+def _chain_with_strictness(
+    self: Plottable,
+    ops: Union[List[ASTObject], Chain],
+    engine: Union[EngineAbstract, str],
+    validate_schema: bool,
+    policy: Optional[Dict[str, PolicyFunction]],
+    context: Optional['ExecutionContext'],
+    start_nodes: Optional[DataFrameT],
+) -> Plottable:
+    if context is None:
+        from .execution_context import ExecutionContext
+        context = ExecutionContext()
+
+    # Resolve engine from original data BEFORE coercion so GPU mode is preserved end-to-end.
+    # _coerce_input_formats then converts input formats (polars, arrow, spark, dask) to that engine.
+    if isinstance(engine, str):
+        engine = EngineAbstract(engine)
+    reject_alias_named_like_binding(self, ops if isinstance(ops, Chain) else Chain(ops), include_edge_endpoint_aliases=True)
+    from graphistry.compute.ComputeMixin import _coerce_input_formats  # lazy — avoids circular import
+    engine_concrete_early = resolve_engine(engine, self)
+    if engine_concrete_early in (Engine.POLARS, Engine.POLARS_GPU):
+        # Clean dependency errors BEFORE _coerce_input_formats (which imports polars to
+        # coerce frames) so the user sees actionable install guidance, not a raw ImportError
+        # deep in coercion / the lazy engine. Both engines need polars; polars-gpu also needs
+        # the RAPIDS cudf_polars stack (checked here so it's consistent regardless of whether a
+        # given query reaches a GPU collect, and reads as an install issue rather than the
+        # genuine not-GPU-capable signal from lazy._engine_for).
+        try:
+            import polars  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                f"GFQL engine={engine_concrete_early.value!r} requires the 'polars' package; "
+                "install it with `pip install polars` (or use engine='pandas')."
+            ) from e
+        if engine_concrete_early == Engine.POLARS_GPU:
+            import importlib.util
+            if importlib.util.find_spec("cudf_polars") is None:
+                raise ImportError(
+                    "GFQL engine='polars-gpu' requires the RAPIDS cudf_polars stack (NVIDIA GPU). "
+                    "Install RAPIDS/cudf_polars, or use engine='polars' for native CPU execution."
+                )
+    self = _coerce_input_formats(self, engine_concrete_early)
+    if engine_concrete_early == Engine.PANDAS:
+        self = ensure_local_engine_match(self, engine_concrete_early)
+
+    if engine_concrete_early in POLARS_ENGINES:
+        # Native polars chain lives in a dedicated dispatched module so the
+        # production pandas/cuDF orchestration below stays untouched (see
+        # no-silent-fallback policy). Correctness gated by differential parity.
+        # POLARS_GPU = the same lazy engine with the GPU execution target.
+        # (Dependency guards for polars / cudf_polars are above, pre-coercion.)
+        if validate_schema:
+            # Construct a fresh validator: the constructor validates children once.
+            if not Chain.ops_were_validated_in_this_call(ops):
+                Chain(ops if not isinstance(ops, Chain) else ops.chain)
+            validate_graph_shape(self, ops, collect_all=False)  # pandas gets this via validate_chain_schema (#1889)
+        from graphistry.compute.gfql.lazy.engine.polars.chain import chain_polars
+        from graphistry.compute.gfql.lazy import target_mode, ExecutionTarget
+        # NO pandas fallback here (no-silent-fallback policy): chain_polars raises
+        # NotImplementedError for deferred features (var-length/multi-hop edges,
+        # undirected multi-edge); that honest signal propagates to the caller.
+        _tgt = ExecutionTarget.GPU if engine_concrete_early == Engine.POLARS_GPU else ExecutionTarget.CPU
+        with target_mode(_tgt):
+            if policy:
+                from graphistry.compute.gfql.call.executor import _thread_local as call_thread_local
+                old_policy = getattr(call_thread_local, 'policy', None)
+                try:
+                    call_thread_local.policy = policy
+                    return chain_polars(self, ops, start_nodes=start_nodes)
+                finally:
+                    call_thread_local.policy = old_policy
+            return chain_polars(self, ops, start_nodes=start_nodes)
+
+    if policy:
+        from graphistry.compute.gfql.call.executor import _thread_local as call_thread_local
+        old_policy = getattr(call_thread_local, 'policy', None)
+        try:
+            call_thread_local.policy = policy
+            return _chain_impl(self, ops, engine, validate_schema, policy, context, start_nodes)
+        finally:
+            call_thread_local.policy = old_policy
+    else:
+        point_ops = ops.chain if isinstance(ops, Chain) else ops
+        point_result = _try_point_rows(self, point_ops, engine_concrete_early, start_nodes, validate_schema)
+        if point_result is not None:
+            return point_result
+        return _chain_impl(self, ops, engine, validate_schema, policy, context, start_nodes)
+
+
+
+_NODE_ROW_CALLS = ("rows", "select", "with_")
+
+
+def _calls_only_on_node_rows(ops: List[ASTObject]) -> bool:
+    """Whether all operations use row tables without binding rows or edge identity."""
+    if not ops:
+        return False
+    for op in ops:
+        if not isinstance(op, ASTCall) or op.function not in _NODE_ROW_CALLS:
+            return False
+        if op.function == "rows" and (
+            op.params.get("binding_ops") is not None or op.params.get("alias_endpoints") is not None
+        ):
+            return False
+    return True
+
+
+def _chain_impl(
+    self: Plottable,
+    ops: Union[List[ASTObject], Chain],
+    engine: Union[EngineAbstract, str],
+    validate_schema: bool,
+    policy,
+    context,
+    start_nodes: Optional[DataFrameT]
+) -> Plottable:
+    if isinstance(engine, str):
+        engine = EngineAbstract(engine)
+
+    validated_in_call = Chain.ops_were_validated_in_this_call(ops)
+    if isinstance(ops, Chain):
+        ops = ops.chain
+
+    if validate_schema and not validated_in_call:
+        # Revalidate mutable operations on every execution, including reused Chains.
+        Chain(ops)
+
+    from graphistry.compute.ast import ASTCall
+
+    schema_changers = ['umap', 'hypergraph']
+
+    schema_changer_idx = None
+    for i, op in enumerate(ops):
+        if isinstance(op, ASTCall) and op.function in schema_changers:
+            schema_changer_idx = i
+            break
+
+    if schema_changer_idx is not None:
+        if len(ops) == 1:
+            from graphistry.compute.gfql.call.executor import execute_call
+            from graphistry.compute.exceptions import GFQLTypeError, ErrorCode
+
+            engine_concrete = resolve_engine(engine, self)
+            schema_changer = ops[0]
+
+            if not isinstance(schema_changer, ASTCall):
+                raise GFQLTypeError(
+                    code=ErrorCode.E201,
+                    message="Schema-changer operation must be ASTCall",
+                    field="operation",
+                    value=type(schema_changer).__name__,
+                    suggestion="Use call('umap', {...}) or call('hypergraph', {...})"
+                )
+
+            if validate_schema:
+                validate_chain_schema(self, ops, collect_all=False)
+
+            return execute_call(self, schema_changer.function, schema_changer.params, engine_concrete, policy=policy, context=context)
+        before = ops[:schema_changer_idx]
+        schema_changer = ops[schema_changer_idx]
+        rest = ops[schema_changer_idx + 1:]
+
+        g_temp = _chain_impl(self, before, engine, validate_schema, policy, context, start_nodes=None) if before else self
+        g_temp2 = _chain_impl(g_temp, [schema_changer], engine, validate_schema, policy, context, start_nodes=None)
+        return _chain_impl(g_temp2, rest, engine, validate_schema, policy, context, start_nodes=None) if rest else g_temp2
+
+    if len(ops) == 0:
+        return self
+
+    logger.debug('orig chain >> %s', ops)
+
+    engine_concrete = resolve_engine(engine, self)
+    logger.debug('chain engine: %s => %s', engine, engine_concrete)
+
+    boundary_result = _handle_boundary_calls(self, ops, engine, validate_schema, policy, context, start_nodes)
+    if boundary_result is not None:
+        return boundary_result
+
+    if validate_schema:
+        validate_chain_schema(self, ops, collect_all=False)
+
+    # The fast path skips the policy hook dispatch (prechain/postchain below), so only
+    # take it when no policy is attached — policy-bearing queries must keep hook firing.
+    if not policy:
+        _fast = _try_chain_fast_path(self, ops, engine_concrete, start_nodes)
+        if _fast is not None:
+            return _fast
+
+    if isinstance(ops[0], ASTEdge):
+        logger.debug('adding initial node to ensure initial link has needed reversals')
+        ops = cast(List[ASTObject], [ ASTNode() ]) + ops
+
+    if isinstance(ops[-1], ASTEdge):
+        logger.debug('adding final node to ensure final link has needed reversals')
+        ops = ops + cast(List[ASTObject], [ ASTNode() ])
+
+    logger.debug('final chain >> %s', ops)
+
+    original_edge = self._edge
+
+    g_out = None
+    error = None
+    success = False
+
+    try:
+        g = self.materialize_nodes(engine=EngineAbstract(engine_concrete.value))
+
+        synthesized_empty_edges = False
+        if g._edges is None and all(isinstance(op, ASTNode) for op in ops):
+            # node-only steps only ever slice edges[:0], so an empty frame serves; result drops it (#1879)
+            synthesized_empty_edges = True
+            synth_src = generate_safe_column_name('src', g._nodes, prefix='__gfql_', suffix='__')
+            synth_dst = generate_safe_column_name('dst', g._nodes, prefix='__gfql_', suffix='__')
+            g = g.edges(df_cons(engine_concrete)({synth_src: [], synth_dst: []}), synth_src, synth_dst)
+        elif g._edges is None and any(isinstance(op, ASTEdge) for op in ops):
+            from graphistry.compute.exceptions import ErrorCode, GFQLSchemaError
+            raise GFQLSchemaError(
+                ErrorCode.E304,
+                'Cannot traverse edges: graph has no edges bound',
+                suggestion='Bind edges via g.edges(df, source, destination), or use a node-only pattern'
+            )
+
+        if g._edges is None or _calls_only_on_node_rows(ops):
+            added_edge_index = False
+        elif g._edge is None:
+            GFQL_EDGE_INDEX = generate_safe_column_name('edge_index', g._edges, prefix='__gfql_', suffix='__')
+
+            added_edge_index = True
+            # Attach the synthetic per-edge id WITHOUT copying edge data (#1670):
+            # the previous reset_index(drop=False) + rename deep-copied AND
+            # block-consolidated the whole edge frame (~70ms @2M edges) on every
+            # chain call — even node-only queries. A shallow copy + assigning the
+            # index as a column yields the identical id values (the frame's index)
+            # with no O(E) data copy. The column is internal-only — dropped on
+            # every exit path (see added_edge_index consumers below) — so only
+            # uniqueness matters.
+            pre_index_edges_df = g._edges
+            indexed_edges_df = g._edges.copy(deep=False)
+            indexed_edges_df[GFQL_EDGE_INDEX] = indexed_edges_df.index
+            g = g.edges(indexed_edges_df, edge=GFQL_EDGE_INDEX)
+            # Pass the frame this was derived FROM: only an index still valid for it may migrate.
+            from graphistry.compute.gfql.index import get_registry, set_registry
+            _reg = get_registry(g)
+            if not _reg.is_empty():
+                g = set_registry(g, _reg.rebind_edges(indexed_edges_df, pre_index_edges_df))
+        else:
+            added_edge_index = False
+
+        if policy and 'prechain' in policy:
+            stats = extract_graph_stats(g)
+            current_path = context.operation_path
+
+            prechain_context: 'PolicyContext' = {
+                'phase': 'prechain',
+                'hook': 'prechain',
+                'query': ops,
+                'current_ast': ops,
+                'query_type': 'chain',
+                'plottable': g,
+                'graph_stats': stats,
+                'execution_depth': context.execution_depth,
+                'operation_path': current_path,
+                'parent_operation': current_path.rsplit('.', 1)[0] if '.' in current_path else 'query',
+                '_policy_depth': 0
+            }
+
+            try:
+                policy['prechain'](prechain_context)
+            except PolicyException:
+                raise
+
+        # Phase 1: Forward pass to build step-local wavefronts.
+        logger.debug('======================== FORWARDS ========================')
+        g_stack : List[Plottable] = []
+        for i, op in enumerate(ops):
+            if isinstance(op, ASTCall):
+                current_g = g_stack[-1] if g_stack else g
+                prev_step_nodes = None  # ASTCall doesn't use wavefronts
+            else:
+                current_g = g
+                prev_step_nodes = (
+                    start_nodes
+                    if len(g_stack) == 0
+                    else g_stack[-1]._nodes
+                )
+
+            g_step = (
+                op.execute(
+                    g=current_g,  # Pass appropriate graph for operation type
+                    prev_node_wavefront=prev_step_nodes,
+                    target_wave_front=None,  # implicit any
+                    engine=engine_concrete
+                )
+            )
+            g_stack.append(g_step)
+
+        import logging
+        if logger.isEnabledFor(logging.DEBUG):
+            for (i, g_step) in enumerate(g_stack):
+                logger.debug('~' * 10 + '\nstep %s', i)
+                logger.debug('nodes: %s', dbg_df(g_step._nodes))
+                logger.debug('edges: %s', dbg_df(g_step._edges))
+
+        all_astcall = all(isinstance(op, ASTCall) for op in ops)
+
+        if all_astcall:
+            g_out = g_stack[-1]
+            if added_edge_index:
+                final_edges_df = g_out._edges.drop(columns=[g._edge])
+                called = g_out
+                g_out = self.nodes(g_out._nodes).edges(final_edges_df, edge=original_edge)
+                # A call such as create_index attaches an index registry to ITS result; rebuilding
+                # from `self` would lose it. Migrate it onto the de-indexed edge frame (same rows).
+                from graphistry.compute.gfql.index import get_registry, set_registry
+                _called_registry = get_registry(called)
+                g_out = set_registry(g_out, _called_registry.rebind_edges(final_edges_df, called._edges))
+            else:
+                from .gfql.exec_context import clear_row_exec_context
+                g_out = clear_row_exec_context(g_out)
+            success = True
+        elif len(ops) == 1 and isinstance(ops[0], ASTNode):
+            # A node selection preserves each source row. Rejoining node IDs in
+            # the traversal combine would multiply duplicate rows and properties.
+            g_out = g_stack[0]
+            alias = ops[0]._name
+            if alias is not None:
+                cols = [c for c in g_out._nodes.columns if c != alias]
+                if g._node in cols:
+                    cols = [g._node, *[c for c in cols if c != g._node]]
+                cols = ([*cols, alias] if alias in g._nodes.columns
+                        else [*cols[:1], alias, *cols[1:]])
+                g_out = g_out.nodes(g_out._nodes[cols].reset_index(drop=True))
+            if synthesized_empty_edges:
+                g_out = self.nodes(g_out._nodes, g._node)
+            elif added_edge_index:
+                g_out = self.nodes(g_out._nodes, g._node).edges(
+                    g_out._edges.drop(columns=[g._edge]), edge=original_edge)
+            elif g._edge is not None:
+                edge_cols = [g._edge, *[c for c in g_out._edges.columns if c != g._edge]]
+                g_out = g_out.edges(g_out._edges[edge_cols])
+            success = True
+        else:
+            # Phase 2: Backward pass to propagate downstream constraints.
+            g_stack_reverse : List[Plottable] = []
+            for (op, g_step) in zip(reversed(ops), reversed(g_stack)):
+                prev_loop_step = g_stack[-1] if len(g_stack_reverse) == 0 else g_stack_reverse[-1]
+                if len(g_stack_reverse) == len(g_stack) - 1:
+                    prev_orig_step = None
+                else:
+                    prev_orig_step = g_stack[-(len(g_stack_reverse) + 2)]
+                prev_wavefront_nodes = prev_loop_step._nodes
+                if g._node is not None and prev_wavefront_nodes is not None and g._nodes is not None:
+                    # slice 5 (#1755): re-attach full node columns to the reverse
+                    # wavefront. The inner merge scans all of g._nodes; when the
+                    # wavefront is tiny (seeded chain), the byte-identical result
+                    # is an isin membership filter (see _lean_intersect_full).
+                    _lean = _lean_intersect_full(g._nodes, prev_wavefront_nodes[[g._node]], g._node, engine_concrete)
+                    prev_wavefront_nodes = _lean if _lean is not None else safe_merge(
+                        g._nodes,
+                        prev_wavefront_nodes[[g._node]],
+                        on=g._node,
+                        how='inner',
+                        engine=engine_concrete
+                    )
+                target_wave_front_nodes = prev_orig_step._nodes if prev_orig_step is not None else None
+                if g._node is not None and target_wave_front_nodes is not None and g._nodes is not None:
+                    _lean = _lean_intersect_full(g._nodes, target_wave_front_nodes[[g._node]], g._node, engine_concrete)
+                    target_wave_front_nodes = _lean if _lean is not None else safe_merge(
+                        g._nodes,
+                        target_wave_front_nodes[[g._node]],
+                        on=g._node,
+                        how='inner',
+                        engine=engine_concrete
+                    )
+                assert prev_loop_step._nodes is not None
+
+                use_fast_backward = (
+                    isinstance(op, ASTEdge)
+                    and op.is_simple_single_hop()
+                    and g_step._edges is not None
+                    and len(g_step._edges) > 0
+                    and g._node is not None
+                    and g._source is not None
+                    and g._destination is not None
+                )
+
+                if use_fast_backward:
+                    assert isinstance(op, ASTEdge)  # type narrowing for mypy
+                    edges_df = g_step._edges
+                    node_id, src_col, dst_col = g._node, g._source, g._destination
+                    assert node_id is not None and src_col is not None and dst_col is not None
+                    is_undirected = op.direction == 'undirected'
+                    prev_ids = prev_wavefront_nodes[node_id] if prev_wavefront_nodes is not None else None
+                    target_ids = target_wave_front_nodes[node_id] if target_wave_front_nodes is not None else None
+
+                    if is_undirected:
+                        if prev_ids is not None and target_ids is not None:
+                            mask = ((edges_df[src_col].isin(prev_ids) & edges_df[dst_col].isin(target_ids))
+                                    | (edges_df[src_col].isin(target_ids) & edges_df[dst_col].isin(prev_ids)))
+                            edges_df = edges_df[mask]
+                        elif prev_ids is not None:
+                            edges_df = edges_df[edges_df[src_col].isin(prev_ids) | edges_df[dst_col].isin(prev_ids)]
+                        elif target_ids is not None:
+                            edges_df = edges_df[edges_df[src_col].isin(target_ids) | edges_df[dst_col].isin(target_ids)]
+                    else:
+                        next_col, prev_col = (src_col, dst_col) if op.direction == 'reverse' else (dst_col, src_col)
+                        edges_df = _filter_edges_by_endpoint(edges_df, prev_wavefront_nodes, node_id, next_col)
+                        edges_df = _filter_edges_by_endpoint(edges_df, target_wave_front_nodes, node_id, prev_col)
+
+                    if len(edges_df) > 0:
+                        if is_undirected:
+                            target_node_ids = df_concat(engine_concrete)([
+                                edges_df[[src_col]].rename(columns={src_col: node_id}),
+                                edges_df[[dst_col]].rename(columns={dst_col: node_id})
+                            ]).drop_duplicates()
+                        else:
+                            target_col = dst_col if op.direction == 'reverse' else src_col
+                            target_node_ids = edges_df[[target_col]].rename(columns={target_col: node_id}).drop_duplicates()
+                        nodes_df = safe_merge(g._nodes, target_node_ids, on=node_id, how='inner', engine=engine_concrete) if g._nodes is not None else target_node_ids
+                    else:
+                        nodes_df = g._nodes.iloc[:0] if g._nodes is not None else None
+
+                    g_step_reverse = g_step.nodes(nodes_df).edges(edges_df)
+                else:
+                    g_step_reverse = op.reverse().execute(
+                        g=_step_with_source_edge_columns(g, g_step, op),
+                        prev_node_wavefront=prev_wavefront_nodes,
+                        target_wave_front=target_wave_front_nodes,
+                        engine=engine_concrete
+                    )
+                g_stack_reverse.append(g_step_reverse)
+
+            import logging
+            if logger.isEnabledFor(logging.DEBUG):
+                for (i, g_step) in enumerate(g_stack_reverse):
+                    logger.debug('~' * 10 + '\nstep %s', i)
+                    logger.debug('nodes: %s', dbg_df(g_step._nodes))
+                    logger.debug('edges: %s', dbg_df(g_step._edges))
+
+            # Phase 3: Materialize final node/edge outputs from pruned steps.
+            logger.debug('============ COMBINE NODES ============')
+            final_nodes_df = combine_steps(
+                g,
+                'nodes',
+                list(zip(ops, reversed(g_stack_reverse))),
+                engine_concrete,
+                label_steps=list(zip(ops, g_stack))
+            )
+
+            logger.debug('============ COMBINE EDGES ============')
+            final_edges_df = combine_steps(
+                g,
+                'edges',
+                list(zip(ops, reversed(g_stack_reverse))),
+                engine_concrete,
+                label_steps=list(zip(ops, g_stack))
+            )
+            if added_edge_index:
+                final_edges_df = final_edges_df.drop(columns=[g._edge])
+                # `self` restores the original edge binding, but carry the materialized
+                # `g._node` explicitly: an edges-only `self._node is None` would drop the
+                # node binding, making the reconciliation concat synthesize a corrupt
+                # `None`-named column (and a void-block concat crash on newer pandas).
+                g_out = self.nodes(final_nodes_df, g._node).edges(final_edges_df, edge=original_edge)
+            else:
+                g_out = g.nodes(final_nodes_df).edges(final_edges_df)
+
+            if synthesized_empty_edges:
+                g_out = self.nodes(final_nodes_df, g._node)
+
+            if g_out._edges is not None and len(g_out._edges) > 0:
+                concat_fn = df_concat(engine_concrete)
+                endpoints = concat_fn(
+                    [
+                        g_out._edges[[g_out._source]].rename(columns={g_out._source: g_out._node}),
+                        g_out._edges[[g_out._destination]].rename(columns={g_out._destination: g_out._node}),
+                    ],
+                    ignore_index=True,
+                    sort=False,
+                ).drop_duplicates(subset=[g_out._node])
+                endpoints = align_shared_column_dtypes(g_out._nodes, endpoints)
+                missing = endpoints[~endpoints[g_out._node].isin(g_out._nodes[g_out._node])]
+                nodes_out = g_out._nodes
+                if len(missing) > 0:  # only a dangling endpoint is backfilled; a present id would widen the attribute dtypes
+                    nodes_out = safe_row_concat([nodes_out, missing], ignore_index=True, sort=False)
+                g_out = g_out.nodes(nodes_out.drop_duplicates(subset=[g_out._node]))
+
+            success = True
+
+    except Exception as e:
+        error = e
+
+    finally:
+        postchain_policy_error = None
+        if policy and 'postchain' in policy:
+
+            graph_for_stats = cast(Plottable, g_out) if success else self
+            stats = extract_graph_stats(graph_for_stats)
+            current_path = context.operation_path
+
+            postchain_context: 'PolicyContext' = {
+                'phase': 'postchain',
+                'hook': 'postchain',
+                'query': ops,
+                'current_ast': ops,
+                'query_type': 'chain',
+                'plottable': graph_for_stats,
+                'graph_stats': stats,
+                'success': success,
+                'execution_depth': context.execution_depth,
+                'operation_path': current_path,
+                'parent_operation': current_path.rsplit('.', 1)[0] if '.' in current_path else 'query',
+                '_policy_depth': 0
+            }
+
+            if error is not None:
+                postchain_context['error'] = str(error)  # type: ignore
+                postchain_context['error_type'] = type(error).__name__  # type: ignore
+
+            try:
+                policy['postchain'](postchain_context)
+            except PolicyException as e:
+                postchain_policy_error = e
+
+        policy_error = None
+        if policy and 'postload' in policy:
+
+            graph_for_stats = cast(Plottable, g_out) if success else self
+            stats = extract_graph_stats(graph_for_stats)
+
+            policy_context: 'PolicyContext' = {
+                'phase': 'postload',
+                'hook': 'postload',
+                'query': ops,
+                'current_ast': ops,  # For chain, current == ops
+                'query_type': 'chain',
+                'plottable': graph_for_stats,  # RESULT or INPUT
+                'graph_stats': stats,
+                'success': success,  # True if successful, False if error
+                'execution_depth': context.execution_depth,  # Add execution depth
+                '_policy_depth': getattr(ops, '_policy_depth', 0) if hasattr(ops, '_policy_depth') else 0
+            }
+
+            if error is not None:
+                policy_context['error'] = str(error)  # type: ignore
+                policy_context['error_type'] = type(error).__name__  # type: ignore
+
+            try:
+                policy['postload'](policy_context)
+
+            except PolicyException as e:
+                if e.query_type is None:
+                    e.query_type = 'chain'
+                if e.data_size is None:
+                    e.data_size = stats
+                policy_error = e
+
+    if postchain_policy_error is not None:
+        if error is not None:
+            raise postchain_policy_error from error
+        else:
+            raise postchain_policy_error
+    elif policy_error is not None:
+        if error is not None:
+            raise policy_error from error
+        else:
+            raise policy_error
+    elif error is not None:
+        raise error
+
+    return cast(Plottable, g_out)

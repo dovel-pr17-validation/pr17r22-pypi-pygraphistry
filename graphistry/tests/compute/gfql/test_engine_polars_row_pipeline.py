@@ -1,0 +1,906 @@
+"""Differential parity: native polars cypher row pipeline == pandas (the oracle). Phase 2:
+boundary-call dispatch (chain_polars splits traversal from trailing call() ops), native frame
+ops (rows/limit/skip/distinct/drop_cols), host-bridged projection. Supported queries return an
+identical polars-typed table; not-yet-ported ops raise NotImplementedError, never silently
+diverge. See plans/gfql-polars-engine."""
+import pandas as pd
+import pytest
+
+import graphistry
+
+pl = pytest.importorskip("polars")
+
+
+NODES = pd.DataFrame({
+    "id": [0, 1, 2, 3, 4, 5],
+    "val": [10, 20, 30, 40, 50, 60],
+    "kind": ["a", "b", "a", "b", "a", "c"],
+    "name": ["alice", "bob", "carol", "dave", "erin", "frank"],
+})
+EDGES = pd.DataFrame({
+    "s": [0, 1, 2, 3, 4, 0, 2],
+    "d": [1, 2, 3, 4, 5, 2, 4],
+    "w": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+})
+BASE = graphistry.nodes(NODES, "id").edges(EDGES, "s", "d")
+
+
+def _to_pandas(df):
+    if df is not None and "polars" in type(df).__module__:
+        return df.to_pandas()
+    return df
+
+
+def _assert_parity(query, *, order_sensitive=True):
+    """Polars result table equals the pandas oracle (and is polars-typed)."""
+    rpd = BASE.gfql(query, engine="pandas")._nodes
+    rpl = BASE.gfql(query, engine="polars")._nodes
+    assert "polars" in type(rpl).__module__, f"expected polars frame for {query!r}"
+    a = _to_pandas(rpd).reset_index(drop=True)
+    b = _to_pandas(rpl).reset_index(drop=True)
+    assert list(a.columns) == list(b.columns), f"columns differ for {query!r}: {list(a.columns)} vs {list(b.columns)}"
+    assert len(a) == len(b), f"row count differs for {query!r}: {len(a)} vs {len(b)}"
+    if order_sensitive:
+        pd.testing.assert_frame_equal(a, b, check_dtype=False)
+    else:
+        a_sorted = a.sort_values(list(a.columns)).reset_index(drop=True)
+        b_sorted = b.sort_values(list(b.columns)).reset_index(drop=True)
+        pd.testing.assert_frame_equal(a_sorted, b_sorted, check_dtype=False)
+
+
+SUPPORTED = [
+    # whole-entity RETURN (pure projection, no row-pipeline op)
+    "MATCH (n) RETURN n",
+    # limit / skip / skip+limit (frame ops)
+    "MATCH (n) RETURN n LIMIT 3",
+    "MATCH (n) RETURN n LIMIT 0",
+    "MATCH (n) RETURN n LIMIT 100",
+    "MATCH (n) RETURN n SKIP 2",
+    "MATCH (n) RETURN n SKIP 4",
+    "MATCH (n) RETURN n SKIP 100",
+    "MATCH (n) RETURN n SKIP 1 LIMIT 2",
+    "MATCH (n) RETURN n SKIP 2 LIMIT 3",
+    # whole-row distinct
+    "MATCH (n) RETURN DISTINCT n",
+    # single-entity WHERE (folds into the node matcher, handled by PR1 traversal)
+    "MATCH (n) WHERE n.val > 25 RETURN n",
+    "MATCH (n) WHERE n.val >= 30 RETURN n",
+    'MATCH (n) WHERE n.kind = "a" RETURN n',
+    "MATCH (n) WHERE n.val < 30 RETURN n LIMIT 1",
+    # relationship patterns into a row return
+    "MATCH (n)-[e]->(m) RETURN m",
+    "MATCH (a)-[e]->(b) WHERE a.val < 30 RETURN b",
+    "MATCH (a)-[e]->(b) RETURN b LIMIT 2",
+    "MATCH (a)-[e]->(b) RETURN DISTINCT b",
+    # whole-entity RETURN flattens to a.* columns (#1650 structured returns)
+    "MATCH (n) RETURN n",
+]
+
+# Row ops lowered to NATIVE polars (no pandas): select/with_/return_ projection (property/
+# arith/comparison/boolean/literal), order_by, group_by (count/sum/avg/min/max), unwind.
+NATIVE_LOWERED = [
+    "MATCH (n)-[e]->(m) RETURN n, m",
+    "MATCH (n) RETURN n.val",
+    "MATCH (n) RETURN n.val AS v, n.kind",
+    "MATCH (n) RETURN n.val, n.name",
+    "MATCH (n) RETURN n.val + 1 AS p",
+    "MATCH (n) RETURN n.val * 2 AS d, n.kind",
+    "MATCH (n) RETURN n.val - 5 AS m",
+    "MATCH (n) RETURN n.val > 25 AS big",
+    "MATCH (n) RETURN DISTINCT n.kind",
+    "MATCH (n) RETURN n.val ORDER BY n.val DESC",
+    "MATCH (n) RETURN n.val ORDER BY n.val",
+    "MATCH (n) WHERE n.val > 15 RETURN n.val ORDER BY n.val DESC LIMIT 2",
+    # OR / NOT WHERE doesn't fold into the matcher -> native where_rows filter
+    "MATCH (n) WHERE n.val > 80 OR n.kind = 'alpha' RETURN n.val, n.kind",
+    "MATCH (n) WHERE NOT n.kind = 'beta' RETURN n.kind",
+    "MATCH (n) RETURN n.kind, count(n) AS c",
+    "MATCH (n) RETURN count(n) AS c",
+    # count(*) / keyless + literal projection (#1707: must NOT collapse to 1)
+    "MATCH (n) RETURN count(*) AS c",
+    "MATCH (n) WHERE n.val > 25 RETURN count(*) AS c",
+    "MATCH (n) RETURN n.kind, count(*) AS c",
+    "MATCH (n) RETURN n.kind, count(*) AS c ORDER BY c DESC",
+    "MATCH (n) RETURN 1 AS one",
+    "MATCH (n) RETURN n.kind, sum(n.val) AS s, avg(n.val) AS a",
+    "MATCH (n) RETURN n.kind, min(n.val) AS mn, max(n.val) AS mx",
+    "MATCH (n) RETURN n.kind, count(n) AS c ORDER BY c DESC",
+    "MATCH (n) UNWIND [1, 2] AS x RETURN n.val, x",
+    "MATCH (n) UNWIND [1, 2, 3] AS x RETURN x",
+    # multi-entity property projection via native rows(binding_ops) (#1709)
+    "MATCH (n)-[e]->(m) RETURN n.val, m.val",
+    # whole-entity identity aggregation (#1709): count(DISTINCT n) lowers the agg arg to the
+    # bare ``__gfql_node_id__`` identity sentinel, now resolved to the node-id column natively.
+    "MATCH (n) RETURN count(DISTINCT n) AS c",
+    "MATCH (n) WHERE n.val > 25 RETURN count(DISTINCT n) AS c",
+    "MATCH (n) RETURN n.kind, count(DISTINCT n) AS c",
+    "MATCH (n) RETURN n.kind, count(DISTINCT n) AS c ORDER BY c DESC",
+    "MATCH (a)-[e]->(b) RETURN count(DISTINCT b) AS c",
+    # property-arg distinct (already native; guard against regression)
+    "MATCH (n) RETURN n.kind, count(DISTINCT n.val) AS c",
+]
+
+# NO-CHEATING (see plan.md): no native impl yet -> NotImplementedError, never a
+# silent pandas bridge. Cross-entity same-path WHERE (DFSamePathExecutor) +
+# multi-entity whole-row result rendering. Multi-entity property projections
+# lowered via rows(binding_ops) are native.
+DEFERRED = [
+    "MATCH (n)-[e]->(m) WHERE n.val < m.val RETURN n, m",   # cross-entity WHERE
+    # whole-entity collect: agg arg is the __node_entity__(n) whole-entity token (not the bare
+    # identity sentinel), whose native list-of-entities representation isn't ported yet -> NIE.
+    "MATCH (n) RETURN collect(n) AS xs",
+]
+
+
+@pytest.mark.parametrize("query", SUPPORTED + NATIVE_LOWERED)
+def test_polars_row_pipeline_parity(query):
+    # ORDER BY queries are order-sensitive; the rest compare orderlessly.
+    _assert_parity(query, order_sensitive="ORDER BY" in query)
+
+
+@pytest.mark.parametrize("query", NATIVE_LOWERED)
+def test_polars_row_pipeline_is_polars_typed(query):
+    """Native row ops return polars-typed results (no pandas round-trip)."""
+    assert "polars" in type(BASE.gfql(query, engine="polars")._nodes).__module__
+
+
+@pytest.mark.parametrize("query", DEFERRED)
+def test_polars_row_pipeline_deferred_raises(query):
+    """Not-yet-native ops raise NotImplementedError (never silently bridge)."""
+    with pytest.raises(NotImplementedError):
+        BASE.gfql(query, engine="polars")
+
+
+# Native polars UNWIND of a CARRIED list column (collect() output / carried binding), the row-
+# pipeline analogue of the IC6 `WITH collect(...) AS xs UNWIND xs AS y` shape. These are literal-
+# seeded (a MATCH-introduced alias before UNWIND-after-WITH is parser-gated for BOTH engines), so
+# the graph is irrelevant; the collect() result is what the UNWIND explodes. Parity gate: pandas.
+COLLECT_UNWIND = [
+    "UNWIND [1, 2, 3] AS x WITH collect(x) AS xs UNWIND xs AS y RETURN y",
+    "UNWIND [3, 1, 2, 1] AS x WITH collect(DISTINCT x) AS xs UNWIND xs AS y RETURN y",
+    "UNWIND [5, 1, 9, 2] AS x WITH collect(x) AS xs UNWIND xs AS y RETURN y ORDER BY y DESC",
+    "UNWIND [1, 2, 3, 4] AS x WITH x % 2 AS k, collect(x) AS xs UNWIND xs AS y RETURN k, y ORDER BY k, y",
+    "UNWIND [1, 2, 3, 4] AS x WITH collect(x) AS xs UNWIND xs AS y RETURN count(y) AS c, sum(y) AS s",
+    "UNWIND [1, 2, 3, 4] AS x WITH x % 2 AS k, collect(x) AS xs UNWIND xs AS y RETURN k, count(y) AS c ORDER BY k",
+    # nested pipeline: collect -> unwind -> collect -> unwind
+    "UNWIND [1, 1, 2, 2, 3] AS x WITH collect(DISTINCT x) AS xs UNWIND xs AS y "
+    "WITH collect(y * 10) AS ys UNWIND ys AS z RETURN z ORDER BY z",
+]
+
+
+@pytest.mark.parametrize("query", COLLECT_UNWIND)
+def test_polars_collect_unwind_parity(query):
+    """collect() -> UNWIND (list-column explode) matches the pandas oracle exactly."""
+    _assert_parity(query, order_sensitive="ORDER BY" in query)
+
+
+@pytest.mark.parametrize("query", COLLECT_UNWIND)
+def test_polars_collect_unwind_is_polars_typed(query):
+    """collect() -> UNWIND stays native (polars-typed, no pandas round-trip)."""
+    assert "polars" in type(BASE.gfql(query, engine="polars")._nodes).__module__
+
+
+def test_polars_unwind_list_column_semantics_unit():
+    """unwind_polars list-column branch == pandas oracle on empty/null/nested cells.
+
+    These cells (empty list, null cell, null WITHIN a list) can't be produced through Cypher
+    collect() — which strips nulls and yields ``[]`` for empty groups — so exercise them by
+    building the list column directly and comparing the native explode to the pandas oracle
+    (``RowPipelineMixin.unwind``)."""
+    import pandas as _pd
+    import polars as _pl
+    from graphistry.compute.gfql.lazy.engine.polars.row_pipeline import unwind_polars
+    from graphistry.compute.gfql.row.pipeline import RowPipelineMixin
+
+    rows = {"k": [0, 1, 2, 3, 4], "xs": [[10, 20], [], [30, None, 40], None, [50]]}
+
+    class _Oracle(RowPipelineMixin):
+        def __init__(self, df):
+            self._df = df
+
+        def _gfql_get_active_table(self):
+            return self._df
+
+        def _gfql_row_table(self, df):
+            return df
+
+    oracle = _Oracle(_pd.DataFrame(rows)).unwind("xs", as_="v").reset_index(drop=True)
+
+    g = graphistry.nodes(_pd.DataFrame({"id": [0]}), "id").bind()
+    g._nodes = _pl.DataFrame(rows)
+    native = unwind_polars(g, "xs", "v")
+    assert "polars" in type(native._nodes).__module__
+    got = native._nodes.to_pandas().reset_index(drop=True)
+
+    # empty list + null cell drop out (0 rows); nulls WITHIN a list survive as real elements.
+    assert list(got.columns) == list(oracle.columns)
+    assert len(got) == len(oracle) == 6
+
+    def _canon(df):
+        # normalize NaN/None null representation (polars -> NaN, pandas oracle -> None) so the
+        # comparison is null-representation agnostic; keep the surviving in-list null as a row.
+        # Compare only the meaningful key/exploded columns (the retained ``xs`` list column
+        # carries an in-list null whose NaN/None rendering differs harmlessly per engine).
+        out = df.sort_values(["k", "v"], na_position="last").reset_index(drop=True)[["k", "v"]]
+        out["v"] = [None if pd.isna(x) else int(x) for x in out["v"]]
+        return out
+
+    pd.testing.assert_frame_equal(_canon(got), _canon(oracle), check_dtype=False)
+
+
+def test_polars_unwind_declines_non_list_and_collisions():
+    """Non-list column / name collision / unknown identifier UNWIND declines (None -> NIE),
+    never a wrong-shape explode."""
+    import pandas as _pd
+    import polars as _pl
+    from graphistry.compute.gfql.lazy.engine.polars.row_pipeline import unwind_polars
+
+    g = graphistry.nodes(_pd.DataFrame({"id": [0]}), "id").bind()
+    g._nodes = _pl.DataFrame({"a": [1, 2, 3], "xs": [[1], [2], [3]]})
+    assert unwind_polars(g, "a", "v") is None          # scalar (non-list) column -> decline
+    assert unwind_polars(g, "xs", "a") is None          # as_ collides with existing column
+    assert unwind_polars(g, "nope", "v") is None        # unknown identifier
+    # nested-list literal is still declined (only scalar-literal lists lowered natively)
+    with pytest.raises(NotImplementedError):
+        BASE.gfql("UNWIND [[1, 2], [3, 4]] AS pair UNWIND pair AS z RETURN z", engine="polars")
+
+
+def test_where_rows_polars_declines_predicate_and_unloweable_values():
+    """filter_dict PREDICATE objects (gt/lt/contains/...) and values polars cannot lower to a
+    literal must DECLINE (None -> NIE), never leak a raw polars TypeError from ``pl.lit`` —
+    the #1743 AUTO cudf->polars-gpu regression, where the leaked TypeError also broke the
+    route's NIE-decline-to-legacy contract. Scalar equality and membership still serve."""
+    import pandas as _pd
+    import polars as _pl
+    from graphistry.compute.gfql.lazy.engine.polars.row_pipeline import where_rows_polars
+    from graphistry.compute.predicates.numeric import gt
+
+    g = graphistry.nodes(_pd.DataFrame({"id": [0]}), "id").bind()
+    g._nodes = _pl.DataFrame({"id": [1, 2, 3], "score": [1, 2, 5]})
+    assert where_rows_polars(g, {"score": gt(1)}, None) is None  # predicate -> decline
+
+    class _Unlowerable:
+        pass
+
+    assert where_rows_polars(g, {"score": _Unlowerable()}, None) is None  # TypeError path -> decline
+    # scalar equality / membership still native
+    out_eq = where_rows_polars(g, {"score": 2}, None)
+    assert out_eq is not None and out_eq._nodes["id"].to_list() == [2]
+    out_in = where_rows_polars(g, {"score": [1, 5]}, None)
+    assert out_in is not None and out_in._nodes["id"].to_list() == [1, 3]
+
+
+def test_order_by_polars_declines_list_like_sort_keys():
+    """Sort keys carrying values the LEGACY row pipeline orders with list semantics must
+    DECLINE (None -> NIE): stringified-list text (legacy parses the whole column, or rejects
+    a mixed one — plain lexicographic order silently diverges, the #1743 cudf-route value
+    regression) and real List columns (legacy element-wise list-orderability). Scalar keys
+    keep serving natively."""
+    import pandas as _pd
+    import polars as _pl
+    from graphistry.compute.gfql.lazy.engine.polars.row_pipeline import order_by_polars
+
+    g = graphistry.nodes(_pd.DataFrame({"id": [0]}), "id").bind()
+    # stringified-list text column (all list-shaped)
+    g._nodes = _pl.DataFrame({"id": ["a", "b"], "list": ["[2, -2]", "[1, 2]"]})
+    assert order_by_polars(g, [("list", "asc")]) is None
+    # mixed list-text + plain string (legacy REJECTS; silent success would diverge)
+    g._nodes = _pl.DataFrame({"id": ["a", "b"], "v": ["[1, 2]", "abc"]})
+    assert order_by_polars(g, [("v", "asc")]) is None
+    # real List column
+    g._nodes = _pl.DataFrame({"id": ["a", "b"], "xs": [[1, 2], [3]]})
+    assert order_by_polars(g, [("xs", "asc")]) is None
+    # scalar keys still native (numeric + plain string)
+    g._nodes = _pl.DataFrame({"id": ["a", "b", "c"], "score": [3, 1, 2], "name": ["x", "z", "y"]})
+    out_num = order_by_polars(g, [("score", "asc")])
+    assert out_num is not None and out_num._nodes["id"].to_list() == ["b", "c", "a"]
+    out_str = order_by_polars(g, [("name", "desc")])
+    assert out_str is not None and out_str._nodes["id"].to_list() == ["b", "c", "a"]
+
+
+def test_row_expr_lowering_unit():
+    """lower_expr_str / lower_select_items / lower_order_by_keys edge cases."""
+    from graphistry.compute.gfql.lazy.engine.polars.row_pipeline import (
+        lower_expr_str, lower_select_items, lower_order_by_keys,
+    )
+    cols = ["id", "n", "val", "kind"]
+    # bare column + property resolution (single-entity bare; bindings prefixed)
+    assert lower_expr_str("val", cols) is not None
+    assert lower_expr_str("n.val", cols) is not None          # alias marker + bare prop
+    assert lower_expr_str("n.val", ["n.val", "m.val"]) is not None  # prefixed
+    # unresolvable -> None (bridge)
+    assert lower_expr_str("n.missing", cols) is None
+    assert lower_expr_str("nope.x", cols) is None
+    # arithmetic / comparison / boolean lower; exotic (function/list) bail
+    assert lower_expr_str("n.val + 1", cols) is not None
+    assert lower_expr_str("n.val > 5 AND n.val < 100", cols) is not None
+    assert lower_expr_str("count(n)", cols) is None
+    assert lower_expr_str("[1, 2, 3]", cols) is not None      # homogeneous-int list -> native concat_list
+    assert lower_expr_str("[1, 2.5]", cols) is None           # mixed int/float category -> NIE
+    # select items: all-lowerable -> list; any unlowerable -> None
+    assert lower_select_items([("v", "n.val"), ("k", "n.kind")], cols) is not None
+    assert lower_select_items([("c", "count(n)")], cols) is None
+    # order_by keys: directions + bail
+    assert lower_order_by_keys([("n.val", "desc")], cols) is not None
+    assert lower_order_by_keys([("count(n)", "asc")], cols) is None
+    assert lower_order_by_keys(["bad-shape"], cols) is None
+
+
+def test_node_identity_sentinel_resolution():
+    """Bare ``__gfql_node_id__`` (whole-entity identity, #1709) resolves ONLY when the graph
+    node-id column is published AND present in the frame; else declines (None -> NIE), never a
+    wrong column. Mirrors pandas ``_gfql_resolve_token`` bare form."""
+    from graphistry.compute.gfql.lazy.engine.polars import row_pipeline as rp
+    cols = ["id", "val", "kind"]
+    # no node-id published -> decline
+    assert rp.lower_expr_str("__gfql_node_id__", cols) is None
+    # published + present -> resolves to that column
+    tok = rp._NODE_ID.set("id")
+    try:
+        expr = rp.lower_expr_str("__gfql_node_id__", cols)
+        assert expr is not None
+        assert expr.meta.root_names() == ["id"]
+    finally:
+        rp._NODE_ID.reset(tok)
+    # published but absent from frame -> decline (never invent a column)
+    tok = rp._NODE_ID.set("node_id_missing")
+    try:
+        assert rp.lower_expr_str("__gfql_node_id__", cols) is None
+    finally:
+        rp._NODE_ID.reset(tok)
+
+
+def test_polars_frame_op_limit_matches_slice():
+    """limit/skip operate on a polars active table without index artifacts."""
+    g = BASE.gfql("MATCH (n) RETURN n LIMIT 4", engine="polars")
+    assert g._nodes.height == 4
+    assert "polars" in type(g._nodes).__module__
+
+
+def test_polars_distinct_preserves_first_order():
+    """Whole-row distinct keeps first occurrence in order (== pandas)."""
+    nodes = pd.DataFrame({"id": [0, 1, 2, 3], "kind": ["a", "a", "b", "b"]})
+    edges = pd.DataFrame({"s": [0, 1], "d": [1, 2]})
+    g = graphistry.nodes(nodes, "id").edges(edges, "s", "d")
+    rpd = _to_pandas(g.gfql("MATCH (n) RETURN DISTINCT n", engine="pandas")._nodes)
+    rpl = _to_pandas(g.gfql("MATCH (n) RETURN DISTINCT n", engine="polars")._nodes)
+    pd.testing.assert_frame_equal(
+        rpd.reset_index(drop=True), rpl.reset_index(drop=True), check_dtype=False
+    )
+
+
+@pytest.mark.parametrize("query,expected", [
+    ("MATCH (n) RETURN count(*) AS c", 6),                    # keyless count over all rows
+    ("MATCH (n) WHERE n.val > 25 RETURN count(*) AS c", 4),   # filtered count
+])
+def test_polars_count_star_broadcasts_not_collapses(query, expected):
+    """#1707 regression: keyless ``count(*)`` lowers to a synthetic constant group
+    column that must broadcast to the full row count. A collapse to 1 row made the
+    downstream count return a constant ``1`` (silent wrong answer). Assert the
+    absolute value (pandas oracle can't mask it) on the native polars engine."""
+    rpl = BASE.gfql(query, engine="polars")._nodes
+    assert "polars" in type(rpl).__module__
+    assert rpl.height == 1                      # a keyless aggregate is a single row
+    assert rpl["c"].to_list() == [expected]     # ...holding the TRUE count, not 1
+
+
+def test_polars_literal_projection_preserves_cardinality():
+    """#1707 corollary: a bare-literal projection (``RETURN 1``) is a map, not a
+    reduce — it must keep every row, not collapse to one."""
+    rpl = BASE.gfql("MATCH (n) RETURN 1 AS one", engine="polars")._nodes
+    assert "polars" in type(rpl).__module__
+    assert rpl.height == 6                       # one row per matched node
+    assert rpl["one"].to_list() == [1] * 6
+
+
+def test_polars_empty_result_shape():
+    """A LIMIT 0 / over-skip empties to 0 rows but keeps the projected schema.
+    Whole-entity RETURN n flattens to a.* columns (#1650), matching pandas."""
+    g = BASE.gfql("MATCH (n) RETURN n SKIP 1000", engine="polars")
+    g_pd = BASE.gfql("MATCH (n) RETURN n SKIP 1000", engine="pandas")
+    assert g._nodes.height == 0
+    assert list(g._nodes.columns) == list(g_pd._nodes.columns)
+
+
+@pytest.mark.parametrize("query,expected", [
+    ("MATCH (n) RETURN count(DISTINCT n) AS c", 6),               # 6 distinct ids
+    ("MATCH (n) WHERE n.val > 25 RETURN count(DISTINCT n) AS c", 4),  # ids with val 30/40/50/60
+])
+def test_polars_count_distinct_entity_absolute(query, expected):
+    """Explicit pin: whole-entity count(DISTINCT n) returns the TRUE distinct-identity count
+    on the native polars engine (pandas oracle can't mask a wrong constant)."""
+    rpl = BASE.gfql(query, engine="polars")._nodes
+    assert "polars" in type(rpl).__module__
+    assert rpl.height == 1
+    assert rpl["c"].to_list() == [expected]
+
+
+def test_polars_count_distinct_entity_grouped_values():
+    """Grouped whole-entity count(DISTINCT n) matches pandas value-for-value and equals the
+    per-group node count (ids unique). BASE kinds: a=3, b=2, c=1."""
+    q = "MATCH (n) RETURN n.kind, count(DISTINCT n) AS c"
+    rpd = _to_pandas(BASE.gfql(q, engine="pandas")._nodes)
+    rpl = _to_pandas(BASE.gfql(q, engine="polars")._nodes)
+    a = rpd.sort_values("n.kind").reset_index(drop=True)
+    b = rpl.sort_values("n.kind").reset_index(drop=True)
+    pd.testing.assert_frame_equal(a, b, check_dtype=False)
+    assert dict(zip(b["n.kind"], b["c"])) == {"a": 3, "b": 2, "c": 1}
+
+
+@pytest.mark.parametrize("seed", list(range(60)))
+def test_polars_identity_aggregation_fuzz_matches_pandas(seed):
+    """Bounded differential fuzz (#1709): random small graphs x whole-entity identity
+    aggregation shapes; native polars MUST equal the pandas oracle value-for-value, or both
+    decline. A silent divergence is the worst outcome, so any polars-ok/pandas-nie or value
+    mismatch fails. Larger sweep lives in scratch (600/600 clean); this pins a deterministic
+    subset into the coverage lane."""
+    import random
+    from .polars_test_utils import graph_sig
+    import numpy as np
+
+    def _norm(sig):
+        def cell(v):
+            if isinstance(v, np.ndarray):
+                return tuple(v.tolist())
+            if isinstance(v, list):
+                return tuple(v)
+            return v
+
+        def frame(f):
+            if f is None:
+                return None
+            c, rows = f
+            return (c, tuple(tuple(cell(v) for v in r) for r in rows))
+        return tuple(frame(f) for f in sig)
+
+    rng = random.Random(seed)
+    n = rng.randint(1, 7)
+    ids = [f"n{i}" for i in range(n)]
+    nodes = pd.DataFrame({
+        "id": pd.Series(ids, dtype="object"),
+        "kind": pd.Series([rng.choice(["A", "B", "C"]) for _ in ids], dtype="object"),
+        "v": pd.Series([rng.choice([1, 2, 3, None]) for _ in ids], dtype="float64"),
+        "grp": pd.Series([rng.choice(["x", "y", None]) for _ in ids], dtype="object"),
+    })
+    ne = rng.randint(0, 8)
+    s = [rng.choice(ids) for _ in range(ne)]
+    d = [rng.choice(ids) for _ in range(ne)]
+    g = graphistry.nodes(nodes, "id").edges(
+        pd.DataFrame({"s": pd.Series(s, dtype="object"), "d": pd.Series(d, dtype="object")}),
+        "s", "d",
+    )
+    queries = [
+        "MATCH (b) RETURN count(DISTINCT b) AS c",
+        "MATCH (b {kind:'A'}) RETURN count(DISTINCT b) AS c",
+        "MATCH (b) RETURN b.kind, count(DISTINCT b) AS c",
+        "MATCH (b) RETURN b.grp, count(DISTINCT b) AS c, count(b) AS t",
+        "MATCH (a)-[]->(b) RETURN count(DISTINCT b) AS c",
+        "MATCH (b) RETURN b.kind, count(DISTINCT b.v) AS c",
+        # binding rows: DISTINCT counts each alias's identity column
+        "MATCH (a)-[e]->(b) RETURN b.kind, count(DISTINCT b) AS c, count(b) AS t",
+        "MATCH (a)-[e]->(b) RETURN a.kind, count(DISTINCT b) AS c, collect(DISTINCT b.kind) AS ks",
+    ]
+    for q in queries:
+        try:
+            base = ("ok", _norm(graph_sig(g.gfql(q, engine="pandas"))))
+        except NotImplementedError:
+            base = ("nie",)
+        try:
+            got = ("ok", _norm(graph_sig(g.gfql(q, engine="polars"))))
+        except NotImplementedError:
+            got = ("nie",)
+        # polars may decline where pandas succeeds (honest NIE); never the reverse, never a
+        # value mismatch.
+        if base[0] == "ok" and got[0] == "ok":
+            assert base[1] == got[1], f"value divergence {q!r} seed={seed}: {base} vs {got}"
+        elif got[0] == "ok":
+            raise AssertionError(f"polars ok but pandas nie for {q!r} seed={seed}")
+
+
+# Direct frame-op coverage: each native polars branch on a real polars-framed graph, independent
+# of which cypher shapes compile to which ops — pins the engine-polymorphic frame_ops layer.
+def _polars_graph():
+    from graphistry.Engine import Engine, df_to_engine
+    nodes = pd.DataFrame({"id": [0, 1, 2, 3], "k": ["a", "a", "b", "b"], "v": [1, 2, 3, 4]})
+    edges = pd.DataFrame({"s": [0, 1], "d": [1, 2]})
+    g = graphistry.nodes(nodes, "id").edges(edges, "s", "d")
+    return g.nodes(df_to_engine(g._nodes, Engine.POLARS), g._node).edges(
+        df_to_engine(g._edges, Engine.POLARS), g._source, g._destination
+    )
+
+
+def _adapter(g):
+    from graphistry.compute.gfql.row.pipeline import _RowPipelineAdapter
+    return _RowPipelineAdapter(g)
+
+
+def test_frame_ops_polars_limit_skip():
+    from graphistry.compute.gfql.row import frame_ops as fo
+    g = _polars_graph()
+    assert fo.limit(_adapter(g), 2)._nodes.height == 2
+    assert fo.skip(_adapter(g), 1)._nodes.height == 3
+    assert "polars" in type(fo.limit(_adapter(g), 2)._nodes).__module__
+
+
+def test_frame_ops_polars_distinct_drop_cols():
+    from graphistry.compute.gfql.row import frame_ops as fo
+    g = _polars_graph()
+    assert fo.distinct(_adapter(g))._nodes.height == 4
+    cols = list(fo.drop_cols(_adapter(g), ["k"])._nodes.columns)
+    assert "k" not in cols and "id" in cols and "v" in cols
+
+
+def test_frame_ops_polars_rows_and_empty_frame():
+    from graphistry.compute.gfql.row import frame_ops as fo
+    g = _polars_graph()
+    # rows() with no source returns the full active table (polars-typed)
+    rows_out = fo.rows(_adapter(g), table="nodes")._nodes
+    assert "polars" in type(rows_out).__module__ and rows_out.height == 4
+    # empty_frame with explicit columns yields a 0-row polars frame with those cols
+    ef = fo.empty_frame(_adapter(g), template_df=g._nodes, columns=["x", "y"])
+    assert "polars" in type(ef).__module__
+    assert list(ef.columns) == ["x", "y"] and ef.height == 0
+
+
+def test_polars_chain_interior_call_mix_raises():
+    """call() between traversals is rejected (boundary-only), like the pandas path."""
+    from graphistry.compute.ast import call, n, e_forward
+    from graphistry.compute.exceptions import GFQLValidationError
+    with pytest.raises(GFQLValidationError):
+        BASE.chain([n(), call("limit", {"value": 2}), e_forward(), n()], engine="polars")
+
+
+def test_polars_chain_prefix_call_before_traversal_defers():
+    """Leading call() before a traversal is deferred on polars (not a cypher shape)."""
+    from graphistry.compute.ast import call, n
+    with pytest.raises(NotImplementedError):
+        BASE.chain([call("limit", {"value": 3}), n()], engine="polars")
+
+
+def test_polars_chain_pure_call_no_traversal():
+    """A chain of only call() ops (no traversal) runs the calls on polars."""
+    from graphistry.compute.ast import call
+    g = BASE.chain([call("limit", {"value": 2})], engine="polars")
+    assert "polars" in type(g._nodes).__module__
+    assert g._nodes.height == 2
+
+
+def test_chain_polars_chain_input_and_empty():
+    """chain_polars accepts a Chain object and an empty op list."""
+    from graphistry.compute.chain import Chain
+    from graphistry.compute.ast import n
+    out = BASE.chain(Chain([n()]), engine="polars")            # Chain unwrap
+    assert "polars" in type(out._nodes).__module__
+    empty = BASE.chain([], engine="polars")                    # empty ops -> self
+    assert empty is not None
+
+
+def test_call_native_on_polars_classifier():
+    """_call_native_on_polars: only frame ops (single-entity rows) are native."""
+    from graphistry.compute.gfql.lazy.engine.polars.chain import _call_native_on_polars
+    from graphistry.compute.ast import call, n
+    assert _call_native_on_polars(n()) is False
+    assert _call_native_on_polars(call("limit", {"value": 1})) is True
+    assert _call_native_on_polars(call("select", {"items": []})) is False
+    assert _call_native_on_polars(call("rows", {"binding_ops": [{}]})) is False
+
+
+def test_run_calls_polars_empty_and_native():
+    """_run_calls_polars: empty-calls short circuit + native select stays polars."""
+    from graphistry.compute.gfql.lazy.engine.polars.chain import _run_calls_polars
+    from graphistry.compute.ast import call
+    g = _polars_graph()
+    assert _run_calls_polars(g, [], None, g, []) is g
+    out = _run_calls_polars(g, [call("rows", {"table": "nodes"}), call("select", {"items": ["v"]})], None, g, [])
+    assert "polars" in type(out._nodes).__module__
+
+
+def test_select_extend_polars_preserves_and_updates_columns():
+    """Bindings-path pre-aggregation projection keeps the row table while
+    overwriting existing aliases and appending derived columns."""
+    from graphistry.compute.gfql.lazy.engine.polars.row_pipeline import select_extend_polars
+
+    g = _polars_graph()
+    out = select_extend_polars(g, [("k", "v + 10"), ("double_v", "v * 2")])
+
+    assert out is not None
+    assert list(out._nodes.columns) == ["id", "k", "v", "double_v"]
+    assert out._nodes["k"].to_list() == [11, 12, 13, 14]
+    assert out._nodes["double_v"].to_list() == [2, 4, 6, 8]
+    assert select_extend_polars(g, [("bad", "missing.property")]) is None
+
+
+def test_try_native_row_op_handles_whole_row_group_prefixes():
+    """Whole-row grouping (prefixed keys) lowers natively via group_by_polars(key_prefixes=...)
+    instead of deferring; keys expand to their entity columns and results match the oracle."""
+    from graphistry.compute.ast import group_by
+    from graphistry.compute.gfql.lazy.engine.polars.chain import _try_native_row_op
+
+    op = group_by(["k"], [("count", "count", "v")], key_prefixes=["node."])
+    out = _try_native_row_op(_polars_graph(), op)
+    assert out is not None
+    assert sorted(out._nodes.select(["k", "count"]).rows()) == [("a", 2), ("b", 2)]
+
+
+def test_group_by_polars_key_prefix_expands_and_dedups_overlap():
+    """key_prefixes genuinely expands `<prefix>*` columns into the key set AND skips
+    columns already present in keys (no polars DuplicateError; pandas twin:
+    test_row_pipeline_ops key-overlap case)."""
+    import polars as pl
+    from graphistry.compute.gfql.lazy.engine.polars.row_pipeline import group_by_polars
+
+    nodes = pl.DataFrame({
+        "tag.id": [1, 1, 2, 2],
+        "tag.name": ["a", "a", "b", "b"],
+        "v": [10, 20, 30, 40],
+    })
+    g = graphistry.nodes(nodes)
+    # "tag." expands to tag.id (already a key -> deduped) + tag.name (appended)
+    out = group_by_polars(g, ["tag.id"], [("total", "sum", "v")], key_prefixes=["tag."])
+    assert out is not None
+    assert sorted(out._nodes.columns) == ["tag.id", "tag.name", "total"]
+    assert sorted(out._nodes.select(["tag.id", "tag.name", "total"]).rows()) == [
+        (1, "a", 30), (2, "b", 70),
+    ]
+
+
+def test_group_by_polars_malformed_agg_declines_not_crashes():
+    """Runtime defense-in-depth: malformed AggSpec shapes and unsupported agg
+    functions decline to None (caller raises honest NIE), never crash."""
+    from graphistry.compute.gfql.lazy.engine.polars.row_pipeline import group_by_polars
+
+    g = _polars_graph()
+    assert group_by_polars(g, ["k"], ["not-a-spec"]) is None  # non-list/tuple item
+    assert group_by_polars(g, ["k"], [("alias",)]) is None  # wrong arity
+    assert group_by_polars(g, ["k"], [("alias", "stdev", "v")]) is None  # unsupported func
+    assert group_by_polars(g, ["missing"], [("count", "count", "v")]) is None  # bad key
+
+
+def test_polars_rows_binding_ops_undirected_self_loop_multiplicity():
+    """Raw undirected bindings preserve both orientations; a self-loop's flip
+    twin is the SAME binding and appears once (#1903 addendum A-1)."""
+    from graphistry.compute.ast import e_undirected, n, rows, serialize_binding_ops
+
+    g = graphistry.nodes(pd.DataFrame({"id": [0, 1]}), "id").edges(
+        pd.DataFrame({"s": [0, 1], "d": [1, 1]}), "s", "d"
+    )
+    binding_ops = serialize_binding_ops([n(name="a"), e_undirected(), n(name="b")])
+    out = g.gfql([rows(binding_ops=binding_ops)], engine="polars")._nodes
+
+    assert sorted(out.select(["a", "b"]).rows()) == [(0, 1), (1, 0), (1, 1)]
+
+
+def test_run_calls_polars_binding_ops_native():
+    """Named middle + bare rows() rewrites to rows(binding_ops) natively for
+    fixed-length connected patterns: returns a polars bindings table."""
+    from graphistry.compute.gfql.lazy.engine.polars.chain import _run_calls_polars
+    from graphistry.compute.ast import call, n, e_forward
+    g = _polars_graph()
+    middle = [n(name="a"), e_forward(), n(name="b")]
+    out = _run_calls_polars(g, [call("rows", {})], None, g, middle)
+    assert "polars" in type(out._nodes).__module__
+    assert {"a", "b"} <= set(out._nodes.columns)
+
+
+def test_run_calls_polars_binding_ops_unbounded_multihop_defers():
+    """Unbounded variable-length binding patterns: DIRECTED fixed point is native
+    (#1709, LDBC IS6); the rest stay outside the subset -> NotImplementedError (NO
+    pandas bridge, see plan.md NO-CHEATING)."""
+    from graphistry.compute.gfql.lazy.engine.polars.chain import _run_calls_polars
+    from graphistry.compute.ast import call, n, e_forward, e_undirected
+    g = _polars_graph()
+    native = _run_calls_polars(
+        g, [call("rows", {})], None, g, [n(name="a"), e_forward(to_fixed_point=True), n(name="b")]
+    )
+    assert "polars" in type(native._nodes).__module__
+    for middle in [
+        # undirected unbounded: multiplicity + backtrack-aware termination unmodeled
+        [n(name="a"), e_undirected(to_fixed_point=True), n(name="b")],
+        # aliased variable-length relationship: pandas rejects it outright
+        [n(name="a"), e_forward(to_fixed_point=True, name="r"), n(name="b")],
+    ]:
+        with pytest.raises(NotImplementedError):
+            _run_calls_polars(g, [call("rows", {})], None, g, middle)
+
+
+def test_frame_ops_polars_rows_empty_table():
+    """rows() materializes an empty active table without index artifacts."""
+    from graphistry.Engine import Engine, df_to_engine
+    from graphistry.compute.gfql.row import frame_ops as fo
+    nodes = pd.DataFrame({"id": [0, 1], "v": [1, 2]})
+    edges = pd.DataFrame({"s": [0], "d": [1]})
+    g = graphistry.nodes(nodes, "id").edges(edges, "s", "d")
+    g = g.nodes(df_to_engine(g._nodes, Engine.POLARS), g._node).edges(
+        df_to_engine(g._edges, Engine.POLARS), g._source, g._destination
+    )
+    empty = g.nodes(g._nodes.clear(), g._node)
+    out = fo.rows(_adapter(empty), table="nodes")._nodes
+    assert "polars" in type(out).__module__ and out.height == 0
+
+
+@pytest.mark.parametrize("values,expected", [
+    ([], False), ([None], False), (["ordinary", None], False),
+    (["update({year: 2020})", "my date({year: 2020})"], False),
+    ([None, "date({year: 2020})"], True),
+    (["  datetime({year: 2020})", None], True),
+])
+@pytest.mark.parametrize("column", ["first", "last"])
+def test_projection_temporal_text_guard_across_columns(values, expected, column):
+    from graphistry.compute.gfql.lazy.engine.polars.row_pipeline import (
+        _select_emits_temporal_constructor_text, select_polars,
+    )
+    data = {"first": ["plain"] * len(values), "last": [None] * len(values)}
+    data[column] = values
+    table = pl.DataFrame(data, schema={"first": pl.String, "last": pl.String})
+    assert _select_emits_temporal_constructor_text(table) is expected
+    result = select_polars(graphistry.nodes(table), [("a", "first"), ("b", "last")])
+    assert (result is None) is expected
+    if result is not None:
+        assert result._nodes.to_dicts() == table.rename({"first": "a", "last": "b"}).to_dicts()
+
+
+def test_projection_temporal_text_guard_without_string_columns():
+    from graphistry.compute.gfql.lazy.engine.polars.row_pipeline import _select_emits_temporal_constructor_text
+    assert not _select_emits_temporal_constructor_text(pl.DataFrame({"number": [1], "flag": [True]}))
+
+
+@pytest.mark.parametrize("lazy_input", [False, True])
+@pytest.mark.parametrize("decline", [False, True])
+def test_property_attachment_preserves_schema_error_policy(lazy_input, decline):
+    from graphistry.compute import ast
+    from graphistry.compute.gfql.lazy.engine.polars.row_pipeline import (
+        _finish_binding_rows_polars, WALK_CURRENT_COL,
+    )
+    state = pl.DataFrame({WALK_CURRENT_COL: [1], "a": ["one"]})
+    lookup = pl.DataFrame({"id": [1], "value": ["x"]})
+    if lazy_input:
+        state, lookup = state.lazy(), lookup.lazy()
+    args = (graphistry.nodes(pl.DataFrame({"id": [1]}), "id"), [ast.n(name="a")], state, {"a": lookup}, "id", None)
+    if decline:
+        assert _finish_binding_rows_polars(*args, decline_on_schema_error=True) is None
+    else:
+        with pytest.raises(pl.exceptions.SchemaError):
+            _finish_binding_rows_polars(*args, decline_on_schema_error=False)
+
+
+@pytest.mark.parametrize("value", [
+    None, "", "ordinary", "雪", "a\nlong string", "\u001cdate", "\u0085date", "(", ")", "a(b)",
+    "date('2020-01-01')", "time('12:00:00')", "localtime('12:00:00')",
+    "datetime({year: 2020})", "localdatetime({year: 2020})", "duration({days: 1})",
+    "  date('2020-01-01')", "\u001cdate('2020-01-01')", "\u0085date('2020-01-01')",
+    "my date({year: 2020})", "update({year: 2020})", "date(", "date({nested: (1)})",
+])
+@pytest.mark.parametrize("height", [1, 2])
+def test_temporal_text_guard_matches_native_expression(value, height):
+    from graphistry.compute.gfql.lazy.engine.polars.projection import _columns_have_temporal_constructor_text
+    from graphistry.compute.gfql.temporal.constructors import TEMPORAL_CALL_EXPR_RE
+    table = pl.DataFrame({"first": ["plain"] * height, "last": [value] * height}, schema={"first": pl.String, "last": pl.String})
+    original = table.clone()
+    pattern = r"^\s*" + TEMPORAL_CALL_EXPR_RE.pattern
+    expected = bool(table.select(pl.any_horizontal([pl.col(c).str.contains(pattern).any() for c in table.columns])).item())
+    assert _columns_have_temporal_constructor_text(table, table.columns) is expected
+    from polars.testing import assert_frame_equal
+    assert_frame_equal(table, original)
+
+
+def test_temporal_text_guard_keeps_invalid_column_behavior():
+    from graphistry.compute.gfql.lazy.engine.polars.projection import _columns_have_temporal_constructor_text
+    table = pl.DataFrame({"text": ["date('2020-01-01')"], "number": [1]})
+    assert _columns_have_temporal_constructor_text(table, ["text", "missing"]) is False
+    assert _columns_have_temporal_constructor_text(table, ["text", "number"]) is False
+    assert _columns_have_temporal_constructor_text(table, []) is False
+
+
+def test_gpu_temporal_guard_does_not_extract_string_scalars(monkeypatch):
+    from graphistry.compute.gfql.lazy import ExecutionTarget, target_mode
+    from graphistry.compute.gfql.lazy.engine.polars.projection import _columns_have_temporal_constructor_text
+    original_item = pl.Series.item
+    def checked_item(series, *args, **kwargs):
+        assert series.dtype != pl.String, "GPU guard must retain native string evaluation"
+        return original_item(series, *args, **kwargs)
+    monkeypatch.setattr(pl.Series, "item", checked_item)
+    with target_mode(ExecutionTarget.GPU):
+        assert _columns_have_temporal_constructor_text(pl.DataFrame({"s": ["plain"]}), ["s"]) is False
+        assert _columns_have_temporal_constructor_text(pl.DataFrame({"s": ["date('2020-01-01')"]}), ["s"]) is True
+
+
+@pytest.mark.parametrize("size", [0, 1, 2, 33])
+@pytest.mark.parametrize("dtype,values", [
+    ("Int64", [2**53 + 1, 2**53 + 2]),
+    ("String", ["first", "second"]),
+    ("Boolean", [False, True]),
+    ("Float64", [0.0, float("nan")]),
+])
+@pytest.mark.parametrize("prefix_null", [False, True, "all"])
+def test_uniform_coalesce_preserves_values_without_projection_plan(size, dtype, values, prefix_null, monkeypatch):
+    import importlib
+    import polars as pl
+    from polars.testing import assert_frame_equal
+
+    native = importlib.import_module("graphistry.compute.gfql.lazy.engine.polars.row_pipeline")
+    selected = [None if prefix_null == "all" else values[i % 2] for i in range(size)]
+    table = pl.DataFrame({
+        "left": pl.Series([None] * size if prefix_null else selected, dtype=getattr(pl, dtype)),
+        "right": pl.Series(selected if prefix_null else [None] * size, dtype=getattr(pl, dtype)),
+        "a": [True] * size,
+    })
+    original = table.clone()
+    expected = pl.DataFrame({"value": pl.Series(selected, dtype=getattr(pl, dtype))})
+    expression_oracle = table.select(pl.coalesce("left", "right").alias("value"))
+    assert_frame_equal(expected, expression_oracle)
+
+    def unexpected_plan(*args, **kwargs):
+        raise AssertionError("Uniform projection entered an expression execution plan")
+
+    monkeypatch.setattr(native, "_project_preserving_height", unexpected_plan)
+    result = native.select_polars(graphistry.nodes(table), [("value", "coalesce(a.left, a.right)")])
+    assert result is not None
+    assert_frame_equal(result._nodes, expected)
+    assert_frame_equal(table, original)
+
+
+@pytest.mark.parametrize("items,columns,expected", [
+    ([("value", "coalesce(left, right)")], {"left": [None, 1], "right": [2, 3]}, [2, 1]),
+    ([("value", "coalesce(left, right)")], {"left": [1, 2], "right": [2.5, 3.5]}, [1.0, 2.0]),
+    ([("value", "coalesce(left + 1, right)")], {"left": [None, 1], "right": [2, 3]}, [2, 2]),
+    ([("value", "7")], {"left": [1, 2], "right": [2, 3]}, [7, 7]),
+])
+def test_eager_projection_decline_boundaries_keep_generic_results(items, columns, expected, monkeypatch):
+    import importlib
+    import polars as pl
+
+    native = importlib.import_module("graphistry.compute.gfql.lazy.engine.polars.row_pipeline")
+    original = native._project_preserving_height
+    calls = []
+
+    def observe(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(native, "_project_preserving_height", observe)
+    result = native.select_polars(graphistry.nodes(pl.DataFrame(columns)), items)
+    assert result is not None
+    assert result._nodes.to_dicts() == [{"value": value} for value in expected]
+    assert calls == [True]
+
+
+@pytest.mark.parametrize("size", [0, 1, 3, 33])
+def test_eager_column_projection_repeats_sources_and_preserves_order(size, monkeypatch):
+    import importlib
+    import polars as pl
+    from polars.testing import assert_frame_equal
+
+    native = importlib.import_module("graphistry.compute.gfql.lazy.engine.polars.row_pipeline")
+    values = [None if i % 2 else 2**53 + i for i in reversed(range(size))]
+    table = pl.DataFrame({"x": pl.Series(values, dtype=pl.Int64)})
+    def unexpected_plan(*args, **kwargs):
+        raise AssertionError("Column projection entered an expression execution plan")
+    monkeypatch.setattr(native, "_project_preserving_height", unexpected_plan)
+    result = native.select_polars(graphistry.nodes(table), [("second", "x"), ("first", "x")])
+    assert result is not None
+    expected = pl.DataFrame({"second": pl.Series(values, dtype=pl.Int64), "first": pl.Series(values, dtype=pl.Int64)})
+    assert_frame_equal(result._nodes, expected)
+
+
+@pytest.mark.parametrize("dtype,values", [
+    (pl.Categorical, ["a", "b"]),
+    (pl.Enum(["a", "b"]), ["a", "b"]),
+    (pl.List(pl.Int64), [[1, None], [2, 3]]),
+    (pl.Struct({"x": pl.Int64}), [{"x": 1}, {"x": None}]),
+])
+@pytest.mark.parametrize("size", [0, 2])
+def test_uniform_coalesce_preserves_nonprimitive_dtypes(dtype, values, size, monkeypatch):
+    import importlib
+    from polars.testing import assert_frame_equal
+
+    native = importlib.import_module("graphistry.compute.gfql.lazy.engine.polars.row_pipeline")
+    table = pl.DataFrame({"left": pl.Series([None] * size, dtype=dtype),
+                          "right": pl.Series(values[:size], dtype=dtype)})
+    expected = table.select(pl.coalesce("left", "right").alias("value"))
+    def unexpected_plan(*args, **kwargs):
+        raise AssertionError("Uniform typed coalesce entered an expression execution plan")
+    monkeypatch.setattr(native, "_project_preserving_height", unexpected_plan)
+    result = native.select_polars(graphistry.nodes(table), [("value", "coalesce(left, right)")])
+    assert result is not None
+    assert_frame_equal(result._nodes, expected)
+    assert result._nodes["value"].to_list() == values[:size]

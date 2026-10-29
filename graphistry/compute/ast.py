@@ -1,0 +1,1871 @@
+from abc import abstractmethod
+import logging
+from typing import (
+    Any, TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union, cast
+)
+from typing_extensions import Literal
+
+if TYPE_CHECKING:
+    from graphistry.compute.chain import Chain
+    # TYPE_CHECKING only: graphistry.compute.gfql.call.__init__ pulls in executor/validation
+    # at import time — a module-level import here would be circular.
+    from graphistry.compute.gfql.call.support import AggSpec
+
+from graphistry.Engine import Engine, EngineAbstract
+from graphistry.compute.dataframe_utils import dbg_df
+
+from graphistry.Plottable import Plottable
+from graphistry.compute.ASTSerializable import ASTSerializable
+from graphistry.compute.exceptions import ErrorCode, GFQLTypeError, GFQLSyntaxError
+from graphistry.compute.gfql.call.validation import validate_call_params
+from graphistry.compute.gfql.identifiers import validate_column_references
+from graphistry.util import setup_logger
+from graphistry.utils.json import JSONVal, is_json_serializable
+from graphistry.compute.gfql.row.prefilter import AliasPrefilters
+from .predicates.ASTPredicate import ASTPredicate
+from .predicates.from_json import from_json as predicates_from_json
+
+from .predicates.is_in import (
+    is_in, IsIn
+)
+from .predicates.categorical import (
+    duplicated, Duplicated,
+)
+from .predicates.temporal import (
+    is_month_start, IsMonthStart,
+    is_month_end, IsMonthEnd,
+    is_quarter_start, IsQuarterStart,
+    is_quarter_end, IsQuarterEnd,
+    is_year_start, IsYearStart,
+    is_year_end, IsYearEnd,
+    is_leap_year, IsLeapYear
+)
+from .predicates.numeric import (
+    gt, GT,
+    lt, LT,
+    ge, GE,
+    le, LE,
+    eq, EQ,
+    ne, NE,
+    between, Between,
+    isna, IsNA,
+    notna, NotNA
+)
+from .predicates.str import (
+    contains, Contains,
+    startswith, Startswith,
+    endswith, Endswith,
+    match, Match,
+    fullmatch, Fullmatch,
+    isnumeric, IsNumeric,
+    isalpha, IsAlpha,
+    isdigit, IsDigit,
+    islower, IsLower,
+    isupper, IsUpper,
+    isspace, IsSpace,
+    isalnum, IsAlnum,
+    isdecimal, IsDecimal,
+    istitle, IsTitle,
+    isnull, IsNull,
+    notnull, NotNull
+)
+from .filter_by_dict import filter_by_dict
+from graphistry.Engine import safe_merge
+from .typing import DataFrameT
+
+
+logger = setup_logger(__name__)
+
+##############################################################################
+
+
+class ASTObject(ASTSerializable):
+    """
+    Internal, not intended for use outside of this module.
+    These are operator-level expressions used as g.chain(List<ASTObject>)
+    """
+    def __init__(self, name: Optional[str] = None):
+        self._name = name
+        pass
+
+    @abstractmethod
+    def execute(
+        self,
+        g: Plottable,
+        prev_node_wavefront: Optional[DataFrameT],
+        target_wave_front: Optional[DataFrameT],
+        engine: Engine
+    ) -> Plottable:
+        raise RuntimeError('execute not implemented')
+        
+    @abstractmethod
+    def reverse(self) -> 'ASTObject':
+        raise RuntimeError('reverse not implemented')
+
+
+##############################################################################
+
+
+def maybe_filter_dict_from_json(d: Dict, key: str) -> Optional[Dict]:
+    if key not in d:
+        return None
+    if key in d and isinstance(d[key], dict):
+        return {
+            k: predicates_from_json(v) if isinstance(v, dict) else v
+            for k, v in d[key].items()
+        }
+    elif key in d and d[key] is not None:
+        raise ValueError('filter_dict must be a dict or None')
+    else:
+        return None
+
+
+def _filter_dict_to_json(filter_dict: Dict[str, Any]) -> Dict[str, Any]:
+    # Keep None values: dropping an entry widens the filter to match-everything.
+    return {
+        k: v.to_json() if isinstance(v, ASTPredicate) else v
+        for k, v in filter_dict.items()
+    }
+
+
+def _edge_from_json_kwargs(d: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        'edge_match': maybe_filter_dict_from_json(d, 'edge_match'),
+        'hops': d['hops'] if 'hops' in d else None,
+        'min_hops': d.get('min_hops'),
+        'max_hops': d.get('max_hops'),
+        'output_min_hops': d.get('output_min_hops'),
+        'output_max_hops': d.get('output_max_hops'),
+        'label_node_hops': d.get('label_node_hops'),
+        'label_edge_hops': d.get('label_edge_hops'),
+        'label_seeds': d.get('label_seeds', False),
+        'to_fixed_point': d['to_fixed_point'] if 'to_fixed_point' in d else DEFAULT_FIXED_POINT,
+        'source_node_match': maybe_filter_dict_from_json(d, 'source_node_match'),
+        'destination_node_match': maybe_filter_dict_from_json(d, 'destination_node_match'),
+        'source_node_query': d['source_node_query'] if 'source_node_query' in d else None,
+        'destination_node_query': d['destination_node_query'] if 'destination_node_query' in d else None,
+        'edge_query': d['edge_query'] if 'edge_query' in d else None,
+        'name': d['name'] if 'name' in d else None,
+        'include_zero_hop_seed': d.get('include_zero_hop_seed', False),
+        'relationship_scope': d.get('relationship_scope', 0),
+    }
+
+
+def _validate_edge_from_json(out: 'ASTEdge', validate: bool) -> 'ASTEdge':
+    if validate:
+        out.validate()
+    return out
+
+##############################################################################
+
+
+class ASTNode(ASTObject):
+    """
+    Internal, not intended for use outside of this module.
+    """
+    def __init__(self, filter_dict: Optional[dict] = None, name: Optional[str] = None, query: Optional[str] = None):
+
+        super().__init__(name)
+
+        if filter_dict == {}:
+            filter_dict = None
+        self.filter_dict = filter_dict
+        self.query = query
+
+    def __repr__(self) -> str:
+        return f'ASTNode(filter_dict={self.filter_dict}, name={self._name})'
+    
+    def _validate_fields(self) -> None:
+        """Validate node fields."""
+        # Validate filter_dict
+        if self.filter_dict is not None:
+            if not isinstance(self.filter_dict, dict):
+                raise GFQLTypeError(
+                    ErrorCode.E201,
+                    "filter_dict must be a dictionary",
+                    field="filter_dict",
+                    value=type(self.filter_dict).__name__,
+                    suggestion="Use filter_dict={'column': 'value'}",
+                )
+
+            # Validate each key in filter_dict
+            for key, value in self.filter_dict.items():
+                if not isinstance(key, str):
+                    raise GFQLTypeError(
+                        ErrorCode.E102,
+                        "Filter keys must be strings",
+                        field=f"filter_dict.{key}",
+                        value=key,
+                        suggestion="Use string column names as keys",
+                    )
+
+                # Validate value is either ASTPredicate or json-serializable
+                if not (isinstance(value, ASTPredicate) or is_json_serializable(value)):
+                    raise GFQLTypeError(
+                        ErrorCode.E201,
+                        "Filter values must be predicates or JSON-serializable",
+                        field=f"filter_dict.{key}",
+                        value=type(value).__name__,
+                        suggestion="Use predicates like gt(5) or simple values",
+                    )
+
+            # Validate that filter_dict doesn't reference internal columns
+            validate_column_references(self.filter_dict, "n()")
+
+        # Validate name
+        if self._name is not None and not isinstance(self._name, str):
+            raise GFQLTypeError(ErrorCode.E204, "name must be a string", field="name", value=type(self._name).__name__)
+
+        # Validate query
+        if self.query is not None and not isinstance(self.query, str):
+            raise GFQLTypeError(
+                ErrorCode.E205, "query must be a string", field="query", value=type(self.query).__name__
+            )
+
+    def _get_child_validators(self) -> Sequence['ASTSerializable']:
+        """Return predicates that need validation."""
+        children = []
+        if self.filter_dict:
+            for value in self.filter_dict.values():
+                if isinstance(value, ASTPredicate):
+                    children.append(value)
+        return children
+
+    def to_json(self, validate=True) -> Dict[str, Any]:
+        if validate:
+            self.validate()
+        return {
+            'type': 'Node',
+            'filter_dict': _filter_dict_to_json(self.filter_dict) if self.filter_dict is not None else {},
+            **({'name': self._name} if self._name is not None else {}),
+            **({'query': self.query } if self.query is not None else {})
+        }
+    
+    @classmethod
+    def from_json(cls, d: Dict[str, Any], validate: bool = True) -> 'ASTNode':
+        out = ASTNode(
+            filter_dict=maybe_filter_dict_from_json(d, 'filter_dict'),
+            name=d['name'] if 'name' in d else None,
+            query=d['query'] if 'query' in d else None
+        )
+        if validate:
+            out.validate()
+        return out
+
+    def execute(
+        self,
+        g: Plottable,
+        prev_node_wavefront: Optional[DataFrameT],
+        target_wave_front: Optional[DataFrameT],
+        engine: Engine
+    ) -> Plottable:
+        out_g = (g
+            .nodes(prev_node_wavefront if prev_node_wavefront is not None else g._nodes)
+            .filter_nodes_by_dict(self.filter_dict)
+            .nodes(lambda g_dynamic: g_dynamic._nodes.query(self.query) if self.query is not None else g_dynamic._nodes)
+        )
+        if g._edges is not None:
+            out_g = out_g.edges(g._edges[:0])
+        if target_wave_front is not None:
+            assert g._node is not None
+            reduced_nodes = safe_merge(cast(DataFrameT, out_g._nodes), target_wave_front[[g._node]], on=g._node, how='inner')
+            out_g = out_g.nodes(reduced_nodes)
+
+        if self._name is not None:
+            out_g = out_g.nodes(out_g._nodes.assign(**{self._name: True}))
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug('CALL NODE %s ===> nodes:%s edges:%s', self, dbg_df(out_g._nodes), dbg_df(out_g._edges))
+            logger.debug('----------------------------------------')
+
+        return out_g
+
+    def reverse(self) -> 'ASTNode':
+        return self
+
+n = ASTNode  # noqa: E305
+
+
+###############################################################################
+
+Direction = Literal['forward', 'reverse', 'undirected']
+
+DEFAULT_HOPS = 1
+DEFAULT_FIXED_POINT = False
+DEFAULT_DIRECTION: Direction = 'forward'
+DEFAULT_FILTER_DICT = None
+
+class ASTEdge(ASTObject):
+    """
+    Internal, not intended for use outside of this module.
+    """
+
+    def __init__(
+        self,
+        direction: Optional[Direction] = DEFAULT_DIRECTION,
+        edge_match: Optional[dict] = DEFAULT_FILTER_DICT,
+        hops: Optional[int] = DEFAULT_HOPS,
+        min_hops: Optional[int] = None,
+        max_hops: Optional[int] = None,
+        output_min_hops: Optional[int] = None,
+        output_max_hops: Optional[int] = None,
+        label_node_hops: Optional[str] = None,
+        label_edge_hops: Optional[str] = None,
+        label_seeds: bool = False,
+        to_fixed_point: bool = DEFAULT_FIXED_POINT,
+        source_node_match: Optional[dict] = DEFAULT_FILTER_DICT,
+        destination_node_match: Optional[dict] = DEFAULT_FILTER_DICT,
+        source_node_query: Optional[str] = None,
+        destination_node_query: Optional[str] = None,
+        edge_query: Optional[str] = None,
+        name: Optional[str] = None,
+        prune_to_endpoints: bool = False,
+        include_zero_hop_seed: bool = False,
+        relationship_scope: int = 0,
+    ):
+
+        super().__init__(name)
+
+        if direction not in ['forward', 'reverse', 'undirected']:
+            raise ValueError('direction must be one of "forward", "reverse", or "undirected"')
+        if source_node_match == {}:
+            source_node_match = None
+        if edge_match == {}:
+            edge_match = None
+        if destination_node_match == {}:
+            destination_node_match = None
+
+        self.hops = hops
+        self.min_hops = min_hops
+        self.max_hops = max_hops
+        self.output_min_hops = output_min_hops
+        self.output_max_hops = output_max_hops
+        self.label_node_hops = label_node_hops
+        self.label_edge_hops = label_edge_hops
+        self.label_seeds = label_seeds
+        self.to_fixed_point = to_fixed_point
+        self.direction : Direction = direction
+        self.source_node_match = source_node_match
+        self.edge_match = edge_match
+        self.destination_node_match = destination_node_match
+        self.source_node_query = source_node_query
+        self.destination_node_query = destination_node_query
+        self.edge_query = edge_query
+        self.prune_to_endpoints = prune_to_endpoints
+        self.include_zero_hop_seed = include_zero_hop_seed
+        self.relationship_scope = relationship_scope
+
+    def __repr__(self) -> str:
+        return f'ASTEdge(direction={self.direction}, edge_match={self.edge_match}, hops={self.hops}, min_hops={self.min_hops}, max_hops={self.max_hops}, output_min_hops={self.output_min_hops}, output_max_hops={self.output_max_hops}, label_node_hops={self.label_node_hops}, label_edge_hops={self.label_edge_hops}, label_seeds={self.label_seeds}, to_fixed_point={self.to_fixed_point}, source_node_match={self.source_node_match}, destination_node_match={self.destination_node_match}, name={self._name}, source_node_query={self.source_node_query}, destination_node_query={self.destination_node_query}, edge_query={self.edge_query}, include_zero_hop_seed={self.include_zero_hop_seed})'
+
+    def is_simple_single_hop(self) -> bool:
+        """Check if edge is single-hop without hop labels (safe to skip backward hop call)."""
+        hop_min = self.min_hops if self.min_hops is not None else (
+            self.hops if isinstance(self.hops, int) else 1
+        )
+        hop_max = self.max_hops if self.max_hops is not None else (
+            self.hops if isinstance(self.hops, int) else hop_min
+        )
+        if hop_min != 1 or hop_max != 1:
+            return False
+        # No fixed-point (unbounded) traversal
+        if self.to_fixed_point:
+            return False
+        # No hop labels that require traversal to compute
+        if self.label_node_hops or self.label_edge_hops or self.label_seeds:
+            return False
+        # No output slicing
+        if self.output_min_hops is not None or self.output_max_hops is not None:
+            return False
+        return True
+
+    def _validate_fields(self) -> None:
+        """Validate edge fields."""
+        # Validate hops
+        if self.hops is not None:
+            if not isinstance(self.hops, int) or self.hops < 1:
+                raise GFQLTypeError(
+                    ErrorCode.E103,
+                    "hops must be a positive integer or None",
+                    field="hops",
+                    value=self.hops,
+                    suggestion="Use hops=2 for specific count, or to_fixed_point=True for unbounded",
+                )
+
+        # Validate hop bounds/slices
+        for field_name, field_val in [
+            ("min_hops", self.min_hops),
+            ("max_hops", self.max_hops),
+            ("output_min_hops", self.output_min_hops),
+            ("output_max_hops", self.output_max_hops),
+        ]:
+            if field_val is not None and (not isinstance(field_val, int) or field_val < 0):
+                raise GFQLTypeError(
+                    ErrorCode.E103,
+                    f"{field_name} must be a non-negative integer or None",
+                    field=field_name,
+                    value=field_val,
+                )
+
+        if self.min_hops is not None and self.max_hops is not None and self.min_hops > self.max_hops:
+            raise GFQLTypeError(
+                ErrorCode.E103,
+                "min_hops cannot exceed max_hops",
+                field="min_hops",
+                value=self.min_hops,
+                suggestion="Set min_hops <= max_hops",
+            )
+
+        if self.output_min_hops is not None and self.output_max_hops is not None and self.output_min_hops > self.output_max_hops:
+            raise GFQLTypeError(
+                ErrorCode.E103,
+                "output_min_hops cannot exceed output_max_hops",
+                field="output_min_hops",
+                value=self.output_min_hops,
+                suggestion="Set output_min_hops <= output_max_hops",
+            )
+
+        if self.output_min_hops is not None and self.max_hops is not None and self.output_min_hops > self.max_hops:
+            raise GFQLTypeError(
+                ErrorCode.E103,
+                "output_min_hops cannot exceed max_hops traversal bound",
+                field="output_min_hops",
+                value=self.output_min_hops,
+                suggestion="Lower output_min_hops or raise max_hops",
+            )
+
+        if self.output_max_hops is not None and self.min_hops is not None and self.output_max_hops < self.min_hops:
+            raise GFQLTypeError(
+                ErrorCode.E103,
+                "output_max_hops cannot be below min_hops traversal bound",
+                field="output_max_hops",
+                value=self.output_max_hops,
+                suggestion="Raise output_max_hops or lower min_hops",
+            )
+
+        for label_field, label_val in [
+            ("label_node_hops", self.label_node_hops),
+            ("label_edge_hops", self.label_edge_hops),
+        ]:
+            if label_val is not None and not isinstance(label_val, str):
+                raise GFQLTypeError(
+                    ErrorCode.E204,
+                    f"{label_field} must be a string when provided",
+                    field=label_field,
+                    value=type(label_val).__name__,
+                )
+
+        if not isinstance(self.label_seeds, bool):
+            raise GFQLTypeError(
+                ErrorCode.E201,
+                "label_seeds must be a boolean",
+                field="label_seeds",
+                value=type(self.label_seeds).__name__,
+            )
+
+        if not isinstance(self.include_zero_hop_seed, bool):
+            raise GFQLTypeError(
+                ErrorCode.E201,
+                "include_zero_hop_seed must be a boolean",
+                field="include_zero_hop_seed",
+                value=type(self.include_zero_hop_seed).__name__,
+            )
+
+        if (
+            not isinstance(self.relationship_scope, int)
+            or isinstance(self.relationship_scope, bool)
+            or self.relationship_scope < 0
+        ):
+            raise GFQLTypeError(
+                ErrorCode.E103,
+                "relationship_scope must be a non-negative integer",
+                field="relationship_scope",
+                value=type(self.relationship_scope).__name__,
+            )
+
+        # Validate to_fixed_point
+        if not isinstance(self.to_fixed_point, bool):
+            raise GFQLTypeError(
+                ErrorCode.E201,
+                "to_fixed_point must be a boolean",
+                field="to_fixed_point",
+                value=type(self.to_fixed_point).__name__,
+            )
+
+        # Validate direction
+        if self.direction not in ['forward', 'reverse', 'undirected']:
+            raise GFQLSyntaxError(
+                ErrorCode.E104,
+                f"Invalid edge direction: {self.direction}",
+                field="direction",
+                value=self.direction,
+                suggestion='Use "forward", "reverse", or "undirected"',
+            )
+
+        # Validate filter dicts
+        for filter_name, filter_dict in [
+            ('source_node_match', self.source_node_match),
+            ('edge_match', self.edge_match),
+            ('destination_node_match', self.destination_node_match),
+        ]:
+            if filter_dict is not None:
+                if not isinstance(filter_dict, dict):
+                    raise GFQLTypeError(
+                        ErrorCode.E201,
+                        f"{filter_name} must be a dictionary",
+                        field=filter_name,
+                        value=type(filter_dict).__name__,
+                    )
+
+                for key, value in filter_dict.items():
+                    if not isinstance(key, str):
+                        raise GFQLTypeError(
+                            ErrorCode.E102, "Filter keys must be strings", field=f"{filter_name}.{key}", value=key
+                        )
+
+                    if not (isinstance(value, ASTPredicate) or is_json_serializable(value)):
+                        raise GFQLTypeError(
+                            ErrorCode.E201,
+                            "Filter values must be predicates or JSON-serializable",
+                            field=f"{filter_name}.{key}",
+                            value=type(value).__name__,
+                        )
+
+        # Validate that filter dicts don't reference internal columns
+        validate_column_references(self.source_node_match, f"e_{self.direction}() source_node_match")
+        validate_column_references(self.edge_match, f"e_{self.direction}() edge_match")
+        validate_column_references(self.destination_node_match, f"e_{self.direction}() destination_node_match")
+
+        # Validate name
+        if self._name is not None and not isinstance(self._name, str):
+            raise GFQLTypeError(ErrorCode.E204, "name must be a string", field="name", value=type(self._name).__name__)
+
+        # Validate query strings
+        for query_name, query_value in [
+            ("source_node_query", self.source_node_query),
+            ("destination_node_query", self.destination_node_query),
+            ("edge_query", self.edge_query),
+        ]:
+            if query_value is not None and not isinstance(query_value, str):
+                raise GFQLTypeError(
+                    ErrorCode.E205, f"{query_name} must be a string", field=query_name, value=type(query_value).__name__
+                )
+
+    def _get_child_validators(self) -> Sequence['ASTSerializable']:
+        """Return predicates that need validation."""
+        children = []
+        for filter_dict in [self.source_node_match, self.edge_match, self.destination_node_match]:
+            if filter_dict:
+                for value in filter_dict.values():
+                    if isinstance(value, ASTPredicate):
+                        children.append(value)
+        return children
+
+    def to_json(self, validate=True) -> Dict[str, Any]:
+        if validate:
+            self.validate()
+        # Range and fixed-point edges carry their traversal bounds via
+        # min/max/to_fixed_point. Keeping the constructor default hops=1 in the
+        # serialized form narrows downstream binding-op replay back to a single hop.
+        serialized_hops = self.hops
+        if (
+            serialized_hops == DEFAULT_HOPS
+            and (
+                self.min_hops is not None
+                or self.max_hops is not None
+                or self.output_min_hops is not None
+                or self.output_max_hops is not None
+                or self.to_fixed_point
+            )
+        ):
+            serialized_hops = None
+        return {
+            'type': 'Edge',
+            'hops': serialized_hops,
+            **({'min_hops': self.min_hops} if self.min_hops is not None else {}),
+            **({'max_hops': self.max_hops} if self.max_hops is not None else {}),
+            **({'output_min_hops': self.output_min_hops} if self.output_min_hops is not None else {}),
+            **({'output_max_hops': self.output_max_hops} if self.output_max_hops is not None else {}),
+            **({'label_node_hops': self.label_node_hops} if self.label_node_hops is not None else {}),
+            **({'label_edge_hops': self.label_edge_hops} if self.label_edge_hops is not None else {}),
+            **({'label_seeds': self.label_seeds} if self.label_seeds else {}),
+            'to_fixed_point': self.to_fixed_point,
+            'direction': self.direction,
+            **({'source_node_match': _filter_dict_to_json(self.source_node_match)} if self.source_node_match is not None else {}),
+            **({'edge_match': _filter_dict_to_json(self.edge_match)} if self.edge_match is not None else {}),
+            **({'destination_node_match': _filter_dict_to_json(self.destination_node_match)} if self.destination_node_match is not None else {}),
+            **({'name': self._name} if self._name is not None else {}),
+            **({'source_node_query': self.source_node_query} if self.source_node_query is not None else {}),
+            **({'destination_node_query': self.destination_node_query} if self.destination_node_query is not None else {}),
+            **({'edge_query': self.edge_query} if self.edge_query is not None else {}),
+            **({'include_zero_hop_seed': self.include_zero_hop_seed} if self.include_zero_hop_seed else {}),
+            **({'relationship_scope': self.relationship_scope} if self.relationship_scope else {})
+        }
+    
+    @classmethod
+    def from_json(cls, d: Dict[str, Any], validate: bool = True) -> 'ASTEdge':
+        out = ASTEdge(
+            direction=d['direction'] if 'direction' in d else None,
+            **_edge_from_json_kwargs(d),
+        )
+        return _validate_edge_from_json(out, validate)
+
+    def execute(
+        self,
+        g: Plottable,
+        prev_node_wavefront: Optional[DataFrameT],
+        target_wave_front: Optional[DataFrameT],
+        engine: Engine
+    ) -> Plottable:
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug('----------------------------------------')
+            logger.debug('@CALL EDGE START {%s} ===>\n', self)
+            logger.debug('prev_node_wavefront: %s', dbg_df(prev_node_wavefront))
+            logger.debug('target_wave_front: %s', dbg_df(target_wave_front))
+            logger.debug('g._nodes: %s', dbg_df(g._nodes))
+            logger.debug('g._edges: %s', dbg_df(g._edges))
+            logger.debug('----------------------------------------')
+
+        wants_output_slice = self.output_min_hops is not None or self.output_max_hops is not None
+        return_wavefront = True  # AST edges are used in chain/gfql wavefront mode
+        # Avoid slicing during traversal but keep hop labels so the final combine step can filter.
+        resolved_output_min = None if return_wavefront else self.output_min_hops
+        resolved_output_max = None if return_wavefront else self.output_max_hops
+        # Use declared min_hops for traversal; hop.py handles path pruning for min_hops > 1
+        resolved_min_hops = self.min_hops
+        resolved_max_hops = self.max_hops
+
+        label_node_hops = self.label_node_hops
+        label_edge_hops = self.label_edge_hops
+        needs_auto_labels = wants_output_slice or (self.min_hops is not None and self.min_hops > 0) or self.prune_to_endpoints
+        if return_wavefront and needs_auto_labels:
+            # Ensure hop labels exist for post-filtering even if user didn't request explicit labels
+            label_node_hops = label_node_hops or '__gfql_output_node_hop__'
+            label_edge_hops = label_edge_hops or '__gfql_output_edge_hop__'
+
+        out_g = g.hop(
+            nodes=prev_node_wavefront,
+            hops=self.hops,
+            min_hops=resolved_min_hops,
+            max_hops=resolved_max_hops,
+            output_min_hops=resolved_output_min,
+            output_max_hops=resolved_output_max,
+            label_node_hops=label_node_hops,
+            label_edge_hops=label_edge_hops,
+            label_seeds=self.label_seeds,
+            to_fixed_point=self.to_fixed_point,
+            direction=self.direction,
+            source_node_match=self.source_node_match,
+            edge_match=self.edge_match,
+            destination_node_match=self.destination_node_match,
+            return_as_wave_front=True,
+            target_wave_front=target_wave_front,
+            source_node_query=self.source_node_query,
+            destination_node_query=self.destination_node_query,
+            edge_query=self.edge_query,
+            engine=engine.value,
+            include_zero_hop_seed=self.include_zero_hop_seed,
+        )
+
+        if self.prune_to_endpoints and out_g._nodes is not None and out_g._edges is not None and len(out_g._edges) > 0:
+            # Prune graph to only max-distance endpoint nodes + their edges.
+            # Used when a variable-length hop is followed by another hop in
+            # a connected pattern, so the next hop starts from the correct
+            # intermediate nodes only.
+            #
+            # Use the auto-generated edge hop labels to find the max-distance
+            # edges, then keep only their destination nodes (forward) or
+            # source nodes (reverse).
+            edge_hop_col = label_edge_hops
+            src_col = out_g._source
+            dst_col = out_g._destination
+            node_col = out_g._node
+            if (
+                edge_hop_col is not None
+                and edge_hop_col in out_g._edges.columns
+                and src_col is not None
+                and dst_col is not None
+                and node_col is not None
+                and len(out_g._edges) > 0
+            ):
+                # For ranges (min_hops != max_hops), keep all distances in
+                # the range. For exact hops, keep only the max distance.
+                prune_min = self.min_hops if self.min_hops is not None else (
+                    self.hops if self.hops is not None else 1
+                )
+                target_edges = out_g._edges[out_g._edges[edge_hop_col] >= prune_min]
+                if self.direction == "reverse":
+                    endpoint_ids = target_edges[src_col]
+                else:
+                    endpoint_ids = target_edges[dst_col]
+                node_mask = out_g._nodes[node_col].isin(endpoint_ids)
+                pruned_nodes = out_g._nodes[node_mask]
+                edge_mask = (
+                    out_g._edges[src_col].isin(pruned_nodes[node_col])
+                    & out_g._edges[dst_col].isin(pruned_nodes[node_col])
+                )
+                out_g = out_g.nodes(pruned_nodes).edges(out_g._edges[edge_mask])
+
+        if self._name is not None:
+            out_g = out_g.edges(out_g._edges.assign(**{self._name: True}))
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug('/CALL EDGE END {%s} ===> nodes:%s edges:%s', self, dbg_df(out_g._nodes), dbg_df(out_g._edges))
+            logger.debug('----------------------------------------')
+
+        return out_g
+
+    def reverse(self) -> 'ASTEdge':
+        # updates both edges and nodes
+        direction : Direction
+        if self.direction == 'reverse':
+            direction = 'forward'
+        elif self.direction == 'forward':
+            direction = 'reverse'
+        else:
+            direction = 'undirected'
+        # The reverse pass validates path completeness, not hop constraints.
+        # Forward pass already pruned dead-end branches; reverse just needs to traverse
+        # the remaining edges back to seeds. Use min_hops=None to skip re-pruning.
+        return ASTEdge(
+            direction=direction,
+            edge_match=self.edge_match,
+            hops=self.hops,
+            min_hops=None,
+            max_hops=self.max_hops,
+            output_min_hops=None,
+            output_max_hops=None,
+            label_node_hops=self.label_node_hops,
+            label_edge_hops=self.label_edge_hops,
+            label_seeds=self.label_seeds,
+            to_fixed_point=self.to_fixed_point,
+            source_node_match=self.destination_node_match,
+            destination_node_match=self.source_node_match,
+            source_node_query=self.destination_node_query,
+            destination_node_query=self.source_node_query,
+            edge_query=self.edge_query,
+            include_zero_hop_seed=self.include_zero_hop_seed,
+            relationship_scope=self.relationship_scope,
+        )
+
+def _init_directional_edge(edge: ASTEdge, direction: Direction, params: Dict[str, Any]) -> None:
+    kwargs = dict(params)
+    kwargs.pop("self", None)
+    ASTEdge.__init__(edge, direction=direction, **kwargs)
+
+class ASTEdgeForward(ASTEdge):
+    """
+    Internal, not intended for use outside of this module.
+    """
+
+    def __init__(
+        self,
+        edge_match: Optional[dict] = DEFAULT_FILTER_DICT,
+        hops: Optional[int] = DEFAULT_HOPS,
+        min_hops: Optional[int] = None,
+        max_hops: Optional[int] = None,
+        output_min_hops: Optional[int] = None,
+        output_max_hops: Optional[int] = None,
+        label_node_hops: Optional[str] = None,
+        label_edge_hops: Optional[str] = None,
+        label_seeds: bool = False,
+        source_node_match: Optional[dict] = DEFAULT_FILTER_DICT,
+        destination_node_match: Optional[dict] = DEFAULT_FILTER_DICT,
+        to_fixed_point: bool = DEFAULT_FIXED_POINT,
+        name: Optional[str] = None,
+        source_node_query: Optional[str] = None,
+        destination_node_query: Optional[str] = None,
+        edge_query: Optional[str] = None,
+        prune_to_endpoints: bool = False,
+        include_zero_hop_seed: bool = False,
+        relationship_scope: int = 0,
+    ):
+        _init_directional_edge(self, 'forward', locals())
+
+    @classmethod
+    def from_json(cls, d: Dict[str, Any], validate: bool = True) -> 'ASTEdge':
+        out = ASTEdgeForward(**_edge_from_json_kwargs(d))
+        return _validate_edge_from_json(out, validate)
+
+
+e_forward = ASTEdgeForward  # noqa: E305
+
+class ASTEdgeReverse(ASTEdge):
+    """
+    Internal, not intended for use outside of this module.
+    """
+
+    def __init__(
+        self,
+        edge_match: Optional[dict] = DEFAULT_FILTER_DICT,
+        hops: Optional[int] = DEFAULT_HOPS,
+        min_hops: Optional[int] = None,
+        max_hops: Optional[int] = None,
+        output_min_hops: Optional[int] = None,
+        output_max_hops: Optional[int] = None,
+        label_node_hops: Optional[str] = None,
+        label_edge_hops: Optional[str] = None,
+        label_seeds: bool = False,
+        source_node_match: Optional[dict] = DEFAULT_FILTER_DICT,
+        destination_node_match: Optional[dict] = DEFAULT_FILTER_DICT,
+        to_fixed_point: bool = DEFAULT_FIXED_POINT,
+        name: Optional[str] = None,
+        source_node_query: Optional[str] = None,
+        destination_node_query: Optional[str] = None,
+        edge_query: Optional[str] = None,
+        prune_to_endpoints: bool = False,
+        include_zero_hop_seed: bool = False,
+        relationship_scope: int = 0,
+    ):
+        _init_directional_edge(self, 'reverse', locals())
+
+    @classmethod
+    def from_json(cls, d: Dict[str, Any], validate: bool = True) -> 'ASTEdge':
+        out = ASTEdgeReverse(**_edge_from_json_kwargs(d))
+        return _validate_edge_from_json(out, validate)
+
+
+e_reverse = ASTEdgeReverse  # noqa: E305
+
+class ASTEdgeUndirected(ASTEdge):
+    """
+    Internal, not intended for use outside of this module.
+    """
+
+    def __init__(
+        self,
+        edge_match: Optional[dict] = DEFAULT_FILTER_DICT,
+        hops: Optional[int] = DEFAULT_HOPS,
+        min_hops: Optional[int] = None,
+        max_hops: Optional[int] = None,
+        output_min_hops: Optional[int] = None,
+        output_max_hops: Optional[int] = None,
+        label_node_hops: Optional[str] = None,
+        label_edge_hops: Optional[str] = None,
+        label_seeds: bool = False,
+        source_node_match: Optional[dict] = DEFAULT_FILTER_DICT,
+        destination_node_match: Optional[dict] = DEFAULT_FILTER_DICT,
+        to_fixed_point: bool = DEFAULT_FIXED_POINT,
+        name: Optional[str] = None,
+        source_node_query: Optional[str] = None,
+        destination_node_query: Optional[str] = None,
+        edge_query: Optional[str] = None,
+        prune_to_endpoints: bool = False,
+        include_zero_hop_seed: bool = False,
+        relationship_scope: int = 0,
+    ):
+        _init_directional_edge(self, 'undirected', locals())
+
+    @classmethod
+    def from_json(cls, d: Dict[str, Any], validate: bool = True) -> 'ASTEdge':
+        out = ASTEdgeUndirected(**_edge_from_json_kwargs(d))
+        return _validate_edge_from_json(out, validate)
+
+
+e_undirected = ASTEdgeUndirected  # noqa: E305
+e = ASTEdgeUndirected  # noqa: E305
+
+
+##############################################################################
+
+
+class ASTLet(ASTObject):
+    """Let-bindings for named graph operations in a DAG.
+
+    Lets you define reusable graph operations that can reference each other,
+    forming a directed acyclic graph (DAG) of computations.
+
+    Parameters
+    ----------
+    bindings : Dict[str, Union[ASTObject, Chain, List[ASTObject], Plottable]]
+        Mapping from binding names to graph operations (AST objects or Plottables).
+
+    Raises
+    ------
+    GFQLTypeError
+        If ``bindings`` is not a dict or contains invalid keys/values.
+
+    Example
+    -------
+    >>> dag = ASTLet({
+    ...     "persons": n({"type": "person"}),
+    ...     "friends": ASTRef("persons", [e_forward({"rel": "friend"})])
+    ... })
+    """
+    bindings: Dict[str, Union['ASTObject', 'Chain', Plottable]]
+    
+    def __init__(self, bindings: Dict[str, Union['ASTObject', 'Chain', List['ASTObject'], Plottable, Dict[str, Any]]], validate: bool = True) -> None:
+        """Initialize Let with named bindings.
+
+        :param bindings: Dictionary mapping names to GraphOperation instances, lists (implicit Chains), or JSON dicts.
+                        JSON dicts must have a 'type' field indicating the AST object type.
+        :type bindings: Dict[str, Union[ASTObject, Chain, List[ASTObject], Plottable, Dict[str, Any]]]
+        :param validate: Whether to validate the bindings immediately
+        :type validate: bool
+        """
+        super().__init__()
+        
+        # Process mixed JSON/native objects
+        processed_bindings: Dict[str, Any] = {}
+        from graphistry.compute.gfql.index.wire import index_op_to_call, is_index_op
+        for name, value in bindings.items():
+            if is_index_op(value):
+                value = index_op_to_call(value)  # DDL as a binding: the graph with that index resident
+            if isinstance(value, list):
+                # Treat list bindings as implicit Chain operations
+                from graphistry.compute.chain import Chain  # noqa: F401, F811
+                chain_ops: List[ASTObject] = []
+                for op in value:
+                    if isinstance(op, dict):
+                        if 'type' not in op:
+                            raise ValueError(f"JSON binding '{name}' missing 'type' field")
+                        obj_type = op.get('type')
+                        if obj_type == 'Chain':
+                            raise ValueError(
+                                f"Binding '{name}' contains nested Chain in list; use Chain(...) directly"
+                            )
+                        chain_ops.append(from_json(op, validate=False))
+                    else:
+                        chain_ops.append(op)
+                processed_bindings[name] = Chain(chain_ops, validate=False)  # type: ignore
+            elif isinstance(value, dict):
+                # JSON dict - check type and convert if valid
+                if 'type' not in value:
+                    raise ValueError(f"JSON binding '{name}' missing 'type' field")
+                
+                obj_type = value.get('type')
+                # Check if it's a valid GraphOperation type
+                if obj_type == 'Chain':
+                    # Import Chain here due to circular dependency
+                    from graphistry.compute.chain import Chain  # noqa: F401, F811
+                    chain_obj = Chain.from_json(value, validate=False)
+                    processed_bindings[name] = chain_obj  # type: ignore
+                else:
+                    # Convert other AST types
+                    ast_obj = from_json(value, validate=False)
+                    processed_bindings[name] = ast_obj  # type: ignore
+            else:
+                # Native object - use as-is
+                processed_bindings[name] = value
+        
+        self.bindings = processed_bindings  # type: ignore
+        
+        if validate:
+            self.validate()
+    
+    def _validate_fields(self) -> None:
+        """Validate Let fields."""
+        if not isinstance(self.bindings, dict):
+            raise GFQLTypeError(
+                ErrorCode.E201,
+                "bindings must be a dictionary",
+                field="bindings",
+                value=type(self.bindings).__name__
+            )
+        
+        for k, v in self.bindings.items():
+            if not isinstance(k, str):
+                raise GFQLTypeError(
+                    ErrorCode.E102,
+                    "binding key must be string",
+                    field=f"bindings.{k}",
+                    value=type(k).__name__
+                )
+            # Check if value is a valid GraphOperation type
+            # Import Chain here due to circular dependency
+            from graphistry.compute.chain import Chain as ChainClass  # noqa: F401
+
+            # GraphOperation now includes all AST types
+            # ASTNode/ASTEdge are now allowed and will operate on the root graph
+            if not isinstance(v, (ASTNode, ASTEdge, ASTRef, ASTCall, ASTRemoteGraph, ASTLet, Plottable, ChainClass)):
+                raise GFQLTypeError(
+                    ErrorCode.E201,
+                    "binding value must be a valid operation (ASTNode, ASTEdge, Chain, ASTRef, ASTCall, ASTRemoteGraph, ASTLet, or Plottable)",
+                    field=f"bindings.{k}",
+                    value=type(v).__name__,
+                    suggestion="Use a valid graph operation or matcher"
+                )
+        # TODO: Check for cycles in DAG
+        return None
+    
+    def _get_child_validators(self) -> Sequence['ASTSerializable']:
+        """Return child AST nodes that need validation."""
+        # Only return objects that inherit from ASTSerializable
+        # Plottable instances don't need validation
+        children = []
+        for v in self.bindings.values():
+            if isinstance(v, ASTSerializable):
+                children.append(v)
+        return children
+    
+    def to_json(self, validate: bool = True) -> Dict[str, Any]:
+        """Convert Let to JSON representation.
+        
+        :param validate: Whether to validate before serialization
+        :type validate: bool
+        :returns: JSON-serializable dictionary
+        :rtype: dict
+        """
+        if validate:
+            self.validate()
+        bindings_json = {}
+        for k, v in self.bindings.items():
+            if hasattr(v, 'to_json'):
+                bindings_json[k] = v.to_json()  # type: ignore
+            else:
+                # Plottable doesn't have to_json
+                raise ValueError(f"Cannot serialize {type(v).__name__} to JSON")
+        return {
+            'type': 'Let',
+            'bindings': bindings_json
+        }
+    
+    @classmethod
+    def from_json(cls, d: Dict[str, Any], validate: bool = True) -> 'ASTLet':
+        """Create ASTLet from JSON representation.
+        
+        :param d: JSON dictionary with 'bindings' field
+        :type d: dict
+        :param validate: Whether to validate after creation
+        :type validate: bool
+        :returns: New ASTLet instance
+        :rtype: ASTLet
+        :raises AssertionError: If 'bindings' field is missing
+        """
+        assert 'bindings' in d, "Let missing bindings"
+
+        # Import Chain here due to circular dependency
+        from graphistry.compute.chain import Chain  # noqa: F401, F811
+
+        bindings: Dict[str, Any] = {}
+        for k, v in d['bindings'].items():
+            # Handle Chain objects specially
+            if isinstance(v, dict) and v.get('type') == 'Chain':
+                bindings[k] = Chain.from_json(v, validate=validate)
+            else:
+                # Regular AST objects
+                bindings[k] = from_json(v, validate=validate)
+        
+        out = cls(bindings=bindings, validate=validate)  # type: ignore
+        return out
+    
+    def execute(
+        self,
+        g: Plottable,
+        prev_node_wavefront: Optional[DataFrameT],
+        target_wave_front: Optional[DataFrameT],
+        engine: Engine
+    ) -> Plottable:
+        # Let bindings don't use wavefronts - execute via chain_let_impl
+        # Import here due to circular dependency
+        from graphistry.compute.chain_let import chain_let_impl  # noqa: F401, F811
+        return chain_let_impl(g, self, EngineAbstract(engine.value))
+    
+    def reverse(self) -> 'ASTLet':
+        raise NotImplementedError("Let reversal not supported")
+
+
+class ASTRemoteGraph(ASTObject):
+    """Load a graph from Graphistry server.
+    
+    Allows fetching previously uploaded graphs by dataset ID,
+    optionally with an authentication token.
+    
+    :param dataset_id: Unique identifier of the dataset on the server
+    :type dataset_id: str
+    :param token: Optional authentication token
+    :type token: Optional[str]
+    
+    :raises GFQLTypeError: If dataset_id is not a string or is empty
+    
+    **Example::**
+    
+        # Fetch public dataset
+        remote = ASTRemoteGraph('my-dataset-id')
+        
+        # Fetch private dataset with token
+        remote = ASTRemoteGraph('private-dataset', token='auth-token')
+    """
+    def __init__(self, dataset_id: str, token: Optional[str] = None) -> None:
+        """Initialize RemoteGraph with dataset ID and optional token.
+        
+        :param dataset_id: Unique identifier of the dataset
+        :type dataset_id: str
+        :param token: Optional authentication token
+        :type token: Optional[str]
+        """
+        super().__init__()
+        self.dataset_id = dataset_id
+        self.token = token
+    
+    def _validate_fields(self) -> None:
+        """Validate RemoteGraph fields."""
+        if not isinstance(self.dataset_id, str):
+            raise GFQLTypeError(
+                ErrorCode.E201,
+                "dataset_id must be a string",
+                field="dataset_id",
+                value=type(self.dataset_id).__name__
+            )
+        
+        if len(self.dataset_id) == 0:
+            raise GFQLTypeError(
+                ErrorCode.E106,
+                "dataset_id cannot be empty",
+                field="dataset_id",
+                value=self.dataset_id
+            )
+        
+        if self.token is not None and not isinstance(self.token, str):
+            raise GFQLTypeError(
+                ErrorCode.E201,
+                "token must be string or None",
+                field="token",
+                value=type(self.token).__name__
+            )
+    
+    def to_json(self, validate: bool = True) -> Dict[str, Any]:
+        """Convert RemoteGraph to JSON representation.
+        
+        :param validate: Whether to validate before serialization
+        :type validate: bool
+        :returns: JSON-serializable dictionary
+        :rtype: dict
+        """
+        if validate:
+            self.validate()
+        result = {
+            'type': 'RemoteGraph',
+            'dataset_id': self.dataset_id
+        }
+        if self.token is not None:
+            result['token'] = self.token
+        return result
+    
+    @classmethod
+    def from_json(cls, d: Dict[str, Any], validate: bool = True) -> 'ASTRemoteGraph':
+        """Create ASTRemoteGraph from JSON representation.
+        
+        :param d: JSON dictionary with 'dataset_id' field
+        :type d: dict
+        :param validate: Whether to validate after creation
+        :type validate: bool
+        :returns: New ASTRemoteGraph instance
+        :rtype: ASTRemoteGraph
+        :raises AssertionError: If 'dataset_id' field is missing
+        """
+        assert 'dataset_id' in d, "RemoteGraph missing dataset_id"
+        out = cls(
+            dataset_id=d['dataset_id'],
+            token=d.get('token')
+        )
+        if validate:
+            out.validate()
+        return out
+    
+    def execute(
+        self,
+        g: Plottable,
+        prev_node_wavefront: Optional[DataFrameT],
+        target_wave_front: Optional[DataFrameT],
+        engine: Engine
+    ) -> Plottable:
+        # Implementation in PR 1.3
+        raise NotImplementedError("RemoteGraph loading will be implemented in PR 1.3")
+    
+    def reverse(self) -> 'ASTRemoteGraph':
+        raise NotImplementedError("RemoteGraph reversal not supported")
+
+
+class ASTRef(ASTObject):
+    """Execute a chain of operations starting from a DAG binding reference.
+    
+    Allows building graph operations that start from a named binding
+    defined in an ASTLet (DAG) and apply additional operations.
+    
+    :param ref: Name of the binding to reference from the DAG
+    :type ref: str
+    :param chain: List of operations to apply to the referenced graph
+    :type chain: List[ASTObject]
+    
+    :raises GFQLTypeError: If ref is not a string or chain is not a list
+    
+    **Example::**
+    
+        # Reference 'persons' binding and find their friends
+        friends = ASTRef('persons', [e_forward({'rel': 'friend'})])
+    """
+    def __init__(self, ref: str, chain: List['ASTObject']) -> None:
+        """Initialize Ref with reference name and operation chain.
+        
+        :param ref: Name of the binding to reference
+        :type ref: str
+        :param chain: List of operations to apply
+        :type chain: List[ASTObject]
+        """
+        super().__init__()
+        self.ref = ref
+        from .chain import _index_ops_as_calls
+        self.chain = _index_ops_as_calls(chain)
+    
+    def _validate_fields(self) -> None:
+        """Validate Ref fields."""
+        if not isinstance(self.ref, str):
+            raise GFQLTypeError(
+                ErrorCode.E201,
+                "ref must be a string",
+                field="ref",
+                value=type(self.ref).__name__
+            )
+        
+        if len(self.ref) == 0:
+            raise GFQLTypeError(
+                ErrorCode.E106,
+                "ref cannot be empty",
+                field="ref",
+                value=self.ref
+            )
+        
+        if not isinstance(self.chain, list):
+            raise GFQLTypeError(
+                ErrorCode.E201,
+                "chain must be a list",
+                field="chain",
+                value=type(self.chain).__name__
+            )
+        
+        for i, op in enumerate(self.chain):
+            if not isinstance(op, ASTObject):
+                raise GFQLTypeError(
+                    ErrorCode.E201,
+                    f"chain[{i}] must be ASTObject",
+                    field=f"chain[{i}]",
+                    value=type(op).__name__
+                )
+    
+    def _get_child_validators(self) -> Sequence['ASTSerializable']:
+        """Return child AST nodes that need validation."""
+        # ASTObject inherits from ASTSerializable, so this is safe
+        return self.chain
+    
+    def to_json(self, validate: bool = True) -> Dict[str, Any]:
+        """Convert Ref to JSON representation.
+        
+        :param validate: Whether to validate before serialization
+        :type validate: bool
+        :returns: JSON-serializable dictionary
+        :rtype: dict
+        """
+        if validate:
+            self.validate()
+        return {
+            'type': 'Ref',
+            'ref': self.ref,
+            'chain': [op.to_json() for op in self.chain]
+        }
+    
+    @classmethod
+    def from_json(cls, d: Dict[str, Any], validate: bool = True) -> 'ASTRef':
+        """Create ASTRef from JSON representation.
+        
+        :param d: JSON dictionary with 'ref' and 'chain' fields
+        :type d: dict
+        :param validate: Whether to validate after creation
+        :type validate: bool
+        :returns: New ASTRef instance
+        :rtype: ASTRef
+        :raises AssertionError: If 'ref' or 'chain' fields are missing
+        """
+        assert 'ref' in d, "Ref missing ref"
+        assert 'chain' in d, "Ref missing chain"
+        out = cls(
+            ref=d['ref'],
+            chain=[from_json(op, validate=validate) for op in d['chain']]
+        )
+        if validate:
+            out.validate()
+        return out
+    
+    def execute(
+        self,
+        g: Plottable,
+        prev_node_wavefront: Optional[DataFrameT],
+        target_wave_front: Optional[DataFrameT],
+        engine: Engine
+    ) -> Plottable:
+        raise NotImplementedError(
+            "ASTRef cannot be used directly in chain(). "
+            "It must be used within an ASTLet/chain_let() context."
+        )
+    
+    def reverse(self) -> 'ASTRef':
+        # Reverse the chain operations
+        return ASTRef(self.ref, [op.reverse() for op in reversed(self.chain)])
+
+
+class ASTCall(ASTObject):
+    """Call a method on the current graph with validated parameters.
+    
+    Allows safe execution of Plottable methods through GFQL with parameter
+    validation and schema checking.
+    
+    Attributes:
+        function: Name of the method to call (must be in safelist)
+        params: Dictionary of parameters to pass to the method
+    """
+    def __init__(self, function: str, params: Optional[Dict[str, Any]] = None) -> None:
+        """Initialize a Call operation.
+
+        Args:
+            function: Name of the Plottable method to call
+            params: Optional dictionary of parameters for the method
+        """
+        super().__init__()
+        self.function = function
+        self.params = params or {}
+
+    def _validate_fields(self) -> None:
+        """Validate Call fields."""
+        if not isinstance(self.function, str):
+            raise GFQLTypeError(
+                ErrorCode.E201,
+                "function must be a string",
+                field="function",
+                value=type(self.function).__name__
+            )
+
+        if len(self.function) == 0:
+            raise GFQLTypeError(
+                ErrorCode.E106,
+                "function name cannot be empty",
+                field="function",
+                value=self.function
+            )
+
+        if not isinstance(self.params, dict):
+            raise GFQLTypeError(
+                ErrorCode.E201,
+                "params must be a dictionary",
+                field="params",
+                value=type(self.params).__name__
+            )
+
+        # Validate parameters against safelist
+        # This ensures validation happens for both local AND remote execution
+        validate_call_params(self.function, self.params)
+
+        # Validate filter_*_by_dict calls for internal column references
+        if self.function in ('filter_nodes_by_dict', 'filter_edges_by_dict'):
+            # For these functions, the filter_dict is passed as a parameter
+            if 'filter_dict' in self.params:
+                validate_column_references(
+                    self.params.get('filter_dict'),
+                    f"call('{self.function}')"
+                )
+
+        # Validate output column name parameters to prevent __gfql_*__ internal column conflicts
+        from graphistry.compute.gfql.identifiers import validate_column_name
+
+        # Map function names to their output column parameter names
+        output_col_params = {
+            'get_degrees': ['col', 'degree_in', 'degree_out'],
+            'get_indegrees': ['col'],
+            'get_outdegrees': ['col'],
+            'get_topological_levels': ['level_col'],
+            'compute_cugraph': ['out_col'],
+            'compute_igraph': ['out_col'],
+            'encode_point_color': ['column'],
+            'encode_edge_color': ['column'],
+            'encode_point_size': ['column'],
+            'encode_edge_size': ['column'],
+            'encode_edge_weight': ['column'],
+            'encode_point_opacity': ['column'],
+            'encode_edge_opacity': ['column'],
+            'encode_point_label': ['column'],
+            'encode_edge_label': ['column'],
+            'encode_point_title': ['column'],
+            'encode_edge_title': ['column'],
+            'encode_point_icon': ['column'],
+            'encode_edge_icon': ['column'],
+            'layout_igraph': ['x_out_col', 'y_out_col'],
+            'layout_cugraph': ['x_out_col', 'y_out_col'],
+            'layout_graphviz': ['x_out_col', 'y_out_col'],
+            'collapse': ['column'],
+        }
+
+        if self.function in output_col_params:
+            for param in output_col_params[self.function]:
+                if param in self.params:
+                    validate_column_name(self.params[param], f"call('{self.function}') {param} parameter")
+
+    def to_json(self, validate: bool = True) -> Dict[str, Any]:
+        """Convert Call to JSON representation.
+        
+        Args:
+            validate: If True, validate before serialization
+            
+        Returns:
+            Dictionary with type, function, and params fields
+        """
+        if validate:
+            self.validate()
+        return {
+            'type': 'Call',
+            'function': self.function,
+            'params': self.params
+        }
+    
+    @classmethod
+    def from_json(cls, d: Dict[str, Any], validate: bool = True) -> 'ASTCall':
+        """Create ASTCall from JSON representation.
+        
+        :param d: JSON dictionary with 'function' field and optional 'params'
+        :type d: dict
+        :param validate: Whether to validate after creation
+        :type validate: bool
+        :returns: New ASTCall instance
+        :rtype: ASTCall
+        :raises AssertionError: If 'function' field is missing
+        
+        **Example::**
+        
+            call_json = {'type': 'Call', 'function': 'hop', 'params': {'steps': 2}}
+            call = ASTCall.from_json(call_json)
+        """
+        assert 'function' in d, "Call missing function"
+        out = cls(
+            function=d['function'],
+            params=d.get('params', {})
+        )
+        if validate:
+            out.validate()
+        return out
+    
+    def execute(
+        self,
+        g: Plottable,
+        prev_node_wavefront: Optional[DataFrameT],
+        target_wave_front: Optional[DataFrameT],
+        engine: Engine
+    ) -> Plottable:
+        """Execute the method call on the graph.
+        
+        Args:
+            g: Graph to operate on
+            prev_node_wavefront: Previous node wavefront (unused)
+            target_wave_front: Target wavefront (unused)
+            engine: Execution engine (pandas/cudf)
+            
+        Returns:
+            New Plottable with method results
+            
+        Raises:
+            GFQLTypeError: If method not in safelist or parameters invalid
+        """
+        # For chain_let, we don't use wavefronts, just execute the call
+        # Import here due to circular dependency
+        from graphistry.compute.gfql.call.executor import execute_call  # noqa: F401, F811
+        return execute_call(g, self.function, self.params, engine)
+    
+    def reverse(self) -> 'ASTCall':
+        # Method calls are transformations that don't need reversal
+        # Return self to act as identity in the reverse pass
+        return self
+
+
+###
+
+def from_json(o: JSONVal, validate: bool = True) -> Union[ASTNode, ASTEdge, ASTLet, ASTRemoteGraph, ASTRef, ASTCall]:
+    if not isinstance(o, dict):
+        raise GFQLSyntaxError(ErrorCode.E101, "AST JSON must be a dictionary", value=type(o).__name__)
+
+    if 'type' not in o:
+        raise GFQLSyntaxError(
+            ErrorCode.E105, "AST JSON missing required 'type' field", suggestion="Add 'type' field: 'Node', 'Edge', 'Let', 'RemoteGraph', 'Ref', or 'Call'"
+        )
+
+    out: Union[ASTNode, ASTEdge, ASTLet, ASTRemoteGraph, ASTRef, ASTCall]
+    if o['type'] == 'Node':
+        out = ASTNode.from_json(o, validate=validate)
+    elif o['type'] == 'Edge':
+        if 'direction' in o:
+            if o['direction'] == 'forward':
+                out = ASTEdgeForward.from_json(o, validate=validate)
+            elif o['direction'] == 'reverse':
+                out = ASTEdgeReverse.from_json(o, validate=validate)
+            elif o['direction'] == 'undirected':
+                out = ASTEdgeUndirected.from_json(o, validate=validate)
+            else:
+                raise GFQLSyntaxError(
+                    ErrorCode.E104,
+                    f"Edge has unknown direction: {o['direction']}",
+                    field="direction",
+                    value=o['direction'],
+                    suggestion='Use "forward", "reverse", or "undirected"',
+                )
+        else:
+            raise GFQLSyntaxError(
+                ErrorCode.E105,
+                "Edge missing required 'direction' field",
+                suggestion="Add 'direction' field: 'forward', 'reverse', or 'undirected'",
+            )
+    elif o['type'] == 'Let':
+        out = ASTLet.from_json(o, validate=validate)
+    elif o['type'] == 'QueryDAG':
+        # For backward compatibility
+        out = ASTLet.from_json(o, validate=validate)
+    elif o['type'] == 'RemoteGraph':
+        out = ASTRemoteGraph.from_json(o, validate=validate)
+    elif o['type'] == 'Ref':
+        out = ASTRef.from_json(o, validate=validate)
+    elif o['type'] == 'Call':
+        out = ASTCall.from_json(o, validate=validate)
+    elif o['type'] in ('CreateIndex', 'DropIndex', 'ShowIndexes'):
+        from graphistry.compute.gfql.index.wire import index_op_from_json, index_op_to_call
+        out = index_op_to_call(index_op_from_json(dict(o)))
+    else:
+        raise GFQLSyntaxError(
+            ErrorCode.E101,
+            f"Unknown AST type: {o['type']}",
+            field="type",
+            value=o["type"],
+            suggestion="Use 'Node', 'Edge', 'Let', 'RemoteGraph', 'Ref', or 'Call'",
+        )
+    return out
+
+
+def normalize_gfql_to_wire(expr: Any) -> List[Dict[str, JSONVal]]:
+    """
+    Normalize GFQL expression to wire format (list of JSON-serializable dicts).
+
+    Accepts:
+    - Chain object
+    - Single ASTObject
+    - List of ASTObjects
+    - Dict with 'type': 'Chain' and 'chain' key
+    - Dict with 'type': 'gfql_chain' and 'gfql' key
+    - Dict with just 'chain' or 'gfql' key
+    - Single dict (parsed as AST op)
+
+    Returns:
+    - List of JSON-serializable dicts ready for wire protocol
+
+    Raises:
+    - TypeError: if expr type is not supported
+    - ValueError: if expr is empty
+    - GFQLSyntaxError: if dict cannot be parsed as valid AST
+    """
+    from graphistry.compute.chain import Chain
+
+    def _normalize_op(op: object) -> Dict[str, JSONVal]:
+        if isinstance(op, ASTObject):
+            return op.to_json()
+        if isinstance(op, dict):
+            return from_json(op, validate=True).to_json()
+        raise TypeError("GFQL operations must be AST objects or dictionaries")
+
+    def _normalize_ops(raw: object) -> List[Dict[str, JSONVal]]:
+        if isinstance(raw, Chain):
+            return _normalize_ops(raw.to_json().get("chain", []))
+        if isinstance(raw, ASTObject):
+            return [raw.to_json()]
+        if isinstance(raw, list):
+            if len(raw) == 0:
+                raise ValueError("GFQL operations list cannot be empty")
+            return [_normalize_op(op) for op in raw]
+        if isinstance(raw, dict):
+            if raw.get("type") == "Chain" and "chain" in raw:
+                return _normalize_ops(raw.get("chain"))
+            if raw.get("type") == "gfql_chain" and "gfql" in raw:
+                return _normalize_ops(raw.get("gfql"))
+            if "chain" in raw:
+                return _normalize_ops(raw.get("chain"))
+            if "gfql" in raw:
+                return _normalize_ops(raw.get("gfql"))
+            return [_normalize_op(raw)]
+        raise TypeError("GFQL expr must be Chain, ASTObject, list, or dict")
+
+    return _normalize_ops(expr)
+
+
+###############################################################################
+# User-friendly aliases for public API
+
+let = ASTLet  # noqa: E305
+remote = ASTRemoteGraph  # noqa: E305
+ref = ASTRef  # noqa: E305
+
+# Import type-safe call() function from models/gfql/types/call
+# This provides overloaded signatures for IDE autocomplete and type checking
+from graphistry.models.gfql.types.call import call  # noqa: E305 E402 F401
+
+
+def rows(
+    table: str = "nodes",
+    source: Optional[str] = None,
+    alias_endpoints: Optional[Dict[str, str]] = None,
+    binding_ops: Optional[List[Dict[str, JSONVal]]] = None,
+    alias_prefilters: Optional[AliasPrefilters] = None,
+    attach_prop_aliases: Optional[List[str]] = None,
+    attach_prop_columns: Optional[Dict[str, List[str]]] = None,
+) -> ASTCall:
+    """Create a row-source operation for GFQL row pipelines.
+
+    This operation converts graph outputs into a row table context (nodes or edges),
+    optionally constrained to a named alias/source tag.
+
+    When *alias_endpoints* is provided, builds a bindings table by joining edges
+    with node properties for each alias. Keys are alias names, values are
+    ``"src"`` or ``"dst"`` indicating which edge endpoint maps to that alias.
+
+    When *binding_ops* is provided, builds a bindings table from serialized
+    node/edge operations. Alternating node/edge chains materialize connected
+    same-path bindings, while node-only sequences materialize cartesian
+    bindings rows. This is the preferred path for direct Cypher multi-alias
+    scalar and aggregate projections.
+    """
+    params: Dict[str, Any] = {"table": table}
+    if source is not None:
+        params["source"] = source
+    if alias_endpoints is not None:
+        params["alias_endpoints"] = alias_endpoints
+    if binding_ops is not None:
+        params["binding_ops"] = binding_ops
+    if alias_prefilters:
+        params["alias_prefilters"] = alias_prefilters
+    if attach_prop_aliases is not None:
+        params["attach_prop_aliases"] = list(attach_prop_aliases)
+    if attach_prop_columns is not None:
+        # per node alias, the property columns to attach (projection pushdown)
+        params["attach_prop_columns"] = {
+            alias: list(columns) for alias, columns in attach_prop_columns.items()
+        }
+    return ASTCall("rows", params)
+
+
+def serialize_binding_ops(ops: Sequence[ASTObject]) -> List[Dict[str, JSONVal]]:
+    """Serialize node/edge bindings for ``rows(binding_ops=...)``."""
+    binding_ops: List[Dict[str, JSONVal]] = []
+    for op in ops:
+        if not isinstance(op, (ASTNode, ASTEdge)):
+            raise ValueError(
+                "Connected bindings-row lowering expects only ASTNode/ASTEdge ops"
+            )
+        binding_ops.append(op.to_json(validate=False))
+    return binding_ops
+
+
+ProjectionItem = Union[str, Tuple[str, Any]]
+
+
+def _normalize_projection_items(items: Iterable[ProjectionItem]) -> List[Tuple[str, Any]]:
+    out: List[Tuple[str, Any]] = []
+    for item in items:
+        if isinstance(item, str):
+            out.append((item, item))
+        else:
+            out.append(item)
+    return out
+
+
+def select(items: Iterable[ProjectionItem]) -> ASTCall:
+    """Create a row projection operation for GFQL row pipelines."""
+    return ASTCall("select", {"items": _normalize_projection_items(items)})
+
+
+def with_(items: Iterable[ProjectionItem], extend: bool = False) -> ASTCall:
+    """Python-safe alias for Cypher WITH row projection semantics."""
+    params: Dict[str, Any] = {"items": _normalize_projection_items(items)}
+    if extend:
+        params["extend"] = True
+    return ASTCall("with_", params)
+
+
+def return_(items: Iterable[ProjectionItem]) -> ASTCall:
+    """Python-safe alias for Cypher RETURN semantics."""
+    return select(items)
+
+
+def where_rows(
+    filter_dict: Optional[Dict[str, Any]] = None,
+    expr: Optional[str] = None,
+) -> ASTCall:
+    """Create a row-table WHERE operation using filter_dict and/or expression."""
+    params: Dict[str, Any] = {}
+    if filter_dict is not None:
+        params["filter_dict"] = filter_dict
+    if expr is not None:
+        params["expr"] = expr
+    if not params:
+        params["filter_dict"] = {}
+    return ASTCall("where_rows", params)
+
+
+def anti_semi_apply(
+    *,
+    binding_ops: List[Dict[str, Any]],
+    join_aliases: Sequence[str],
+    neq: Optional[Sequence[str]] = None,
+    requested_property_columns: Optional[Mapping[str, Sequence[str]]] = None,
+) -> ASTCall:
+    """Filter active rows by removing rows matching a correlated pattern.
+
+    ``binding_ops`` encodes the pattern to evaluate as bindings rows.
+    ``join_aliases`` names shared aliases used as anti-join keys.
+    ``neq`` optionally names two pattern aliases whose bindings must DIFFER
+    (``EXISTS { (n)--(m) WHERE m <> n }`` — the viz drop-self prune flavor).
+    """
+    params: Dict[str, Any] = {
+        "binding_ops": binding_ops,
+        "join_aliases": list(join_aliases),
+    }
+    if neq is not None:
+        params["neq"] = list(neq)
+    if requested_property_columns is not None:
+        params["requested_property_columns"] = {
+            alias: list(columns) for alias, columns in requested_property_columns.items()
+        }
+    return ASTCall("anti_semi_apply", params)
+
+
+def search_any(
+    *,
+    alias: str,
+    term: str,
+    out_col: str,
+    case_sensitive: bool = False,
+    regex: bool = False,
+    columns: Optional[Sequence[str]] = None,
+) -> ASTCall:
+    """Annotate active rows with a cross-column search marker (viz-filter L2):
+    ``out_col`` True where ANY of ``alias``'s columns matches ``term`` — OR across
+    columns, case-insensitive substring default, regex opt-in, dtype-gated (string
+    columns always; integer columns iff numeric-literal term)."""
+    params: Dict[str, Any] = {"alias": alias, "term": term, "out_col": out_col}
+    if case_sensitive:
+        params["case_sensitive"] = True
+    if regex:
+        params["regex"] = True
+    if columns is not None:
+        params["columns"] = list(columns)
+    return ASTCall("search_any", params)
+
+
+def semi_apply_mark(
+    *,
+    binding_ops: List[Dict[str, Any]],
+    join_aliases: Sequence[str],
+    out_col: str,
+    neq: Optional[Sequence[str]] = None,
+    requested_property_columns: Optional[Mapping[str, Sequence[str]]] = None,
+) -> ASTCall:
+    """Annotate active rows with a correlated pattern-existence boolean.
+
+    ``binding_ops`` encodes the pattern to evaluate as bindings rows.
+    ``join_aliases`` names shared aliases used as join keys.
+    ``out_col`` receives a bool marker where True means the pattern matched.
+    """
+    params: Dict[str, Any] = {
+        "binding_ops": binding_ops,
+        "join_aliases": list(join_aliases),
+        "out_col": out_col,
+    }
+    if neq is not None:
+        params["neq"] = list(neq)
+    if requested_property_columns is not None:
+        params["requested_property_columns"] = {
+            alias: list(columns) for alias, columns in requested_property_columns.items()
+        }
+    return ASTCall("semi_apply_mark", params)
+
+
+def join_apply(
+    *,
+    binding_ops: List[Dict[str, Any]],
+    join_aliases: Sequence[str],
+    how: str = "inner",
+) -> ASTCall:
+    """Join active rows with rows produced by a correlated binding pattern.
+
+    ``binding_ops`` encodes the right-hand pattern to evaluate as bindings rows.
+    ``join_aliases`` names shared aliases used as join keys.
+    ``how`` is ``"inner"`` or ``"left"``.
+    """
+    return ASTCall(
+        "join_apply",
+        {
+            "binding_ops": binding_ops,
+            "join_aliases": list(join_aliases),
+            "how": how,
+        },
+    )
+
+
+def order_by(keys: Iterable[Tuple[Any, str]]) -> ASTCall:
+    """Create an ORDER BY operation for GFQL row pipelines."""
+    return ASTCall("order_by", {"keys": list(keys)})
+
+
+def skip(value: Any) -> ASTCall:
+    """Create a SKIP operation for GFQL row pipelines."""
+    return ASTCall("skip", {"value": value})
+
+
+def limit(value: Any) -> ASTCall:
+    """Create a LIMIT operation for GFQL row pipelines."""
+    return ASTCall("limit", {"value": value})
+
+
+def distinct(subset: Optional[Sequence[str]] = None) -> ASTCall:
+    """Create a DISTINCT operation, optionally keyed by visible columns."""
+    return ASTCall("distinct", {"subset": list(subset)} if subset else {})
+
+
+def unwind(expr: Any, as_: str = "value") -> ASTCall:
+    """Create a constrained UNWIND row expansion operation."""
+    return ASTCall("unwind", {"expr": expr, "as_": as_})
+
+
+def drop_cols(cols: Iterable[str]) -> ASTCall:
+    """Drop named columns from the active row table (ignores missing columns at runtime)."""
+    return ASTCall("drop_cols", {"cols": list(cols)})
+
+
+def count_table(
+    table: str = "nodes",
+    source: Optional[str] = None,
+    alias: str = "count(*)",
+) -> ASTCall:
+    """Count matched rows without materializing them (fast path for a lone ``count(*)``).
+
+    Emitted by the Cypher lowering when a RETURN is exactly ``count(*)`` over a
+    single node/edge pattern (no DISTINCT, GROUP BY, row-level WHERE, UNWIND,
+    paging, or multi-relationship binding). Produces a one-row table
+    ``{alias: n}`` where ``n`` is the height of the active ``table`` (or, when a
+    ``source`` alias-mask column is present, the count of its truthy rows). This
+    avoids the full-frame materialize + constant-key ``group_by`` the general
+    aggregate path performs — the win that turns count(*) from O(N) into a single
+    reduction.
+    """
+    params: Dict[str, Any] = {"table": table, "alias": alias}
+    if source is not None:
+        params["source"] = source
+    return ASTCall("count_table", params)
+
+
+def group_by(
+    keys: Iterable[str],
+    aggregations: Iterable["AggSpec"],
+    key_prefixes: Optional[Iterable[str]] = None,
+) -> ASTCall:
+    """Create grouped aggregation operation for row pipelines.
+
+    key_prefixes: if provided, all DataFrame columns whose name starts with any of these
+    prefixes are appended to the key list at runtime.  Useful for bindings-row paths where
+    alias property column names (e.g. ``"tag.name"``) are not known at lowering time.
+    """
+    args: Dict[str, Any] = {"keys": list(keys), "aggregations": list(aggregations)}
+    if key_prefixes is not None:
+        args["key_prefixes"] = list(key_prefixes)
+    return ASTCall("group_by", args)

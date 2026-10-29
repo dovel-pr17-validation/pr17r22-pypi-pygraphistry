@@ -1,0 +1,725 @@
+import pandas as pd
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from graphistry.constants import NODE
+from graphistry.Plottable import Plottable
+from graphistry.util import setup_logger
+logger = setup_logger(__name__)
+
+if TYPE_CHECKING:
+    import igraph
+    import numpy as np
+    from pandas.api.extensions import ExtensionDtype
+    from graphistry.compute.typing import DataFrameT
+
+
+def ensure_pandas(df: Any) -> pd.DataFrame:
+    """Convert to pandas if not already (e.g. cuDF). No-op for pandas.
+
+    Delegates to :func:`graphistry.compute.engine_coercion.ensure_pandas`.
+    Defined here to avoid a circular import at module load time.
+    """
+    from graphistry.compute.engine_coercion import ensure_pandas as _impl
+    return _impl(df)
+
+
+def restore_engine(g: Plottable, original_nodes: Any, original_edges: Any) -> Plottable:
+    """Convert result DataFrames back to the original engine if needed.
+
+    Delegates to :func:`graphistry.compute.engine_coercion.restore_engine`.
+    Defined here to avoid a circular import at module load time.
+    """
+    from graphistry.compute.engine_coercion import restore_engine as _impl
+    return _impl(g, original_nodes, original_edges)
+
+
+def _restore_igraph_large_nullable_ints(
+    df: pd.DataFrame, attributes: Union["igraph.VertexSeq", "igraph.EdgeSeq"],
+    renamed_attributes: Optional[Dict[str, str]] = None,
+) -> pd.DataFrame:
+    """Keep exact nullable integers across igraph's pandas DataFrame export."""
+    repairs = {}
+    for name in attributes.attributes():
+        target = renamed_attributes.get(name, name) if renamed_attributes is not None else name
+        if target not in df or not (
+            pd.api.types.is_float_dtype(df[target].dtype) or pd.api.types.is_object_dtype(df[target].dtype)
+        ):
+            continue
+        if not df[target].isna().any():
+            continue
+        values = attributes[name]
+        non_null = [value for value in values if value is not None and value is not pd.NA]
+        if not non_null or len(non_null) == len(values):
+            continue
+        if not all(isinstance(value, int) and not isinstance(value, bool) for value in non_null):
+            continue
+        if not any(abs(value) > 2**53 for value in non_null):
+            continue
+        dtype = "UInt64" if max(non_null) > 2**63 - 1 else object
+        repairs[target] = pd.Series([None if value is pd.NA else value for value in values], index=df.index, dtype=dtype)
+    return df.assign(**repairs) if repairs else df
+
+
+def _pandas_dtype(df: Optional["DataFrameT"], col: str) -> Optional[Union["np.dtype", "ExtensionDtype"]]:
+    """Pandas dtype of df[col] for any dataframe engine, or None when the column is absent."""
+    if df is None or col not in df.columns:
+        return None
+    return ensure_pandas(df[[col]].head(0))[col].dtype
+
+
+# preferring igraph naming convetions over graphistry.constants
+SRC_IGRAPH = 'source'
+DST_IGRAPH = 'target'
+NODE_IGRAPH = NODE
+RENAMED_NAME_ATTR = 'graphistry.renamed_name_attr'
+
+def from_igraph(self,
+    ig: Any,
+    node_attributes: Optional[List[str]] = None,
+    edge_attributes: Optional[List[str]] = None,
+    load_nodes: bool = True, load_edges: bool = True,
+    merge_if_existing: bool = True
+) -> Plottable:
+    """
+    Convert igraph object into Plotter
+
+    If base g has _node, _source, _destination definitions, use them
+
+    When merge_if_existing with preexisting nodes/edges df and shapes match ig, combine attributes
+
+    For merge_if_existing to work with edges, must set g._edge and have corresponding edge index attribute in igraph.Graph 
+
+    :param ig: Source igraph object
+    :type ig: igraph
+
+    :param node_attributes: Subset of node attributes to load; None means all (default)
+    :type node_attributes: Optional[List[str]]
+
+    :param edge_attributes: Subset of edge attributes to load; None means all (default)
+    :type edge_attributes: Optional[List[str]]
+
+    :param load_nodes: Whether to load nodes dataframe (default True)
+    :type load_nodes: bool
+
+    :param load_edges: Whether to load edges dataframe (default True)
+    :type load_edges: bool
+
+    :param merge_if_existing: Whether to merge with existing node/edge dataframes (default True)
+    :param merge_if_existing: bool
+
+    :returns: Plotter
+
+    **Example: Convert from igraph, including all node/edge properties**
+        ::
+
+            import graphistry, pandas as pd
+            edges = pd.DataFrame({'s': ['a', 'b', 'c', 'd'], 'd': ['b', 'c', 'd', 'e'], 'v': [101, 102, 103, 104]})
+            g = graphistry.edges(edges, 's', 'd').materialize_nodes().get_degrees()
+            assert 'degree' in g._nodes.columns
+            g2 = g.from_igraph(g.to_igraph())
+            assert len(g2._nodes.columns) == len(g._nodes.columns)
+
+    **Example: Enrich from igraph, but only load in 1 node attribute**
+        ::
+
+            import graphistry, pandas as pd
+            edges = pd.DataFrame({'s': ['a', 'b', 'c', 'd'], 'd': ['b', 'c', 'd', 'e'], 'v': [101, 102, 103, 104]})
+            g = graphistry.edges(edges, 's', 'd').materialize_nodes().get_degree()
+            assert 'degree' in g._nodes
+            ig = g.to_igraph(include_nodes=False)
+            assert 'degree' not in ig.vs
+            ig.vs['pagerank'] = ig.pagerank()
+            g2 = g.from_igraph(ig, load_edges=False, node_attributes=[g._node, 'pagerank'])
+            assert 'pagerank' in g2._nodes
+            asssert 'degree' in g2._nodes
+
+    """
+
+    g = self.bind()
+
+    #Compute nodes: need indexing for edges
+
+    node_col = g._node or NODE
+    
+    ig_vs_df = _restore_igraph_large_nullable_ints(ig.get_vertex_dataframe(), ig.vs)
+    nodes_df = ig_vs_df
+    renamed_name_attr = ig[RENAMED_NAME_ATTR] if RENAMED_NAME_ATTR in ig.attributes() else None
+
+
+    if load_nodes:
+
+        if node_col not in nodes_df:
+            #TODO if no g._nodes but 'name' in nodes_df, still use?
+            if ('name' in nodes_df) and (renamed_name_attr in nodes_df):
+                nodes_df = nodes_df.rename(columns={'name': node_col})
+                # igraph widens int IDs and turns category IDs into strings
+                node_dtype = _pandas_dtype(self._nodes, node_col)
+                if node_dtype is not None:
+                    nodes_df[node_col] = nodes_df[node_col].astype(node_dtype)
+            elif (
+                ('name' in nodes_df) and
+                (g._nodes is not None and g._node is not None) and
+                (g._nodes[g._node].dtype.name == nodes_df['name'].dtype.name)
+            ):
+                nodes_df = nodes_df.rename(columns={'name': node_col})
+            elif ('name' in nodes_df) and (g._nodes is None):
+                nodes_df = nodes_df.rename(columns={'name': node_col})
+            else:
+                nodes_df = nodes_df.reset_index().rename(columns={nodes_df.index.name: node_col})
+
+        if renamed_name_attr in nodes_df and 'name' not in nodes_df:
+            nodes_df = nodes_df.rename(columns={renamed_name_attr: 'name'})
+            name_dtype = _pandas_dtype(self._nodes, 'name')
+            if name_dtype is not None:
+                nodes_df['name'] = nodes_df['name'].astype(name_dtype)
+
+        # igraph exports an empty graph's columns as float64
+        if renamed_name_attr is not None and len(nodes_df) == 0 and g._nodes is not None:
+            original_dtypes = ensure_pandas(g._nodes.head(0)).dtypes
+            nodes_df = nodes_df.astype({c: original_dtypes[c] for c in nodes_df.columns if c in original_dtypes})
+
+        if node_attributes is not None:
+            nodes_df = nodes_df[ node_attributes ]
+
+        if g._nodes is not None and merge_if_existing:
+            if g._node is None:
+                raise ValueError('Non-None g._nodes and merge_if_existing=True, yet no g._node is defined')
+            if len(g._nodes) != len(nodes_df):
+                logger.warning('node tables do not match in length; switch merge_if_existing to False or load_nodes to False or add missing nodes')
+
+            g_nodes_trimmed = g._nodes[[x for x in g._nodes if x not in nodes_df or x == g._node]]
+            merged = nodes_df.merge(ensure_pandas(g_nodes_trimmed), how='left', on=g._node)
+            # pandas < 2.1 moves the key column last when the left frame is empty
+            nodes_df = merged[list(nodes_df.columns) + [c for c in merged.columns if c not in nodes_df.columns]]
+
+        nodes_df = nodes_df.reset_index(drop=True)
+        g = g.nodes(nodes_df, node_col)
+
+    # #####
+
+    if load_edges:
+
+        # #####
+
+        #TODO: Reuse for g.nodes(nodes_df) as well?
+
+        if len(ig_vs_df.columns) == 0:
+            node_id_col = None
+        elif node_col in ig_vs_df:
+            node_id_col = node_col
+        elif renamed_name_attr is not None and 'name' in ig_vs_df:
+            node_id_col = 'name'
+        #User to_igraph() with numeric IDs may swizzle id mappings (ex: sparse numeric) so try to un-swizzle
+        #FIXME: how to handle dense edge case's swizzling?
+        elif g._node is not None and g._nodes[g._node].dtype.name == ig_vs_df.reset_index()['vertex ID'].dtype.name:
+            node_id_col = None
+            #FIXME: This seems quite error prone... what if any fields already exist?
+            for c in ['name', 'id', 'idx', NODE]:
+                if c in ig_vs_df.columns:
+                    if g._nodes[g._node].min() == ig_vs_df[c].min() and g._nodes[g._node].max() == ig_vs_df[c].max():
+                        if g._nodes[g._node].sort_values().equals(ig_vs_df[c].sort_values()):
+                            node_id_col = c
+                            break
+            if node_id_col is None:
+                logger.debug('lacks matching sortable dimension, likely passed integers-as-vids, continue without remapping')
+        elif 'name' in ig_vs_df:
+            node_id_col = 'name'
+        else:
+            raise ValueError('Could not determine graphistry node ID column to match igraph nodes on')
+
+        if node_id_col is None:
+            ig_index_to_node_id_df = None
+        else:
+            ig_index_to_node_id_df = ig_vs_df[[node_id_col]].reset_index().rename(columns={'vertex ID': 'ig_index'})
+
+        # #####
+
+        src_col = g._source or SRC_IGRAPH
+        dst_col = g._destination or DST_IGRAPH
+        from graphistry.compute.util import generate_safe_column_name_from
+        edges_df = ig.get_edge_dataframe()
+        renamed_attrs: Dict[str, str] = {}
+        occupied_names = set(edges_df.columns) | {src_col, dst_col}
+
+        # igraph edge attributes named 'source' or 'target' collide with the
+        # endpoint columns from get_edge_dataframe(); endpoints come first,
+        # rename later occurrences so attributes stay accessible.
+        if edges_df.columns.duplicated().any():
+            counts: dict = {}
+            new_cols = []
+            for c in edges_df.columns:
+                n = counts.get(c, 0) + 1
+                counts[c] = n
+                new_name = c
+                if n > 1:
+                    new_name = generate_safe_column_name_from(c, occupied_names, prefix='__attr_', start=n)
+                    occupied_names.add(new_name)
+                    renamed_attrs[c] = new_name
+                new_cols.append(new_name)
+            edges_df.columns = new_cols
+            logger.warning(
+                'igraph edge attribute names collide with endpoint columns; '
+                'renamed duplicate columns to __attr_<name>_<n>__'
+            )
+
+        final_binding_collisions = [
+            attr_name
+            for attr_name in ig.es.attributes()
+            if attr_name not in renamed_attrs and attr_name in {src_col, dst_col}
+        ]
+        for attr_name in ig.es.attributes():
+            if attr_name in renamed_attrs or attr_name not in {src_col, dst_col}:
+                continue
+            fallback_name = generate_safe_column_name_from(attr_name, occupied_names, prefix='__attr_', start=2)
+            occupied_names.add(fallback_name)
+            renamed_attrs[attr_name] = fallback_name
+            edges_df = edges_df.rename(columns={attr_name: fallback_name})
+        if final_binding_collisions:
+            logger.warning(
+                'igraph edge attribute names collide with final endpoint bindings; '
+                'renamed attributes to __attr_<name>_<n>__'
+            )
+        edges_df = _restore_igraph_large_nullable_ints(edges_df, ig.es, renamed_attrs)
+
+        if len(edges_df) == 0 and g._nodes is not None and g._node in g._nodes:
+            # igraph exports an empty edge list's endpoints as float64
+            node_id_dtype = _pandas_dtype(g._nodes, g._node)
+            edges_df = edges_df.astype({'source': node_id_dtype, 'target': node_id_dtype})
+        elif ig_index_to_node_id_df is not None:
+            edges_df['source'] = edges_df[['source']].merge(
+                ig_index_to_node_id_df.rename(columns={'ig_index': 'source'}),
+                how='left',
+                on='source'
+            )[node_id_col]
+            edges_df['target'] = edges_df[['target']].merge(
+                ig_index_to_node_id_df.rename(columns={'ig_index': 'target'}),
+                how='left',
+                on='target'
+            )[node_id_col]
+
+        if renamed_name_attr is not None:
+            for ig_col, col in [('source', src_col), ('target', dst_col)]:
+                endpoint_dtype = _pandas_dtype(self._edges, col)
+                if endpoint_dtype is not None:
+                    edges_df[ig_col] = edges_df[ig_col].astype(endpoint_dtype)
+
+        endpoint_cols_after_rename = {src_col, dst_col}
+        restored_attrs = {
+            renamed_name: original_name
+            for original_name, renamed_name in renamed_attrs.items()
+            if original_name not in endpoint_cols_after_rename
+        }
+        edges_df = edges_df.rename(columns={
+            'source': src_col,
+            'target': dst_col,
+            **restored_attrs
+        })
+
+        if edge_attributes is not None:
+            edges_df = edges_df[ edge_attributes ]
+
+        if g._edges is not None and merge_if_existing:
+
+            g_indexed = g
+
+            if g._edge is None:
+                g_indexed = g.edges(
+                    g._edges.reset_index().rename(columns={g._edges.index.name or 'index': '__edge_index__'}),
+                    g._source, g._destination, '__edge_index__'
+                )
+                logger.warning('edge index g._edge not set so using edge index as ID; set g._edge via g.edges(), or change merge_if_existing to False')
+
+            if g_indexed._edge not in edges_df:
+                logger.warning('edge index g._edge %s missing as attribute in ig; using ig edge order for IDs', g_indexed._edge)
+                edges_df = edges_df.reset_index().rename(columns={edges_df.index.name or 'index': g_indexed._edge})
+
+            if len(g_indexed._edges.columns) == 3 and (len(g_indexed._edges) == len(edges_df)):
+                #opt: skip merge: no old columns
+                pass
+            elif ((len(edges_df.columns) == 3) or len(edges_df.columns) == 0) and (len(g._edges) == len(edges_df)):
+                #opt: skip merge: no new columns
+                edges_df = g._edges
+            else:
+                if len(g._edges) != len(edges_df):
+                    logger.warning('edge tables do not match in length; switch merge_if_existing to False or load_edges to False or add missing edges')
+                g_edges_trimmed = g_indexed._edges[[x for x in g_indexed._edges if x not in edges_df or x == g_indexed._edge]]
+                edges_df = edges_df.merge(ensure_pandas(g_edges_trimmed), how='left', on=g_indexed._edge)
+
+            if g._edge is None:
+                edges_df = edges_df[[x for x in edges_df if x != g_indexed._edge]]
+
+        g = g.edges(edges_df, src_col, dst_col)
+
+    return g
+
+
+def to_igraph(
+    self: Plottable, 
+    directed: bool = True,
+    include_nodes: bool = True,
+    node_attributes: Optional[List[str]] = None,
+    edge_attributes: Optional[List[str]] = None,
+    use_vids: bool = False
+) -> Any:
+    """Convert current item to igraph Graph . See examples in from_igraph.
+
+    igraph is a CPU-only library. cuDF DataFrames are automatically converted to pandas before
+    being passed to igraph. For a GPU-native alternative, see :meth:`to_cugraph`.
+
+    igraph reserves the vertex attribute ``name`` for node IDs. A node attribute called ``name``,
+    other than the node ID column, is stored under a generated name such as ``__attr_name_2__``,
+    and the graph attribute ``graphistry.renamed_name_attr`` records that name so
+    :meth:`from_igraph` can restore the column. This does not apply when ``use_vids=True``.
+
+    :param directed: Whether to create a directed graph (default True)
+    :type directed: bool
+
+    :param include_nodes: Whether to ingest the nodes table, if it exists (default True)
+    :type include_nodes: bool
+
+    :param node_attributes: Which node attributes to load, None means all (default None)
+    :type node_attributes: Optional[List[str]]
+
+    :param edge_attributes: Which edge attributes to load, None means all (default None)
+    :type edge_attributes: Optional[List[str]]
+
+    :param use_vids: Whether to interpret IDs as igraph vertex IDs, which must be non-negative integers (default False)
+    :type use_vids: bool
+
+    """
+    import igraph
+
+    g = self.bind()
+    if not include_nodes and self._nodes is not None:
+        g._node = None
+        g._nodes = None
+
+    #otherwise, if no nodes, ig adds extra column 'name' to vertices
+    g = g.materialize_nodes()
+
+    #igraph expects src/dst first
+    edge_attrs = g._edges.columns if edge_attributes is None else edge_attributes
+    edge_attrs = [x for x in edge_attrs if x not in [g._source, g._destination]]
+    edges_df = ensure_pandas(g._edges[[g._source, g._destination] + edge_attrs])
+    if edges_df[[g._source, g._destination]].isna().any().any():
+        raise ValueError("igraph cannot preserve null edge endpoint IDs")
+
+    #igraph expects node first
+    node_attrs = g._nodes if node_attributes is None else node_attributes
+    node_attrs = [x for x in node_attrs if x != g._node]
+    nodes_df = ensure_pandas(g._nodes[[g._node] + node_attrs])
+    if nodes_df[g._node].isna().any():
+        raise ValueError("igraph cannot preserve null node IDs")
+
+    # igraph reserves 'name' for node IDs; from_igraph restores the original column
+    renamed_name_attr = None
+    if not use_vids and 'name' in node_attrs:
+        from graphistry.compute.util import generate_safe_column_name_from
+        renamed_name_attr = generate_safe_column_name_from('name', nodes_df.columns, prefix='__attr_', start=2)
+        nodes_df = nodes_df.rename(columns={'name': renamed_name_attr})
+        logger.debug('igraph node attribute name collides with node IDs; renamed it to %s', renamed_name_attr)
+
+    ig = igraph.Graph.DataFrame(
+        edges_df, directed=directed, vertices=nodes_df, use_vids=use_vids
+    )
+    if renamed_name_attr is not None:
+        ig[RENAMED_NAME_ATTR] = renamed_name_attr
+    return ig
+
+
+compute_algs: List[str] = [
+    'articulation_points',
+    'authority_score',
+    'betweenness',
+    'bibcoupling',
+    #'biconnected_components',
+    #'bipartite_projection',
+    'harmonic_centrality',
+    'closeness',
+    'clusters',
+    'cocitation',
+    'community_edge_betweenness',
+    'community_fastgreedy',
+    'community_infomap',
+    'community_label_propagation',
+    #'community_leading_eigenvector_naive',  # in docs but not in code?
+    'community_leading_eigenvector',
+    'community_leiden',
+    'community_multilevel',
+    'community_optimal_modularity',
+    'community_spinglass',
+    'community_walktrap',
+    'constraint',
+    'coreness',
+    'gomory_hu_tree',
+    'harmonic_centrality',
+    'hub_score',
+    'eccentricity',
+    'eigenvector_centrality',
+    'k_core',
+    #'modularity',
+    'pagerank',
+    'personalized_pagerank',
+    'spanning_tree'
+]
+
+def compute_igraph(
+    self: Plottable,
+    alg: str,
+    out_col: Optional[str] = None,
+    directed: Optional[bool] = None,
+    use_vids=False,
+    params: dict = {},
+    stringify_rich_types=True
+) -> Plottable:
+    """Enrich or replace graph using igraph methods
+
+    igraph is a CPU-only library. cuDF DataFrames are automatically converted to pandas
+    before calling igraph, and the result is converted back. Polars frames (eager or lazy)
+    also run on pandas and come back as eager Polars frames with their identifier dtypes.
+    For a GPU-native alternative, see :meth:`compute_cugraph`.
+
+    :param alg: Name of an igraph.Graph method like `pagerank`
+    :type alg: str
+
+    :param out_col: For algorithms that generate a node attribute column, `out_col` is the desired output column name. When `None`, use the algorithm's name. (default None)
+    :type out_col: Optional[str]
+
+    :param directed: During the to_igraph conversion, whether to be directed. If None, try directed and then undirected. (default None)
+    :type directed: Optional[bool]
+
+    :param use_vids: During the to_igraph conversion, whether to interpret IDs as igraph vertex IDs (non-negative integers) or arbitrary values (False, default)
+    :type use_vids: bool
+
+    :param params: Any named parameters to pass to the underlying igraph method
+    :type params: dict
+
+    :param stringify_rich_types: When rich types like igraph.Graph are returned, which may be problematic for downstream rendering, coerce them to strings
+    :type stringify_rich_types: bool 
+
+    :returns: Plotter
+    :rtype: Plotter
+
+    **Example: Pagerank**
+        ::
+
+            import graphistry, pandas as pd
+            edges = pd.DataFrame({'s': ['a','b','c','d'], 'd': ['c','c','e','e']})
+            g = graphistry.edges(edges, 's', 'd').materialize_nodes()
+            g2 = g.compute_igraph('pagerank')
+            assert 'pagerank' in g2._nodes.columns
+
+    **Example: Pagerank with custom name**
+        ::
+
+            import graphistry, pandas as pd
+            edges = pd.DataFrame({'s': ['a','b','c','d'], 'd': ['c','c','e','e']})
+            g = graphistry.edges(edges, 's', 'd').materialize_nodes()
+            g2 = g.compute_igraph('pagerank', out_col='my_pr')
+            assert 'my_pr' in g2._nodes.columns
+
+    **Example: Pagerank on an undirected**
+        ::
+
+            import graphistry, pandas as pd
+            edges = pd.DataFrame({'s': ['a','b','c','d'], 'd': ['c','c','e','e']})
+            g = graphistry.edges(edges, 's', 'd').materialize_nodes()
+            g2 = g.compute_igraph('pagerank', directed=False)
+            assert 'pagerank' in g2._nodes.columns
+
+    **Example: Pagerank with custom parameters**
+        ::
+
+                import graphistry, pandas as pd
+                edges = pd.DataFrame({'s': ['a','b','c','d'], 'd': ['c','c','e','e']})
+                g = graphistry.edges(edges, 's', 'd').materialize_nodes()
+                g2 = g.compute_igraph('pagerank', params={'damping': 0.85})
+                assert 'pagerank' in g2._nodes.columns
+
+    **Example: Personalized Pagerank**
+        ::
+
+            import graphistry, pandas as pd
+            edges = pd.DataFrame({'s': ['a','b','c','d'], 'd': ['c','c','e','e']})
+            g = graphistry.edges(edges, 's', 'd').materialize_nodes()
+            g2 = g.compute_igraph('personalized_pagerank')
+            assert 'personalized_pagerank' in g2._nodes.columns
+
+    """
+
+    import igraph
+
+    if alg not in compute_algs:
+        raise ValueError(f'Unexpected parameter alg "{alg}" does not correspond to a known igraph graph.*() algorithm like "pagerank"')
+
+    if out_col is None:
+        out_col = alg
+
+    original_nodes = self._nodes
+    original_edges = self._edges
+
+    try:
+        ig = self.to_igraph(directed=True if directed is None else directed, use_vids=use_vids)
+        out = getattr(ig, alg)(**params)
+    except NotImplementedError as e:
+        if directed is None:
+            ig = self.to_igraph(directed=False, use_vids=use_vids)
+            out = getattr(ig, alg)(**params)
+        else:
+            raise e
+
+    if isinstance(out, igraph.clustering.VertexClustering):
+        clustering = out.membership
+    elif isinstance(out, igraph.clustering.VertexDendrogram):
+        clustering = out.as_clustering().membership
+    elif isinstance(out, igraph.Graph):
+        return restore_engine(from_igraph(self, out), original_nodes, original_edges)
+    elif isinstance(out, list) and self._nodes is None:
+        raise ValueError("No g._nodes table found; use .bind(), .nodes(), .materialize_nodes()")
+    elif alg == 'articulation_points':
+        assert isinstance(out, list)  # List[int]
+        membership = [0] * len(ig.vs)
+        for i in out:
+            membership[i] = 1
+        clustering = membership
+    elif isinstance(out, list) and len(out) == len(self._nodes):
+        if stringify_rich_types and len(out) > 0 and all((isinstance(c, igraph.Graph) for c in out)):
+            #ex: k_core
+            clustering = [str(c) for c in out]
+        else:
+            clustering = out
+    else:
+        if isinstance(out, list) and len(out) > 0:
+            xtra = f" (element 0 type: {type(out[0])})"
+        else:
+            xtra = ""
+
+        raise RuntimeError(f'Unexpected output type "{type(out)}"{xtra}; should be VertexClustering, VertexDendrogram, Graph, or list_<|V|>')
+
+    ig.vs[out_col] = clustering
+
+    return restore_engine(self.from_igraph(ig), original_nodes, original_edges)
+
+
+layout_algs: List[str] = [
+    'auto', 'automatic',
+    'bipartite',
+    'circle', 'circular',
+    #'connected_components',
+    'dh', 'davidson_harel',
+    'drl',
+    'drl_3d',
+    'fr', 'fruchterman_reingold',
+    'fr_3d', 'fr3d', 'fruchterman_reingold_3d',
+    'grid',
+    'grid_3d',
+    'graphopt',
+    'kk', 'kamada_kawai',
+    'kk_3d', 'kk3d', 'kamada_kawai_3d',
+    'lgl', 'large', 'large_graph',
+    'mds',
+    'random', 'random_3d',
+    'rt', 'tree', 'reingold_tilford',
+    'rt_circular', 'reingold_tilford_circular',
+    'sphere', 'spherical', 'circle_3d', 'circular_3d',
+    'star',
+    'sugiyama',
+    #'umap'
+]
+
+def layout_igraph(
+    self: Plottable,
+    layout: str,
+    directed: Optional[bool] = None,
+    use_vids: bool = False,
+    bind_position: bool = True,
+    x_out_col: str = 'x',
+    y_out_col: str = 'y',
+    play: Optional[int] = 0,
+    params: dict = {}
+) -> Plottable:
+    """Compute graph layout using igraph algorithm. For a list of layouts, see layout_algs or igraph documentation.
+
+    igraph is a CPU-only library. cuDF DataFrames are automatically converted to pandas
+    before calling igraph, and the result is converted back. For a GPU-native alternative,
+    see :meth:`layout_cugraph`.
+
+    :param layout: Name of an igraph.Graph.layout method like `sugiyama`
+    :type layout: str
+
+    :param directed: During the to_igraph conversion, whether to be directed. If None, try directed and then undirected. (default None)
+    :type directed: Optional[bool]
+
+    :param use_vids: Whether to use igraph vertex ids (non-negative integers) or arbitary node ids (False, default)
+    :type use_vids: bool
+
+    :param bind_position: Whether to call bind(point_x=, point_y=) (default True)
+    :type bind_position: bool
+
+    :param x_out_col: Attribute to write x position to. (default 'x')
+    :type x_out_col: str
+
+    :param y_out_col: Attribute to write x position to. (default 'y')
+    :type y_out_col: str
+
+    :param play: If defined, set settings(url_params={'play': play}). (default 0)
+    :type play: Optional[str]
+
+    :param params: Any named parameters to pass to the underlying igraph method
+    :type params: dict
+
+    :returns: Plotter
+    :rtype: Plotter
+
+    **Example: Sugiyama layout**
+        ::
+
+            import graphistry, pandas as pd
+            edges = pd.DataFrame({'s': ['a','b','c','d'], 'd': ['b','c','d','e']})
+            g = graphistry.edges(edges, 's', 'd')
+            g2 = g.layout_igraph('sugiyama')
+            assert 'x' in g2._nodes
+            g2.plot()
+
+    **Example: Change which column names are generated**
+        ::
+
+            import graphistry, pandas as pd
+            edges = pd.DataFrame({'s': ['a','b','c','d'], 'd': ['b','c','d','e']})
+            g = graphistry.edges(edges, 's', 'd')
+            g2 = g.layout_igraph('sugiyama', x_out_col='my_x', y_out_col='my_y')
+            assert 'my_x' in g2._nodes
+            assert g2._point_x == 'my_x'
+            g2.plot()
+
+    **Example: Pass parameters to layout methods - Sort nodes by degree**
+        ::
+        
+            import graphistry, pandas as pd
+            edges = pd.DataFrame({'s': ['a','b','c','d'], 'd': ['b','c','d','e']})
+            g = graphistry.edges(edges, 's', 'd')
+            g2 = g.get_degrees()
+            assert 'degree' in g._nodes.columns
+            g3 = g.layout_igraph('sugiyama', params={'layers': 'degree'})
+            g3.plot()
+    """
+
+    original_nodes = self._nodes
+    original_edges = self._edges
+
+    try:
+        ig = self.to_igraph(directed=True if directed is None else directed, use_vids=use_vids)
+        layout_df = pd.DataFrame([x for x in ig.layout(layout, **params)])
+    except NotImplementedError as e:
+        if directed is None:
+            ig = self.to_igraph(directed=False, use_vids=use_vids)
+            layout_df = pd.DataFrame([x for x in ig.layout(layout, **params)])
+        else:
+            raise e
+
+    g2 = self.from_igraph(ig)
+    g2 = g2.nodes(g2._nodes.assign(**{x_out_col: layout_df[0], y_out_col: layout_df[1]}))
+    if bind_position:
+        g2 = g2.bind(point_x=x_out_col, point_y=y_out_col)
+    if play is not None:
+        g2 = g2.layout_settings(play=play)
+    return restore_engine(g2, original_nodes, original_edges)

@@ -1,0 +1,490 @@
+from typing import Any, Callable, ClassVar, Dict, Tuple, TYPE_CHECKING, Union, cast
+from datetime import date, time
+import operator
+import numpy as np
+import pandas as pd
+
+from graphistry.compute.ast_temporal import DateTimeValue, DateValue, TemporalValue, TimeValue, _resolve_timezone
+from graphistry.compute.typing import SeriesT
+from graphistry.models.gfql.coercions.temporal import to_ast
+from graphistry.models.gfql.types.guards import is_any_temporal, is_native_numeric, is_string
+from graphistry.models.gfql.types.predicates import BetweenBoundInput, ComparisonInput
+from graphistry.utils.json import JSONVal
+from .ASTPredicate import ASTPredicate
+
+if TYPE_CHECKING:
+    # Note: pd.Series[T] syntax not supported in Python 3.8
+    pass
+
+
+class ComparisonPredicate(ASTPredicate):
+    """Base class for comparison predicates that support both numeric and temporal values"""
+    
+    def __init__(self, val: ComparisonInput) -> None:
+        self.val = self._normalize_value(val)
+    
+    def _normalize_value(
+        self, val: ComparisonInput
+    ) -> Union[int, float, np.number, TemporalValue, str]:
+        """Convert various input types to internal representation"""
+        # Numerics stay scalar; bare numeric-vs-datetime is E302; epochs are DateTimeValue.
+        if is_native_numeric(val):
+            return val
+        elif is_any_temporal(val):
+            # to_ast always returns TemporalValue for valid temporal inputs
+            temporal_val = to_ast(val)
+            return temporal_val
+        elif is_string(val):
+            raise ValueError(
+                f"Raw string '{val}' is ambiguous. Use:\n"
+                f"  - pd.Timestamp('{val}') for datetime\n"
+                f"  - {{'type': 'datetime', 'value': '{val}'}} for explicit type"
+            )
+        else:
+            raise TypeError(f"Unsupported type for {self.__class__.__name__}: {type(val)}")
+    
+    def _prepare_temporal_series(self, s: SeriesT, temporal_val: TemporalValue) -> SeriesT:
+        """Prepare series for temporal comparison by extracting/converting as needed"""
+        if isinstance(temporal_val, DateTimeValue):
+            # Normalize series to target timezone for comparison
+            if hasattr(s, 'dt') and hasattr(s.dt, 'tz_localize'):
+                tzinfo = _resolve_timezone(temporal_val.timezone) or temporal_val.timezone
+                if getattr(s.dt, 'tz', None) is None:
+                    result = s.dt.tz_localize('UTC').dt.tz_convert(tzinfo)
+                else:
+                    result = s.dt.tz_convert(tzinfo)
+                # cudf does not support binary ops on tz-aware Series (RAPIDS 26.02+);
+                # strip tz after conversion — values are already in the target timezone
+                if hasattr(result, '__module__') and 'cudf' in result.__module__:
+                    result = result.dt.tz_localize(None)
+                return result
+            return s
+
+        elif isinstance(temporal_val, DateValue):
+            # Day-truncate on every engine: cudf raises NotImplementedError before capability checks.
+            if hasattr(s, 'dt'):
+                return s.dt.floor('D')
+            return s
+
+        elif isinstance(temporal_val, TimeValue):
+            # Time-of-day as a timedelta rather than .dt.time, which raises the same
+            # way on cudf 26.02. Same reasoning as the date lane above.
+            if hasattr(s, 'dt'):
+                return s - s.dt.floor('D')
+            return s
+
+        raise TypeError(f"Unknown temporal value type: {type(temporal_val)}")
+
+    def _get_temporal_comparison_value(self, temporal_val: TemporalValue) -> Union[pd.Timestamp, date, time]:
+        """Get the appropriate comparison value from a TemporalValue"""
+        if isinstance(temporal_val, DateTimeValue):
+            return temporal_val.as_pandas_value()
+        elif isinstance(temporal_val, (DateValue, TimeValue)):
+            return temporal_val._parsed
+        raise TypeError(f"Unknown temporal value type: {type(temporal_val)}")
+
+    def _prepare_temporal_comparison(self, s: SeriesT, temporal_val: TemporalValue):
+        """Prepare both series and comparison value for temporal comparison.
+
+        Handles cudf compatibility: when the series had tz stripped (because cudf
+        does not support tz-aware binary ops), also strip tz from the scalar.
+        """
+        prepared_s = self._prepare_temporal_series(s, temporal_val)
+        comparison_val = self._get_temporal_comparison_value(temporal_val)
+        # Match: if series was made tz-naive for cudf, make scalar naive too
+        if (
+            hasattr(prepared_s, '__module__') and 'cudf' in prepared_s.__module__
+            and isinstance(comparison_val, pd.Timestamp)
+            and comparison_val.tzinfo is not None
+        ):
+            comparison_val = comparison_val.tz_localize(None)
+        # Pair the scalar with the dtype the truncation produced (cudf 26.02 lanes):
+        # day-truncated datetime64 pairs with a midnight Timestamp; time-of-day
+        # timedelta64 pairs with a Timedelta. dtype-driven, so engine-agnostic.
+        dtype_txt = str(getattr(prepared_s, 'dtype', '')).lower()
+        if isinstance(temporal_val, DateValue) and dtype_txt.startswith('datetime64'):
+            comparison_val = pd.Timestamp(comparison_val)
+        elif (isinstance(temporal_val, TimeValue) and dtype_txt.startswith('timedelta64')
+                and isinstance(comparison_val, time)):
+            comparison_val = pd.Timedelta(
+                hours=comparison_val.hour, minutes=comparison_val.minute,
+                seconds=comparison_val.second, microseconds=comparison_val.microsecond)
+        return prepared_s, comparison_val
+
+    @staticmethod
+    def _series_is_datetime(s: SeriesT) -> bool:
+        """Whether a pandas/cuDF series is stored as datetime64-like."""
+        dtype = getattr(s, "dtype", None)
+        return bool(dtype is not None and pd.api.types.is_datetime64_any_dtype(dtype))
+
+    @staticmethod
+    def _raise_numeric_datetime_mismatch(s: SeriesT) -> None:
+        """Reject the historically silent numeric-vs-datetime comparison."""
+        from graphistry.compute.exceptions import ErrorCode, GFQLSchemaError
+
+        raise GFQLSchemaError(
+            ErrorCode.E302,
+            "Type mismatch: datetime column cannot be compared to a numeric value",
+            field=getattr(s, "name", None),
+            value=None,
+            column_type=str(getattr(s, "dtype", "")),
+            suggestion=(
+                'Use a typed datetime value (for example {"type": "datetime", '
+                '"value": "2020-01-09T00:00:00", "timezone": "UTC"}) or an explicit '
+                'UTC epoch instant {"type": "datetime", "value": 1578528000000, '
+                '"unit": "ms"} (unit "s" or "ms"; no default unit)'
+            ),
+        )
+
+    def _safe_scalar_compare(
+        self, s: SeriesT, op: Callable[[Any, Any], Any]
+    ) -> SeriesT:
+        """Compare scalars while treating incomparable mixed values as null/False.
+
+        Cypher null semantics require mixed-type comparison cells (e.g., int vs str)
+        to not crash query execution; they simply do not satisfy the predicate.
+        """
+        try:
+            return op(s, self.val)
+        except TypeError:
+            def _cmp_cell(cell: Any) -> bool:
+                if pd.isna(cell):
+                    return False
+                try:
+                    out = op(cell, self.val)
+                except TypeError:
+                    return False
+                if pd.isna(out):
+                    return False
+                return bool(out)
+
+            if isinstance(s, pd.Series):
+                return cast(SeriesT, s.map(_cmp_cell))
+
+            # cuDF path: TypeError here is dtype-level incompatibility in current
+            # RAPIDS builds; emit an all-False mask to preserve Cypher filter
+            # semantics without host round-trips (which can crash in some setups).
+            if hasattr(s, "to_pandas") and s.__class__.__module__.startswith("cudf"):
+                return cast(SeriesT, s.notna() & False)
+
+            raise
+    
+    
+    def _validate_fields(self) -> None:
+        """Validate predicate fields."""
+        from graphistry.compute.exceptions import ErrorCode, GFQLTypeError
+        
+        if not isinstance(self.val, (int, float, TemporalValue)):
+            raise GFQLTypeError(
+                ErrorCode.E201,
+                "val must be numeric or temporal",
+                field="val",
+                value=type(self.val).__name__,
+                suggestion="Use numeric values or temporal objects"
+            )
+    
+    def to_json(self, validate=True) -> dict:
+        """Serialize maintaining backward compatibility"""
+        if validate:
+            self.validate()
+        
+        result: Dict[str, JSONVal] = {"type": self.__class__.__name__}
+        
+        if isinstance(self.val, TemporalValue):
+            # to_json() returns a dict, not a string
+            val_dict = self.val.to_json()
+            result["val"] = cast(JSONVal, val_dict)
+        else:
+            result["val"] = cast(JSONVal, self.val)
+        
+        return result
+
+
+# For backward compatibility - keep but deprecated
+class NumericASTPredicate(ComparisonPredicate):
+    """Deprecated: Use ComparisonPredicate instead"""
+    pass
+
+###
+
+class _StringAllowingComparisonMixin:
+    """Mixin that lets subclasses of ``ComparisonPredicate`` accept raw strings.
+
+    The base ``ComparisonPredicate`` rejects raw strings to force users of
+    the IR-direct API to disambiguate string vs. datetime intent (e.g.
+    ``pd.Timestamp("2024-01-15")`` vs. literal ``"2024-01-15"``).  For
+    Cypher-sourced predicates the type is already unambiguous: a Cypher
+    quoted literal ``'value'`` is unambiguously a string, and Cypher
+    datetime literals use ``datetime('...')``.  Lexicographic comparison
+    on strings is well-defined (pandas Series ``>``/``<``/``==``/``!=``
+    operate elementwise on strings), so all comparison ops should accept
+    strings.
+
+    ``EQ`` predates this mixin with an inline override; the other
+    comparison ops (``NE`` / ``GT`` / ``LT`` / ``GE`` / ``LE``) gain
+    string acceptance through this mixin in #1031 — Earley's broader
+    unification of label + comparison through ``where_predicates``
+    surfaces every comparison-with-string-literal Cypher query.
+    """
+
+    def _normalize_value(self, val):  # type: ignore[no-untyped-def]
+        if is_string(val):
+            return val
+        return super()._normalize_value(val)  # type: ignore[misc]
+
+    def _validate_fields(self) -> None:
+        from graphistry.compute.exceptions import ErrorCode, GFQLTypeError
+        if not isinstance(self.val, (int, float, TemporalValue, str)):  # type: ignore[attr-defined]
+            raise GFQLTypeError(
+                ErrorCode.E201,
+                "val must be numeric, temporal, or string",
+                field="val",
+                value=type(self.val).__name__,  # type: ignore[attr-defined]
+                suggestion="Use numeric/temporal values or strings",
+            )
+
+
+class _ScalarTemporalComparison(_StringAllowingComparisonMixin, ComparisonPredicate):
+    op: ClassVar[Any]
+    safe_scalar_compare: ClassVar[bool] = True
+
+    @staticmethod
+    def _series_is_boolean(s: SeriesT) -> bool:
+        if pd.api.types.is_bool_dtype(s.dtype):
+            return True
+        if isinstance(s, pd.Series) and pd.api.types.is_object_dtype(s.dtype):
+            non_null = s.dropna()
+            return len(non_null) > 0 and bool(non_null.map(lambda v: isinstance(v, bool)).all())
+        return False
+
+    def _orders_boolean_series_against_number(self, s: SeriesT) -> bool:
+        """Ordering a Boolean series against a number is incomparable, so it never satisfies."""
+        return (
+            not isinstance(self.val, bool)
+            and isinstance(self.val, (int, float))
+            and self._series_is_boolean(s)
+        )
+
+    def __call__(self, s: SeriesT) -> SeriesT:
+        if isinstance(self.val, (int, float, str)):
+            if self._orders_boolean_series_against_number(s):
+                return s.notna() & False
+            if isinstance(self.val, (int, float, np.number)) and not isinstance(self.val, bool) and self._series_is_datetime(s):
+                # A bare numeric bound is never implicitly an instant (no default unit
+                # to guess); explicit epoch instants are typed DateTimeValue values.
+                self._raise_numeric_datetime_mismatch(s)
+            return (
+                self._safe_scalar_compare(s, type(self).op)
+                if self.safe_scalar_compare
+                else type(self).op(s, self.val)
+            )
+        elif isinstance(self.val, TemporalValue):
+            prepared_s, comparison_val = self._prepare_temporal_comparison(s, self.val)
+            return type(self).op(prepared_s, comparison_val)
+        else:
+            raise TypeError(f"Unexpected value type: {type(self.val)}")
+
+
+class GT(_ScalarTemporalComparison):
+    op = staticmethod(operator.gt)
+
+def gt(val: ComparisonInput) -> GT:
+    """
+    Return whether a given value is greater than a threshold
+    """
+    return GT(val)
+
+class LT(_ScalarTemporalComparison):
+    op = staticmethod(operator.lt)
+
+def lt(val: ComparisonInput) -> LT:
+    """
+    Return whether a given value is less than a threshold
+    """
+    return LT(val)
+
+class GE(_ScalarTemporalComparison):
+    op = staticmethod(operator.ge)
+
+def ge(val: ComparisonInput) -> GE:
+    """
+    Return whether a given value is greater than or equal to a threshold
+    """
+    return GE(val)
+
+class LE(_ScalarTemporalComparison):
+    op = staticmethod(operator.le)
+
+def le(val: ComparisonInput) -> LE:
+    """
+    Return whether a given value is less than or equal to a threshold
+    """
+    return LE(val)
+
+class EQ(_ScalarTemporalComparison):
+    op = staticmethod(operator.eq)
+    safe_scalar_compare = False
+
+def eq(val: ComparisonInput) -> EQ:
+    """
+    Return whether a given value is equal to a threshold.
+
+    Accepts:
+    - Numeric values (int, float, np.number, bool)
+    - Temporal values (datetime/date/time/pd.Timestamp, temporal wire dicts, TemporalValue)
+    - Strings (e.g., eq("active"))
+
+    For null checks, use `isna()` / `notna()` instead.
+    """
+    return EQ(val)
+
+class NE(_ScalarTemporalComparison):
+    op = staticmethod(operator.ne)
+    safe_scalar_compare = False
+
+    def __call__(self, s: SeriesT) -> SeriesT:
+        # openCypher/SQL three-valued logic: `null <> x` is NULL, so a NULL cell is NOT a match
+        # (an unknown value cannot be proven unequal to x). pandas `NaN != x` returns True, which
+        # would wrongly KEEP the null; AND with notna() so a null is excluded — matching cuDF and
+        # the polars engine. The other comparisons (eq/gt/lt/ge/le) already drop nulls (their
+        # operator returns False on a null cell).
+        mask = super().__call__(s)
+        return mask & s.notna()
+
+def ne(val: ComparisonInput) -> NE:
+    """
+    Return whether a given value is not equal to a threshold.
+
+    Follows openCypher/SQL three-valued logic: a NULL/NA cell is NOT a match (``null <> x`` is
+    unknown), so null rows are excluded — the same as ``eq`` and the other comparisons.
+    """
+    return NE(val)
+
+class Between(ASTPredicate):
+    def __init__(self, lower: BetweenBoundInput, 
+                 upper: BetweenBoundInput, 
+                 inclusive: bool = True) -> None:
+        # Store original inputs for creating sub-predicates
+        self.lower_input = lower
+        self.upper_input = upper
+        # Store normalized values for type checking
+        self.lower = self._normalize_value(lower)
+        self.upper = self._normalize_value(upper)
+        self.inclusive = inclusive
+
+    def _normalize_value(
+        self, val: BetweenBoundInput
+    ) -> Union[int, float, np.number, TemporalValue, str]:
+        # Delegates to ComparisonPredicate's normalizer (Between is not a subclass, hence the
+        # arg-type ignore for the borrowed self). That method raises on str, so a str is never
+        # actually returned for Between's numeric/temporal bounds — but the return type must
+        # match the delegated method's declared union (incl. str) to type-check; __call__'s
+        # isinstance(int/float/TemporalValue) guards route any non-numeric/temporal to a raise.
+        return ComparisonPredicate._normalize_value(self, val)  # type: ignore[arg-type]
+
+    def __call__(self, s: SeriesT) -> SeriesT:
+        # Check if both bounds are same type
+        lower_is_temporal = isinstance(self.lower, TemporalValue)
+        upper_is_temporal = isinstance(self.upper, TemporalValue)
+        
+        if isinstance(self.lower, (int, float)) and isinstance(self.upper, (int, float)):
+            # Numeric comparison. A bare numeric bound is never implicitly an
+            # instant; datetime columns require typed datetime bounds.
+            if ComparisonPredicate._series_is_datetime(s):
+                ComparisonPredicate._raise_numeric_datetime_mismatch(s)
+            if self.inclusive:
+                return (s >= self.lower) & (s <= self.upper)
+            else:
+                return (s > self.lower) & (s < self.upper)
+        
+        elif lower_is_temporal and upper_is_temporal:
+            # Temporal comparison
+            # Create comparison predicates using original inputs
+            ge_pred = GE(self.lower_input)
+            le_pred = LE(self.upper_input)
+            gt_pred = GT(self.lower_input)
+            lt_pred = LT(self.upper_input)
+            
+            if self.inclusive:
+                return ge_pred(s) & le_pred(s)
+            else:
+                return gt_pred(s) & lt_pred(s)
+        
+        else:
+            raise TypeError("Between requires both bounds to be same type (numeric or temporal)")
+        
+    def _validate_fields(self) -> None:
+        """Validate predicate fields."""
+        from graphistry.compute.exceptions import ErrorCode, GFQLTypeError
+        
+        # Check types match
+        lower_is_numeric = isinstance(self.lower, (int, float))
+        upper_is_numeric = isinstance(self.upper, (int, float))
+        lower_is_temporal = isinstance(self.lower, TemporalValue)
+        upper_is_temporal = isinstance(self.upper, TemporalValue)
+        
+        if not ((lower_is_numeric and upper_is_numeric) or (lower_is_temporal and upper_is_temporal)):
+            raise GFQLTypeError(
+                ErrorCode.E201,
+                "Between requires both bounds to be same type (numeric or temporal)",
+                field="bounds",
+                value=f"lower={type(self.lower).__name__}, upper={type(self.upper).__name__}"
+            )
+        
+        if not isinstance(self.inclusive, bool):
+            raise GFQLTypeError(
+                ErrorCode.E201,
+                "inclusive must be boolean",
+                field="inclusive",
+                value=type(self.inclusive).__name__
+            )
+
+    
+    def to_json(self, validate=True) -> dict:
+        """Serialize maintaining backward compatibility"""
+        if validate:
+            self.validate()
+        
+        result: Dict[str, JSONVal] = {"type": self.__class__.__name__, "inclusive": self.inclusive}
+        
+        # Serialize lower/upper based on type
+        if isinstance(self.lower, TemporalValue):
+            result["lower"] = cast(JSONVal, self.lower.to_json())
+        else:
+            result["lower"] = cast(JSONVal, self.lower)
+            
+        if isinstance(self.upper, TemporalValue):
+            result["upper"] = cast(JSONVal, self.upper.to_json())
+        else:
+            result["upper"] = cast(JSONVal, self.upper)
+            
+        return result
+
+def between(lower: BetweenBoundInput, 
+            upper: BetweenBoundInput, 
+            inclusive: bool = True) -> Between:
+    """
+    Return whether a given value is between a lower and upper threshold
+    """
+    return Between(lower, upper, inclusive)
+
+class IsNA(ASTPredicate):
+    def __call__(self, s: SeriesT) -> SeriesT:
+        return s.isna()
+
+def isna() -> IsNA:
+    """
+    Return whether a given value is NA
+    """
+    return IsNA()
+
+
+class NotNA(ASTPredicate):
+    def __call__(self, s: SeriesT) -> SeriesT:
+        return s.notna()
+
+def notna() -> NotNA:
+    """
+    Return whether a given value is not NA
+    """
+    return NotNA()

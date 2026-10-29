@@ -1,0 +1,1073 @@
+import pandas as pd
+import pytest
+import re
+
+from graphistry.compute.predicates.str import (
+    contains,
+    startswith,
+    endswith,
+    match,
+    fullmatch,
+    IsUpper, isupper
+)
+# Helper to check if cuDF is available and functional (requires GPU)
+def has_cudf():
+    try:
+        import cudf
+        # Test actual GPU operation - import alone doesn't guarantee GPU works
+        _ = cudf.Series([1, 2, 3])
+        return True
+    except (ImportError, Exception):
+        # ImportError if cudf not installed
+        # Other exceptions (CUDARuntimeError) if GPU not available
+        return False
+
+
+# Cache result to avoid repeated GPU checks
+_cudf_available = None
+
+
+def cudf_available():
+    global _cudf_available
+    if _cudf_available is None:
+        _cudf_available = has_cudf()
+    return _cudf_available
+
+
+# Skip tests that require cuDF when it's not available or GPU not working
+requires_cudf = pytest.mark.skipif(
+    not cudf_available(),
+    reason="cudf not installed or GPU not available"
+)
+
+
+def test_is_upper():
+    d = isupper()
+    assert isinstance(d, IsUpper)
+
+    o = d.to_json()
+    assert isinstance(o, dict)
+    assert o['type'] == 'IsUpper'
+
+    d2 = IsUpper.from_json(o)
+    assert isinstance(d2, IsUpper)
+
+
+
+def test_contains_pandas_basic():
+    s = pd.Series(['Mouse', 'dog', 'house and parrot', '23'])
+    predicate = contains('og')
+    result = predicate(s)
+    expected = pd.Series([False, True, False, False])
+    pd.testing.assert_series_equal(result, expected)
+
+
+def test_contains_pandas_regex():
+    s = pd.Series(['Mouse', 'dog', 'house and parrot', '23'])
+    predicate = contains('house|dog', regex=True)
+    result = predicate(s)
+    expected = pd.Series([False, True, True, False])
+    pd.testing.assert_series_equal(result, expected)
+
+
+def test_contains_pandas_case_insensitive():
+    s = pd.Series(['Mouse', 'dog', 'HOUSE', 'house'])
+    predicate = contains('house', case=False)
+    result = predicate(s)
+    expected = pd.Series([False, False, True, True])
+    pd.testing.assert_series_equal(result, expected)
+
+
+def test_contains_pandas_na_default():
+    s = pd.Series(['Mouse', 'dog', None, 'house'])
+    predicate = contains('og')
+    result = predicate(s)
+    assert result[0] is False
+    assert result[1] is True
+    assert pd.isna(result[2])
+    assert result[3] is False
+
+
+def test_contains_pandas_na_false():
+    s = pd.Series(['Mouse', 'dog', None, 'house'])
+    predicate = contains('og', na=False)
+    result = predicate(s)
+    expected = pd.Series([False, True, False, False])
+    pd.testing.assert_series_equal(result, expected)
+
+
+def test_contains_pandas_na_true():
+    s = pd.Series(['Mouse', 'dog', None, 'house'])
+    predicate = contains('og', na=True)
+    result = predicate(s)
+    expected = pd.Series([False, True, True, False])
+    pd.testing.assert_series_equal(result, expected)
+
+
+@requires_cudf
+def test_contains_cudf_basic():
+    import cudf
+    s = cudf.Series(['Mouse', 'dog', 'house and parrot', '23'])
+    predicate = contains('og')
+    result = predicate(s)
+    expected = cudf.Series([False, True, False, False])
+    pd.testing.assert_series_equal(result.to_pandas(), expected.to_pandas())
+
+
+@requires_cudf
+def test_contains_cudf_case_insensitive():
+    import cudf
+    s = cudf.Series(['Mouse', 'dog', 'HOUSE', 'house'])
+    predicate = contains('house', case=False)
+    result = predicate(s)
+    expected = cudf.Series([False, False, True, True])
+    pd.testing.assert_series_equal(result.to_pandas(), expected.to_pandas())
+
+
+@requires_cudf
+def test_contains_cudf_na_handling():
+    import cudf
+
+    # Test default NA behavior
+    s = cudf.Series(['Mouse', 'dog', None, 'house'])
+    predicate = contains('og')
+    result = predicate(s).to_pandas()
+    assert result[0] is False
+    assert result[1] is True
+    assert pd.isna(result[2])
+    assert result[3] is False
+
+    # Test NA=False
+    predicate = contains('og', na=False)
+    result = predicate(s)
+    expected = cudf.Series([False, True, False, False])
+    pd.testing.assert_series_equal(result.to_pandas(), expected.to_pandas())
+
+    # Test NA=True
+    predicate = contains('og', na=True)
+    result = predicate(s)
+    expected = cudf.Series([False, True, True, False])
+    pd.testing.assert_series_equal(result.to_pandas(), expected.to_pandas())
+
+
+@requires_cudf
+def test_contains_pandas_cudf_parity():
+    import cudf
+
+    # Create identical data
+    data = ['Mouse', 'dog', None, 'HOUSE', 'house and parrot']
+    s_pandas = pd.Series(data)
+    s_cudf = cudf.Series(data)
+
+    # Test case-sensitive
+    predicate = contains('house')
+    result_pandas = predicate(s_pandas)
+    result_cudf = predicate(s_cudf).to_pandas()
+    pd.testing.assert_series_equal(result_pandas, result_cudf)
+
+    # Test case-insensitive
+    predicate = contains('house', case=False)
+    result_pandas = predicate(s_pandas)
+    result_cudf = predicate(s_cudf).to_pandas()
+    pd.testing.assert_series_equal(result_pandas, result_cudf)
+
+    # Test with na=False
+    predicate = contains('house', na=False)
+    result_pandas = predicate(s_pandas)
+    result_cudf = predicate(s_cudf).to_pandas()
+    pd.testing.assert_series_equal(result_pandas, result_cudf)
+
+
+
+BACKENDS = [
+    "pandas",
+    pytest.param("cudf", marks=requires_cudf),
+]
+
+BOUNDARY_PREDICATES = [
+    (
+        "startswith",
+        startswith,
+        "ho",
+        ['Mouse', 'dog', 'house', 'Home'],
+        [False, False, True, False],
+    ),
+    (
+        "endswith",
+        endswith,
+        "se",
+        ['Mouse', 'dog', 'house', 'Home'],
+        [True, False, True, False],
+    ),
+]
+
+
+def _series_for_backend(backend, data):
+    if backend == "cudf":
+        import cudf
+        return cudf.Series(data)
+    return pd.Series(data)
+
+
+def _to_pandas(result):
+    return result.to_pandas() if hasattr(result, "to_pandas") else result
+
+
+def _assert_result_values(result, expected):
+    result = _to_pandas(result)
+    assert len(result) == len(expected)
+    for actual, expected_value in zip(result, expected):
+        if expected_value is None:
+            assert pd.isna(actual)
+        else:
+            assert bool(actual) is expected_value
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize(
+    "name,predicate_factory,pat,data,expected",
+    BOUNDARY_PREDICATES,
+)
+def test_boundary_string_basic(
+    backend,
+    name,
+    predicate_factory,
+    pat,
+    data,
+    expected,
+):
+    s = _series_for_backend(backend, data)
+    result = predicate_factory(pat)(s)
+    _assert_result_values(result, expected)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize(
+    "name,predicate_factory,pat,data,expected",
+    [
+        (
+            "startswith",
+            startswith,
+            "john",
+            ['John', 'john', 'JOHN', 'Jane'],
+            [True, True, True, False],
+        ),
+        (
+            "endswith",
+            endswith,
+            ".com",
+            ['test.com', 'test.COM', 'test.Com', 'test.org'],
+            [True, True, True, False],
+        ),
+    ],
+)
+def test_boundary_string_case_insensitive(
+    backend,
+    name,
+    predicate_factory,
+    pat,
+    data,
+    expected,
+):
+    s = _series_for_backend(backend, data)
+    result = predicate_factory(pat, case=False)(s)
+    _assert_result_values(result, expected)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize(
+    "name,predicate_factory,pat,expected_default,expected_false,expected_true",
+    [
+        (
+            "startswith",
+            startswith,
+            "ho",
+            [False, None, True],
+            [False, False, True],
+            [False, True, True],
+        ),
+        (
+            "endswith",
+            endswith,
+            "se",
+            [True, None, True],
+            [True, False, True],
+            [True, True, True],
+        ),
+    ],
+)
+def test_boundary_string_na_handling(
+    backend,
+    name,
+    predicate_factory,
+    pat,
+    expected_default,
+    expected_false,
+    expected_true,
+):
+    s = _series_for_backend(backend, ['Mouse', None, 'house'])
+    _assert_result_values(predicate_factory(pat)(s), expected_default)
+    _assert_result_values(predicate_factory(pat, na=False)(s), expected_false)
+    _assert_result_values(predicate_factory(pat, na=True)(s), expected_true)
+
+
+
+def test_match_pandas_basic():
+    s = pd.Series(['Mouse', 'dog', 'house', '123'])
+    predicate = match(r'\d+')
+    result = predicate(s)
+    expected = pd.Series([False, False, False, True])
+    pd.testing.assert_series_equal(result, expected)
+
+
+def test_match_pandas_case_insensitive():
+    s = pd.Series(['Mouse', 'mouse', 'MOUSE', 'dog'])
+    predicate = match(r'mouse', case=False)
+    result = predicate(s)
+    expected = pd.Series([True, True, True, False])
+    pd.testing.assert_series_equal(result, expected)
+
+
+def test_match_pandas_case_insensitive_with_flags():
+    s = pd.Series(['Mouse', 'mouse', 'MOUSE', 'dog', None])
+    predicate = match(r'mouse', case=False, flags=re.IGNORECASE)
+    result = predicate(s)
+    expected = pd.Series([True, True, True, False, None], dtype=object)
+    pd.testing.assert_series_equal(result, expected)
+
+
+def test_match_pandas_na_handling():
+    s = pd.Series(['123', None, 'abc'])
+    predicate = match(r'\d+')
+    result = predicate(s)
+    assert result[0] is True
+    assert pd.isna(result[1])
+    assert result[2] is False
+
+    # Test with na=False
+    predicate = match(r'\d+', na=False)
+    result = predicate(s)
+    expected = pd.Series([True, False, False])
+    pd.testing.assert_series_equal(result, expected)
+
+    # Test with na=True
+    predicate = match(r'\d+', na=True)
+    result = predicate(s)
+    expected = pd.Series([True, True, False])
+    pd.testing.assert_series_equal(result, expected)
+
+
+@requires_cudf
+def test_match_cudf_basic():
+    import cudf
+    s = cudf.Series(['Mouse', 'dog', 'house', '123'])
+    predicate = match(r'\d+')
+    result = predicate(s)
+    expected = cudf.Series([False, False, False, True])
+    pd.testing.assert_series_equal(result.to_pandas(), expected.to_pandas())
+
+
+@requires_cudf
+def test_match_cudf_case_insensitive():
+    import cudf
+    s = cudf.Series(['Mouse', 'mouse', 'MOUSE', 'dog'])
+    predicate = match(r'mouse', case=False)
+    result = predicate(s)
+    expected = cudf.Series([True, True, True, False])
+    pd.testing.assert_series_equal(result.to_pandas(), expected.to_pandas())
+
+
+@requires_cudf
+def test_match_cudf_na_handling():
+    import cudf
+    s = cudf.Series(['123', None, 'abc'])
+
+    # Default NA handling
+    predicate = match(r'\d+')
+    result = predicate(s).to_pandas()
+    assert result[0] is True
+    assert pd.isna(result[1])
+    assert result[2] is False
+
+    # NA=False
+    predicate = match(r'\d+', na=False)
+    result = predicate(s)
+    expected = cudf.Series([True, False, False])
+    pd.testing.assert_series_equal(result.to_pandas(), expected.to_pandas())
+
+    # NA=True
+    predicate = match(r'\d+', na=True)
+    result = predicate(s)
+    expected = cudf.Series([True, True, False])
+    pd.testing.assert_series_equal(result.to_pandas(), expected.to_pandas())
+
+
+@requires_cudf
+def test_match_pandas_cudf_parity():
+    import cudf
+
+    # Create identical data
+    data = ['Mouse', '123', None, 'MOUSE', 'dog123']
+    s_pandas = pd.Series(data)
+    s_cudf = cudf.Series(data)
+
+    # Test case-sensitive
+    predicate = match(r'\d+')
+    result_pandas = predicate(s_pandas)
+    result_cudf = predicate(s_cudf).to_pandas()
+    pd.testing.assert_series_equal(result_pandas, result_cudf)
+
+    # Test case-insensitive
+    predicate = match(r'mouse', case=False)
+    result_pandas = predicate(s_pandas)
+    result_cudf = predicate(s_cudf).to_pandas()
+    pd.testing.assert_series_equal(result_pandas, result_cudf)
+
+    # Test with na=False
+    predicate = match(r'\d+', na=False)
+    result_pandas = predicate(s_pandas)
+    result_cudf = predicate(s_cudf).to_pandas()
+    pd.testing.assert_series_equal(result_pandas, result_cudf)
+
+
+
+def test_fullmatch_pandas_basic():
+    s = pd.Series(['123', '123abc', 'abc123', 'abc'])
+    predicate = fullmatch(r'\d+')
+    result = predicate(s)
+    # Only '123' matches entirely
+    expected = pd.Series([True, False, False, False])
+    pd.testing.assert_series_equal(result, expected)
+
+
+def test_fullmatch_pandas_case_insensitive():
+    s = pd.Series(['ABC', 'abc', 'AbC', 'abcd'])
+    predicate = fullmatch(r'abc', case=False)
+    result = predicate(s)
+    # 'abcd' has extra char
+    expected = pd.Series([True, True, True, False])
+    pd.testing.assert_series_equal(result, expected)
+
+
+def test_fullmatch_pandas_vs_match():
+    s = pd.Series(['123', '123abc', 'abc123'])
+
+    # match() matches from start
+    match_result = match(r'\d+')(s)
+    expected_match = pd.Series([True, True, False])
+    pd.testing.assert_series_equal(match_result, expected_match)
+
+    # fullmatch() requires entire string
+    fullmatch_result = fullmatch(r'\d+')(s)
+    expected_fullmatch = pd.Series([True, False, False])
+    pd.testing.assert_series_equal(fullmatch_result, expected_fullmatch)
+
+
+def test_fullmatch_pandas_na_handling():
+    s = pd.Series(['123', None, 'abc'])
+    predicate = fullmatch(r'\d+')
+    result = predicate(s)
+    assert result[0] is True
+    assert pd.isna(result[1])
+    assert result[2] is False
+
+    # Test with na=False
+    predicate = fullmatch(r'\d+', na=False)
+    result = predicate(s)
+    expected = pd.Series([True, False, False])
+    pd.testing.assert_series_equal(result, expected)
+
+    # Test with na=True
+    predicate = fullmatch(r'\d+', na=True)
+    result = predicate(s)
+    expected = pd.Series([True, True, False])
+    pd.testing.assert_series_equal(result, expected)
+
+
+@requires_cudf
+def test_fullmatch_cudf_basic():
+    import cudf
+    s = cudf.Series(['123', '123abc', 'abc123', 'abc'])
+    predicate = fullmatch(r'\d+')
+    result = predicate(s)
+    expected = cudf.Series([True, False, False, False])
+    pd.testing.assert_series_equal(result.to_pandas(), expected.to_pandas())
+
+
+@requires_cudf
+def test_fullmatch_cudf_case_insensitive():
+    import cudf
+    s = cudf.Series(['ABC', 'abc', 'AbC', 'abcd'])
+    predicate = fullmatch(r'abc', case=False)
+    result = predicate(s)
+    expected = cudf.Series([True, True, True, False])
+    pd.testing.assert_series_equal(result.to_pandas(), expected.to_pandas())
+
+
+@requires_cudf
+def test_fullmatch_cudf_na_handling():
+    import cudf
+    s = cudf.Series(['123', None, 'abc'])
+
+    # Default NA handling
+    predicate = fullmatch(r'\d+')
+    result = predicate(s).to_pandas()
+    assert result[0] is True
+    assert pd.isna(result[1])
+    assert result[2] is False
+
+    # NA=False
+    predicate = fullmatch(r'\d+', na=False)
+    result = predicate(s)
+    expected = cudf.Series([True, False, False])
+    pd.testing.assert_series_equal(result.to_pandas(), expected.to_pandas())
+
+    # NA=True
+    predicate = fullmatch(r'\d+', na=True)
+    result = predicate(s)
+    expected = cudf.Series([True, True, False])
+    pd.testing.assert_series_equal(result.to_pandas(), expected.to_pandas())
+
+
+@requires_cudf
+def test_fullmatch_pandas_cudf_parity():
+    import cudf
+
+    # Create identical data
+    data = ['123', '123abc', None, 'ABC', 'abc']
+    s_pandas = pd.Series(data)
+    s_cudf = cudf.Series(data)
+
+    # Test case-sensitive
+    predicate = fullmatch(r'\d+')
+    result_pandas = predicate(s_pandas)
+    result_cudf = predicate(s_cudf).to_pandas()
+    pd.testing.assert_series_equal(result_pandas, result_cudf)
+
+    # Test case-insensitive
+    predicate = fullmatch(r'abc', case=False)
+    result_pandas = predicate(s_pandas)
+    result_cudf = predicate(s_cudf).to_pandas()
+    pd.testing.assert_series_equal(result_pandas, result_cudf)
+
+    # Test with na=False
+    predicate = fullmatch(r'\d+', na=False)
+    result_pandas = predicate(s_pandas)
+    result_cudf = predicate(s_cudf).to_pandas()
+    pd.testing.assert_series_equal(result_pandas, result_cudf)
+
+
+
+def test_edge_cases_pandas():
+    # Empty strings
+    s = pd.Series(['', 'test', ''])
+    predicate = contains('')
+    result = predicate(s)
+    # Empty pattern matches everything
+    expected = pd.Series([True, True, True])
+    pd.testing.assert_series_equal(result, expected)
+
+    # Special regex characters
+    s = pd.Series(['test.txt', 'test_txt', 'test?txt'])
+    predicate = contains(r'test\.txt', regex=True)
+    result = predicate(s)
+    expected = pd.Series([True, False, False])
+    pd.testing.assert_series_equal(result, expected)
+
+    # Unicode
+    s = pd.Series(['café', 'naïve', 'test'])
+    predicate = contains('café')
+    result = predicate(s)
+    expected = pd.Series([True, False, False])
+    pd.testing.assert_series_equal(result, expected)
+
+
+@requires_cudf
+def test_edge_cases_cudf():
+    import cudf
+
+    # Empty strings
+    s = cudf.Series(['', 'test', ''])
+    predicate = contains('')
+    result = predicate(s)
+    expected = cudf.Series([True, True, True])
+    pd.testing.assert_series_equal(result.to_pandas(), expected.to_pandas())
+
+    # Special regex characters
+    s = cudf.Series(['test.txt', 'test_txt', 'test?txt'])
+    predicate = contains(r'test\.txt', regex=True)
+    result = predicate(s)
+    expected = cudf.Series([True, False, False])
+    pd.testing.assert_series_equal(result.to_pandas(), expected.to_pandas())
+
+
+@requires_cudf
+def test_all_predicates_pandas_cudf_parity():
+    import cudf
+
+    # Test data with various edge cases
+    data = ['Test', 'test', None, '', '123', 'Test123', 'END']
+    s_pandas = pd.Series(data)
+    s_cudf = cudf.Series(data)
+
+    # Test all predicates with various parameters
+    predicates = [
+        contains('est'),
+        contains('EST', case=False),
+        contains('est', na=False),
+        startswith('Test'),
+        startswith('Test', na=False),
+        endswith('END'),
+        endswith('end', na=True),
+        match(r'\d+'),
+        match(r'test', case=False),
+        match(r'\d+', na=False),
+        fullmatch(r'\d+'),
+        fullmatch(r'test', case=False),
+        fullmatch(r'Test123')
+    ]
+
+    for predicate in predicates:
+        result_pandas = predicate(s_pandas)
+        result_cudf = predicate(s_cudf).to_pandas()
+
+        # Check if results are identical
+        try:
+            pd.testing.assert_series_equal(result_pandas, result_cudf)
+        except AssertionError as e:
+            pytest.fail(
+                f"Parity check failed for "
+                f"{predicate.__class__.__name__}: {e}"
+            )
+
+
+
+TUPLE_CASES = [
+    (
+        "startswith",
+        startswith,
+        ('app', 'ban'),
+        ['apple', 'banana', 'apricot', 'orange', None],
+        {},
+        [True, True, False, False, None],
+    ),
+    (
+        "startswith",
+        startswith,
+        ('app', 'ban'),
+        ['Apple', 'BANANA', 'apricot', 'Orange', None],
+        {"case": False},
+        [True, True, False, False, None],
+    ),
+    (
+        "startswith",
+        startswith,
+        ('app', 'ban'),
+        ['apple', None, 'banana', 'orange'],
+        {},
+        [True, None, True, False],
+    ),
+    (
+        "startswith",
+        startswith,
+        ('app', 'ban'),
+        ['apple', None, 'banana', 'orange'],
+        {"na": False},
+        [True, False, True, False],
+    ),
+    (
+        "startswith",
+        startswith,
+        ('app', 'ban'),
+        ['apple', None, 'banana', 'orange'],
+        {"na": True},
+        [True, True, True, False],
+    ),
+    (
+        "startswith",
+        startswith,
+        ('app', 'ban'),
+        ['APPLE', None, 'Banana', 'orange'],
+        {"case": False, "na": False},
+        [True, False, True, False],
+    ),
+    (
+        "startswith",
+        startswith,
+        ('app',),
+        ['apple', 'apricot', 'banana'],
+        {},
+        [True, False, False],
+    ),
+    (
+        "startswith",
+        startswith,
+        (),
+        ['apple', 'banana', 'orange'],
+        {},
+        [False, False, False],
+    ),
+    (
+        "startswith",
+        startswith,
+        (),
+        ['apple', None, 'orange'],
+        {},
+        [False, None, False],
+    ),
+    (
+        "endswith",
+        endswith,
+        ('.txt', '.csv'),
+        ['test.txt', 'data.csv', 'config.txt', 'image.png', None],
+        {},
+        [True, True, True, False, None],
+    ),
+    (
+        "endswith",
+        endswith,
+        ('.txt', '.csv'),
+        ['test.TXT', 'data.CSV', 'config.txt', 'image.PNG', None],
+        {"case": False},
+        [True, True, True, False, None],
+    ),
+    (
+        "endswith",
+        endswith,
+        ('.txt', '.csv'),
+        ['test.txt', None, 'data.csv', 'image.png'],
+        {},
+        [True, None, True, False],
+    ),
+    (
+        "endswith",
+        endswith,
+        ('.txt', '.csv'),
+        ['test.txt', None, 'data.csv', 'image.png'],
+        {"na": False},
+        [True, False, True, False],
+    ),
+    (
+        "endswith",
+        endswith,
+        ('.txt', '.csv'),
+        ['test.txt', None, 'data.csv', 'image.png'],
+        {"na": True},
+        [True, True, True, False],
+    ),
+    (
+        "endswith",
+        endswith,
+        ('.txt', '.csv'),
+        ['test.TXT', None, 'data.CSV', 'image.png'],
+        {"case": False, "na": False},
+        [True, False, True, False],
+    ),
+    (
+        "endswith",
+        endswith,
+        ('.txt',),
+        ['test.txt', 'data.csv', 'config.txt'],
+        {},
+        [True, False, True],
+    ),
+    (
+        "endswith",
+        endswith,
+        (),
+        ['test.txt', 'data.csv', 'image.png'],
+        {},
+        [False, False, False],
+    ),
+    (
+        "endswith",
+        endswith,
+        (),
+        ['test.txt', None, 'image.png'],
+        {},
+        [False, None, False],
+    ),
+]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize(
+    "name,predicate_factory,pat,data,kwargs,expected",
+    TUPLE_CASES,
+)
+def test_boundary_string_tuple_cases(
+    backend,
+    name,
+    predicate_factory,
+    pat,
+    data,
+    kwargs,
+    expected,
+):
+    s = _series_for_backend(backend, data)
+    result = predicate_factory(pat, **kwargs)(s)
+    _assert_result_values(result, expected)
+
+
+@requires_cudf
+@pytest.mark.parametrize(
+    "name,predicate_factory,data,pat",
+    [
+        (
+            "startswith",
+            startswith,
+            ['Apple', 'banana', None, 'application', 'orange', 'BANANA'],
+            ('app', 'ban'),
+        ),
+        (
+            "endswith",
+            endswith,
+            ['test.TXT', 'data.csv', None, 'config.txt', 'image.png', 'doc.CSV'],
+            ('.txt', '.csv'),
+        ),
+    ],
+)
+def test_boundary_string_tuple_pandas_cudf_parity(
+    name,
+    predicate_factory,
+    data,
+    pat,
+):
+    import cudf
+
+    s_pandas = pd.Series(data)
+    s_cudf = cudf.Series(data)
+
+    test_cases = [
+        predicate_factory(pat),
+        predicate_factory(pat, case=False),
+        predicate_factory(pat, na=False),
+        predicate_factory(pat, na=True),
+        predicate_factory(pat, case=False, na=False),
+        predicate_factory(pat, case=False, na=True),
+        predicate_factory((pat[0],)),
+        predicate_factory(()),
+    ]
+
+    for predicate in test_cases:
+        result_pandas = predicate(s_pandas)
+        result_cudf = predicate(s_cudf).to_pandas()
+        try:
+            pd.testing.assert_series_equal(result_pandas, result_cudf)
+        except AssertionError as e:
+            pytest.fail(f"Parity check failed for {name} {predicate}: {e}")
+
+
+class TestCudfRegexPrep:
+    """_cudf_regex_prep is a pure pattern transform (no cuDF needed): libcudf rejects
+    inline flag groups, so a leading (?i) folds to the case=False path and any other
+    flag declines honestly. Direct CPU coverage of every branch (viz-filter #1673)."""
+
+    def test_no_inline_flags_passthrough(self):
+        from graphistry.compute.predicates.str import _cudf_regex_prep
+        assert _cudf_regex_prep("al.*", True) == ("al.*", True)
+        assert _cudf_regex_prep("a(?:b|c)d", True) == ("a(?:b|c)d", True)  # (?: not a flag group
+
+    def test_leading_case_flag_folds(self):
+        from graphistry.compute.predicates.str import _cudf_regex_prep
+        assert _cudf_regex_prep("(?i)Al.*", True) == ("Al.*", False)
+        assert _cudf_regex_prep("(?i)x", False) == ("x", False)
+        assert _cudf_regex_prep("(?ii)x", True) == ("x", False)  # repeated i still i-only
+
+    def test_other_inline_flags_decline(self):
+        import pytest as _pytest
+        from graphistry.compute.predicates.str import _cudf_regex_prep
+        for pat in ["(?m)^a", "(?s).*", "(?im)a", "(?x) a b"]:
+            with _pytest.raises(NotImplementedError):
+                _cudf_regex_prep(pat, True)
+
+    def test_lookaround_and_backrefs_decline(self):
+        """#1675 wave-1: libcudf rejects lookaround/backrefs at kernel-compile time —
+        decline honestly instead of a raw non-NIE RuntimeError (dgx-repro'd)."""
+        import pytest as _pytest
+        from graphistry.compute.predicates.str import _cudf_regex_prep
+        for pat in ["(?=a)b", "(?!a)b", "(?<=a)b", "(?<!a)b", r"(a)\1"]:
+            with _pytest.raises(NotImplementedError):
+                _cudf_regex_prep(pat, True)
+
+
+class TestCudfCasefoldOrDecline:
+    """The cuDF case-insensitive workaround lowercases DATA + PATTERN; .lower() turns
+    \\D into \\d (and \\W/\\S/\\B alike), silently INVERTING the predicate (wave-1,
+    dgx-repro'd); case-crossing ranges + non-ASCII are also unsound (wave-2). Lowercase
+    escapes are no-ops and must keep folding."""
+
+    def test_plain_patterns_fold(self):
+        from graphistry.compute.predicates.str import _cudf_casefold_or_decline
+        assert _cudf_casefold_or_decline("NODE.1") == "node.1"
+        assert _cudf_casefold_or_decline("Ab|Cd") == "ab|cd"
+        assert _cudf_casefold_or_decline("[A-Z]+") == "[a-z]+"
+
+    def test_lowercase_escapes_still_fold(self):
+        """Wave-2: .lower() no-ops on \\d/\\./\\w — these worked at base and must not
+        regress to NIE (a blanket backslash decline did exactly that)."""
+        from graphistry.compute.predicates.str import _cudf_casefold_or_decline
+        assert _cudf_casefold_or_decline(r"\d+") == r"\d+"
+        assert _cudf_casefold_or_decline(r"NODE\.1") == r"node\.1"
+        assert _cudf_casefold_or_decline(r"A\w+") == r"a\w+"
+
+    def test_uppercase_escapes_decline(self):
+        import pytest as _pytest
+        from graphistry.compute.predicates.str import _cudf_casefold_or_decline
+        for pat in [r"\D+", r"a\Wb", r"\S*", r"x\By",
+                    r"\x41", r"[\x41-\x5a]"]:  # wave-4: hex escapes spell letters invisibly
+            with _pytest.raises(NotImplementedError):
+                _cudf_casefold_or_decline(pat)
+
+    def test_case_crossing_ranges_and_nonascii_decline(self):
+        """Wave-2: (?i)[A-z] silently narrows on fold; [X-b] folds to the INVALID
+        [x-b]; non-ASCII folds can diverge from libcudf's lowercasing (Istanbul-I)."""
+        import pytest as _pytest
+        from graphistry.compute.predicates.str import _cudf_casefold_or_decline
+        for pat in ["[A-z]+", "[X-b]", "\u0130stanbul",
+                    "[?-Z]", "[Z-~]", "[X-^]", "[\\x41-Z]"]:  # wave-3: mixed letter/non-letter ranges
+            with _pytest.raises(NotImplementedError):
+                _cudf_casefold_or_decline(pat)
+        assert _cudf_casefold_or_decline("[a-c]") == "[a-c]"  # same-case range folds fine
+        assert _cudf_casefold_or_decline("[0-9]+") == "[0-9]+"  # non-letter range folds fine
+        assert _cudf_casefold_or_decline("e-MAIL") == "e-mail"  # class-free literal hyphen folds fine
+
+
+# --- Regression: string predicates must be VALUE-SAFE on non-string columns. Previously
+# `s.str.contains(...)` etc. raised `AttributeError: Can only use .str accessor with string
+# values!` on a numeric/temporal/bool column. openCypher: a string op over a non-string value is
+# null -> excluded (matching the per-cell behavior on an object column holding non-strings), and
+# must NOT stringify (which would diverge pandas<->cuDF, e.g. wrongly match `5 CONTAINS '5'`). ---
+from graphistry.compute.predicates.str import Contains, Startswith, Endswith, Match, Fullmatch
+
+
+@pytest.mark.parametrize("pred", [
+    Contains("1", regex=False), Startswith("1"), Endswith("1"),
+    Match("1"), Fullmatch("1"),
+])
+@pytest.mark.parametrize("series", [
+    pd.Series([1, 15, 3]),            # int
+    pd.Series([1.0, 15.0, 3.0]),      # float
+    pd.Series([True, False, True]),   # bool
+])
+def test_string_predicate_on_nonstring_column_is_null_not_raise(pred, series):
+    # Must not raise, and must be all-null (excluded), never stringified.
+    result = pred(series)
+    assert len(result) == len(series)
+    assert all(pd.isna(v) for v in result), f"{pred!r} on {series.dtype} -> {list(result)}"
+
+
+def test_string_predicate_on_string_and_mixed_unchanged():
+    # String dtype: normal matching still works.
+    assert list(Contains("a", regex=False)(pd.Series(["abc", "xyz", None]))) == [True, False, None]
+    # Mixed object: non-string cells already become null (unchanged behavior).
+    r = Contains("a", regex=False)(pd.Series(["a1", 2, None], dtype="object"))
+    assert r.iloc[0] == True  # noqa: E712
+    assert pd.isna(r.iloc[1]) and pd.isna(r.iloc[2])
+
+
+# --- Regression: a CATEGORICAL-of-strings column is string-VALUED on every engine, but only
+# pandas lends it a `.str` accessor. cuDF raises on `.str`, which routed the whole column into
+# the non-string (null/False) result: pandas answered rows, cuDF answered NOTHING, silently. ---
+class _NoStrAccessorCategorical:
+    """cuDF-shaped categorical stand-in: string categories, no working ``.str``.
+
+    Lets the CPU lane pin the decode contract that only a GPU can otherwise exercise.
+    """
+
+    def __init__(self, values):
+        self._s = pd.Series(values, dtype='object')
+        self.dtype = pd.CategoricalDtype(pd.Index(['ab', 'cd'], dtype='object'))
+
+    @property
+    def str(self):
+        raise AttributeError("Can only use .str accessor with string values")
+
+    def astype(self, _t):
+        return self._s
+
+
+class _NoStrAccessorFloatCategorical(_NoStrAccessorCategorical):
+    def __init__(self, values):
+        super().__init__(values)
+        self.dtype = pd.CategoricalDtype(pd.Index([1.5, 2.5], dtype='float64'))
+
+
+def test_str_ops_series_passes_through_usable_accessor():
+    from graphistry.compute.predicates.str import _str_ops_series
+    s = pd.Series(['a', 'b'])
+    assert _str_ops_series(s) is s
+
+
+def test_str_ops_series_decodes_string_categories_without_accessor():
+    from graphistry.compute.predicates.str import _str_ops_series
+    out = _str_ops_series(_NoStrAccessorCategorical(['ab', None, 'cd']))
+    assert out is not None
+    assert list(out) == ['ab', None, 'cd']
+
+
+def test_str_ops_series_declines_non_string_categories():
+    """Stringifying a numeric categorical would render engine-divergently, so it stays a
+    non-string column (null result) rather than becoming a wrong match."""
+    from graphistry.compute.predicates.str import _str_ops_series
+    assert _str_ops_series(_NoStrAccessorFloatCategorical([1.5, 2.5])) is None
+    assert _str_ops_series(pd.Series([1, 2, 3])) is None
+
+
+def test_pandas_categorical_string_predicates_match_values():
+    """The pandas oracle every non-pandas engine is held to."""
+    s = pd.Series(pd.Categorical(['Xa', None, 'yb', 'XC']))
+    assert list(Contains('x', case=False, regex=False, na=False)(s)) == [True, False, False, True]
+    assert list(Startswith('X', na=False)(s)) == [True, False, False, True]
+    assert list(Match('^X', na=False)(s)) == [True, False, False, True]
+
+
+@requires_cudf
+class TestCudfCategoricalStringPredicateParity:
+    """Every string predicate on a cuDF categorical-of-str must equal the pandas answer."""
+
+    @staticmethod
+    def _pair(values):
+        import cudf
+        p = pd.Series(pd.Categorical(values))
+        return p, cudf.from_pandas(p)
+
+    @pytest.mark.parametrize("pred", [
+        Contains('x', case=False, regex=False, na=False),
+        Contains('X', case=True, regex=False, na=False),
+        Startswith('X', na=False),
+        Endswith('a', na=False),
+        Match('^X', na=False),
+        Fullmatch('Xa', na=False),
+    ])
+    def test_matches_pandas(self, pred):
+        p, c = self._pair(['Xa', None, 'yb', 'XC', 'zz'])
+        assert list(pred(c).to_pandas()) == list(pred(p)), f"{pred!r} diverged on cuDF"
+
+    def test_callable_predicate_matches_pandas(self):
+        """``isalpha`` & co. take an unguarded ``.str``: on a cuDF categorical that was a raw
+        AttributeError where pandas answered."""
+        from graphistry.compute.predicates.str import IsAlpha, IsUpper
+        p, c = self._pair(['Xa', None, 'yb', 'XC', 'zz'])
+        for pred in [IsAlpha(), IsUpper()]:
+            got = list(pred(c).to_pandas().fillna(-1))
+            want = list(pd.Series(pred(p)).fillna(-1))
+            assert got == want, f"{pred!r} diverged on cuDF"
+
+    def test_searchany_explicit_categorical_column_matches_pandas(self):
+        from graphistry.compute.gfql.search_any import search_any_mask
+        import cudf
+        pdf = pd.DataFrame({'id': list(range(5)),
+                            'cat': pd.Categorical(['Xa', None, 'yb', 'XC', 'zz'])})
+        cdf = cudf.from_pandas(pdf)
+        want = list(search_any_mask(pdf, 'x', columns=['cat']))
+        assert want == [True, False, False, True, False], "pandas oracle drift"
+        assert list(search_any_mask(cdf, 'x', columns=['cat']).to_pandas()) == want
+
+    def test_searchany_explicit_float_categorical_still_declines(self):
+        """Numeric-categorical stringification stays an honest NIE, not a silent divergence."""
+        from graphistry.compute.gfql.search_any import search_any_mask
+        import cudf
+        cdf = cudf.from_pandas(pd.DataFrame({'catf': pd.Categorical([1.5, 2.5, 1.5])}))
+        with pytest.raises(NotImplementedError):
+            search_any_mask(cdf, '1', columns=['catf'])

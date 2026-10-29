@@ -1,0 +1,6348 @@
+import ast
+import copy
+import math
+from decimal import Decimal, InvalidOperation
+import numpy as np
+import numbers
+import re
+import warnings
+from functools import lru_cache
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Literal, Mapping, NoReturn, Optional, Sequence, Tuple, cast
+
+import pandas as pd
+from graphistry.Engine import (
+    is_polars_df,
+    df_to_engine,
+    Engine,
+    EngineAbstract,
+    is_series_like,
+    resolve_engine,
+    s_cons,
+    s_to_numeric,
+    safe_map_series,
+)
+from graphistry.compute.exceptions import ErrorCode, GFQLTypeError, GFQLValidationError
+from graphistry.compute.dataframe_utils import concat_frames, domain_diff, domain_union, series_values
+from graphistry.compute.gfql.call.support import AggSpec
+from graphistry.compute.gfql.row import frame_ops as row_frame_ops
+from graphistry.compute.gfql.row.prefilter import AliasPrefilters
+from graphistry.compute.typing import DataFrameT, SeriesT
+from graphistry.utils.json import JSONVal
+from graphistry.compute.gfql.row.order_expr import (
+    extract_temporal_duration_sort_ast,
+    is_order_aggregate_alias_ast,
+    order_expr_ast_static_supported,
+)
+from graphistry.compute.gfql.agg_types import (
+    GFQL_NUMERIC_ONLY_AGGREGATIONS,
+    numeric_agg_all_null_value,
+    pandas_agg_kernel_null_fill,
+    pandas_conform_agg_dtype,
+    pandas_dtype_is_numeric_for_agg,
+    pandas_non_numeric_agg_dtype,
+    pandas_object_series_is_bool_like,
+    raise_non_numeric_aggregation,
+)
+from graphistry.compute.gfql.language_defs import (
+    GFQL_ALLOWED_UNARY_OPS,
+    GFQL_COMPARISON_BINARY_OP_NAMES,
+    GFQL_COMPARISON_BINARY_OPS,
+    GFQL_GROUPBY_AGG_METHODS,
+    GFQL_EQUALITY_COMPARISON_BINARY_OPS,
+    GFQL_INEQUALITY_EQUALITY_COMPARISON_BINARY_OPS,
+    GFQL_ORDERED_COMPARISON_BINARY_OPS,
+)
+from graphistry.compute.gfql.row.dispatch import (
+    apply_string_predicate_scalar,
+    apply_string_predicate_series,
+    eval_sequence_fn_scalar,
+    eval_sequence_fn_series,
+)
+from graphistry.compute.gfql.row.entity_props import (
+    LABEL_FLAG_PREFIX,
+    edge_property_columns,
+    entity_keys_series,
+    format_edge_entity_text,
+    format_node_entity_text,
+    format_node_labels_text,
+)
+from graphistry.compute.gfql.row.entity_text import (
+    entity_labels_scalar,
+    entity_labels_series,
+    entity_properties_scalar,
+    entity_properties_series,
+    entity_property_scalar,
+    entity_property_series,
+    entity_type_scalar,
+    entity_type_series,
+    is_entity_text_scalar,
+)
+from graphistry.compute.gfql.same_path_types import EDGE_IDENTITY_COLUMN, NODE_IDENTITY_COLUMN
+from graphistry.compute.gfql.identifiers import (
+    DEFAULT_ROW_EDGE_IDENTITY_COL,
+    ROW_EDGE_IDENTITY_BASE,
+    SHORTEST_PATH_HOPS_COLUMN_PREFIX,
+    WALK_CURRENT_COL,
+    WALK_FROM_COL,
+    WALK_PREV_COL,
+    WALK_TO_COL,
+    is_shortest_path_hops_column,
+    shadow_restore_column,
+    trail_column_name,
+)
+from graphistry.compute.util import generate_safe_column_name, generate_safe_column_name_from
+from graphistry.compute.gfql.cache_registry import register_process_singleton
+from graphistry.compute.gfql.series_str_compat import is_non_textual_scalar_dtype, series_sequence_len, series_str_match
+from graphistry.compute.gfql.row.ordering import (
+    build_list_sort_columns,
+    build_temporal_sort_columns,
+    is_null_scalar,
+    order_detect_list_series,
+    order_detect_native_temporal_mode,
+    order_detect_stringified_list_series,
+    order_detect_temporal_mode,
+    parse_stringified_list_series,
+    validate_order_series_vector_safe,
+)
+from graphistry.compute.gfql.temporal.durations import (
+    parse_duration_calendar_components,
+    parse_temporal_sort_duration_components,
+    resolve_duration_text_property,
+)
+from graphistry.compute.gfql.row.integer_text import (
+    ASCII_EXACT_INT64_PATTERN,
+    ASCII_EXACT_INT64_RE,
+    PANDAS_DIGIT_TRANSLATION,
+    UNICODE_EXACT_INT64_RE,
+    normalize_supported_decimal_digits,
+)
+
+
+#: Cypher's two numeric kinds; a Literal so a typo'd branch is a type error, not a silent miss.
+CypherNumericKind = Literal["int", "float"]
+
+if TYPE_CHECKING:
+    from graphistry.Plottable import Plottable
+    from graphistry.compute.typing import DataFrameT
+    from graphistry.compute.gfql.index.handoff import IndexedBindingsHandoff
+    from graphistry.compute.gfql.index.registry import GfqlIndexRegistry
+    from graphistry.compute.ast import ASTObject
+    from graphistry.compute.gfql.expr_parser import ExprNode
+
+
+GFQLParseExprFn = Callable[[str], "ExprNode"]
+GFQLValidateExprFn = Callable[["ExprNode"], List[str]]
+GFQLRuntimeParserBundle = Tuple[GFQLParseExprFn, GFQLValidateExprFn, ModuleType]
+_GFQL_MISSING_BOOL_OPERAND = object()
+_INT64_MIN = -(2**63)
+_INT64_LIMIT_HIGH = 2**63
+_INT64_MIN_AS_FLOAT = float(_INT64_MIN)
+_INT64_LIMIT_HIGH_AS_FLOAT = float(_INT64_LIMIT_HIGH)
+_EXACT_INT64_STRING = ASCII_EXACT_INT64_PATTERN
+_EXACT_INT64_STRING_RE = ASCII_EXACT_INT64_RE
+_UNICODE_EXACT_INT64_STRING_RE = UNICODE_EXACT_INT64_RE
+_INT64_MAX_POSITIVE_DIGITS = str(_INT64_LIMIT_HIGH - 1)
+_INT64_MIN_ABSOLUTE_DIGITS = str(-_INT64_MIN)
+
+
+def _to_cypher_int64_scalar(value: object) -> Optional[int]:
+    """Convert a scalar according to Cypher toInteger, with overflow as null."""
+    if is_null_scalar(value):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if _EXACT_INT64_STRING_RE.fullmatch(text):
+            parsed = int(text)
+        elif _UNICODE_EXACT_INT64_STRING_RE.fullmatch(text):
+            text = normalize_supported_decimal_digits(text)
+            if not _EXACT_INT64_STRING_RE.fullmatch(text):
+                return None
+            parsed = int(text)
+        else:
+            try:
+                parsed_float = float(text)
+            except ValueError:
+                return None
+            if not math.isfinite(parsed_float):
+                return None
+            parsed = math.trunc(parsed_float)
+    elif isinstance(value, bool):
+        parsed = int(value)
+    elif isinstance(value, numbers.Integral):
+        parsed = int(value)
+    elif isinstance(value, numbers.Real):
+        as_float = float(value)
+        if not math.isfinite(as_float):
+            return None
+        parsed = math.trunc(as_float)
+    elif isinstance(value, Decimal):
+        if not value.is_finite():
+            return None
+        parsed = int(value.to_integral_value(rounding="ROUND_DOWN"))
+    else:
+        return None
+    return parsed if _INT64_MIN <= parsed < _INT64_LIMIT_HIGH else None
+
+
+def _pandas_series_to_int64(inner: pd.Series) -> pd.Series:
+    """Convert pandas values to Cypher integer semantics without a native-int float hop."""
+    index = inner.index
+    if pd.api.types.is_bool_dtype(inner.dtype):
+        return inner.astype("Int64")
+    if pd.api.types.is_integer_dtype(inner.dtype):
+        if inner.dtype.kind == "u":
+            out = pd.Series(pd.NA, index=index, dtype="Int64")
+            in_range = inner.lt(_INT64_LIMIT_HIGH).to_numpy(dtype=bool)
+            in_range_values = inner.iloc[np.flatnonzero(in_range)].astype("int64")
+            out.iloc[np.flatnonzero(in_range)] = in_range_values.to_numpy()
+            return out
+        return inner.astype("Int64")
+    if pd.api.types.is_float_dtype(inner.dtype):
+        values = inner.to_numpy(dtype="float64", na_value=np.nan)
+        finite = np.isfinite(values)
+        in_range = finite & (values >= _INT64_MIN) & (values < _INT64_LIMIT_HIGH)
+        truncated = np.trunc(values)
+        return pd.Series(truncated, index=index).where(in_range, pd.NA).astype("Int64")
+
+    from pyarrow.lib import ArrowInvalid
+
+    text = inner.astype("string").str.strip()
+    exact_mask = text.str.match(_EXACT_INT64_STRING).fillna(False).to_numpy(dtype=bool)
+    out = pd.Series(pd.NA, index=index, dtype="Int64")
+    if exact_mask.any():
+        exact_positions = np.flatnonzero(exact_mask)
+        try:
+            exact_values = text.iloc[exact_positions].astype("Int64")
+        except (OverflowError, ArrowInvalid):
+            exact_values = _pandas_ascii_exact_text_to_int64(text.iloc[exact_positions])
+        out.iloc[exact_positions] = pd.array(exact_values, dtype="Int64")
+
+    remaining_mask = ~exact_mask
+    remaining_positions = np.flatnonzero(remaining_mask)
+    if len(remaining_positions):
+        normalized_remaining = text.iloc[remaining_positions].str.translate(PANDAS_DIGIT_TRANSLATION)
+        unicode_exact_mask = normalized_remaining.str.match(
+            _EXACT_INT64_STRING
+        ).fillna(False).to_numpy(dtype=bool)
+        unicode_exact_positions = remaining_positions[np.flatnonzero(unicode_exact_mask)]
+        if len(unicode_exact_positions):
+            unicode_exact_values = _pandas_ascii_exact_text_to_int64(
+                text.iloc[unicode_exact_positions].str.translate(PANDAS_DIGIT_TRANSLATION)
+            )
+            out.iloc[unicode_exact_positions] = pd.array(unicode_exact_values, dtype="Int64")
+
+        numeric_positions = remaining_positions[np.flatnonzero(~unicode_exact_mask)]
+        if len(numeric_positions):
+            remaining = inner.iloc[numeric_positions]
+            numeric = pd.to_numeric(remaining, errors="coerce")
+            if len(numeric):
+                numeric_values = _pandas_series_to_int64(numeric)
+                out.iloc[numeric_positions] = pd.array(numeric_values, dtype="Int64")
+    return out
+
+
+def _pandas_ascii_exact_text_to_int64(text: pd.Series) -> pd.Series:
+    """Parse normalized ASCII integer text through native Arrow decimals."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    out = pd.Series(pd.NA, index=text.index, dtype="Int64")
+
+    signs = text.str[0]
+    negative = signs.eq("-")
+    digits = text.str.replace(r"^[+-]", "", regex=True).str.lstrip("0").fillna("")
+    normalized_text = digits.where(digits.ne(""), "0")
+    normalized_text = normalized_text.mask(negative, "-" + normalized_text)
+    digit_count = digits.str.len()
+    max_count = len(_INT64_MAX_POSITIVE_DIGITS)
+    at_max_count = digit_count.eq(max_count)
+    in_range = digits.eq("") | digit_count.lt(max_count) | (
+        at_max_count & ~negative & digits.le(_INT64_MAX_POSITIVE_DIGITS)
+    ) | (
+        at_max_count & negative & digits.le(_INT64_MIN_ABSOLUTE_DIGITS)
+    )
+    in_range = in_range.to_numpy(dtype=bool)
+    at_max_count = at_max_count.to_numpy(dtype=bool)
+    fast_mask = in_range & ~at_max_count
+    fast_positions = np.flatnonzero(fast_mask)
+    if len(fast_positions):
+        fast_values = normalized_text.iloc[fast_positions].astype("Int64")
+        out.iloc[fast_positions] = pd.array(fast_values, dtype="Int64")
+
+    boundary_positions = np.flatnonzero(in_range & at_max_count)
+    if not len(boundary_positions):
+        return out
+
+    exact_in_decimal = normalized_text.iloc[boundary_positions]
+    decimals = pc.cast(pa.array(exact_in_decimal, type=pa.string()), pa.decimal128(38, 0))
+    exact_values = pc.cast(decimals, pa.int64())
+    out.iloc[boundary_positions] = pd.Series(
+        exact_values.to_numpy(zero_copy_only=False), index=exact_in_decimal.index, dtype="Int64"
+    )
+    return out
+
+
+def _cudf_series_to_int64(inner: SeriesT) -> SeriesT:  # pragma: no cover - cuDF-only; exact-text semantics validated on dgx-spark
+    """Convert cuDF values with the same exact-text semantics as pandas."""
+    import cudf
+
+    index = inner.index
+    if inner.dtype.kind == "b":
+        return inner.astype("int64")
+    if inner.dtype.kind == "i":
+        return inner.astype("int64")
+    if inner.dtype.kind == "u":
+        in_range = inner.lt(_INT64_LIMIT_HIGH)
+        return inner.where(in_range).astype("int64")
+    if inner.dtype.kind == "f":
+        numeric = s_to_numeric(Engine.CUDF)(inner, errors="coerce")
+        finite_mask = numeric.notna() & (numeric.abs() != float("inf"))
+        in_range = numeric.ge(_INT64_MIN_AS_FLOAT) & numeric.lt(_INT64_LIMIT_HIGH_AS_FLOAT)
+        safe_numeric = numeric.where(finite_mask & in_range)
+        return safe_numeric.astype("Int64")
+
+    normalized_text = inner.astype(str).str.strip().str.translate(PANDAS_DIGIT_TRANSLATION)
+    exact_mask = normalized_text.str.match(_EXACT_INT64_STRING).fillna(False).to_numpy(dtype=bool)
+    out = cudf.Series(pd.NA, index=index, dtype="Int64")
+    if exact_mask.any():
+        exact_positions = np.flatnonzero(exact_mask)
+        candidates = normalized_text.iloc[exact_positions]
+        signs = candidates.str[0]
+        negative = signs.eq("-")
+        digits = candidates.str.replace(r"^[+-]", "", regex=True).str.lstrip("0").fillna("")
+        digit_count = digits.str.len()
+        at_max_count = digit_count.eq(len(_INT64_MAX_POSITIVE_DIGITS))
+        in_range = digits.eq("") | digit_count.lt(len(_INT64_MAX_POSITIVE_DIGITS)) | (
+            at_max_count & ~negative & digits.le(_INT64_MAX_POSITIVE_DIGITS)
+        ) | (
+            at_max_count & negative & digits.le(_INT64_MIN_ABSOLUTE_DIGITS)
+        )
+        in_range = in_range.to_numpy(dtype=bool)
+        selected_positions = exact_positions[in_range]
+        exact_values = normalized_text.iloc[selected_positions].astype("int64")
+        out.iloc[selected_positions] = exact_values
+
+    remaining_positions = np.flatnonzero(~exact_mask)
+    if len(remaining_positions):
+        remaining = inner.iloc[remaining_positions]
+        numeric = s_to_numeric(Engine.CUDF)(remaining, errors="coerce")
+        finite_mask = numeric.notna() & (numeric.abs() != float("inf"))
+        in_range = numeric.ge(_INT64_MIN_AS_FLOAT) & numeric.lt(_INT64_LIMIT_HIGH_AS_FLOAT)
+        safe_numeric = numeric.where(finite_mask & in_range)
+        out.iloc[remaining_positions] = safe_numeric.astype("Int64")
+    return out
+
+
+@lru_cache(maxsize=1)
+def _gfql_expr_runtime_parser_bundle() -> Optional[GFQLRuntimeParserBundle]:
+    try:
+        import graphistry.compute.gfql.expr_parser as expr_parser_mod
+        from graphistry.compute.gfql.expr_parser import parse_expr, validate_expr_capabilities
+        # Ensure parser backend dependency is present (e.g., lark).
+        try:
+            parse_expr("1 = 1")
+        except ImportError:
+            return None
+        return parse_expr, validate_expr_capabilities, expr_parser_mod
+    except Exception:
+        return None
+
+
+register_process_singleton(_gfql_expr_runtime_parser_bundle, "an import-resolution bundle, None on a minimal install; re-resolving cannot change the answer")
+
+
+@lru_cache(maxsize=1)
+def _gfql_cudf_list_sort_requires_host_bridge() -> bool:
+    """cuDF 25.02 can segfault in list-sort pivot internals; bridge to pandas there."""
+    try:
+        import cudf  # type: ignore
+    except (ModuleNotFoundError, ImportError):
+        return False
+    version = str(getattr(cudf, "__version__", ""))
+    match = re.match(r"^(\d+)\.(\d+)", version)
+    if match is None:
+        return False
+    major = int(match.group(1))
+    minor = int(match.group(2))
+    return (major, minor) <= (25, 2)
+
+
+register_process_singleton(_gfql_cudf_list_sort_requires_host_bridge, "probes the installed cuDF version for a segfaulting list-sort; the installed version cannot change inside a process")
+
+
+def _gfql_bridge_cudf_df_to_pandas(work_df: Any) -> Any:
+    """Prefer Arrow bridge for cuDF host conversion on older RAPIDS releases."""
+    if hasattr(work_df, "to_arrow"):
+        arrow_table = work_df.to_arrow()
+        if hasattr(arrow_table, "to_pylist"):
+            return pd.DataFrame(arrow_table.to_pylist(), columns=list(work_df.columns))
+        return arrow_table.to_pandas()
+    return work_df.to_pandas()
+
+
+def _gfql_bridge_cudf_series_to_pandas(values: Any, index: Any) -> Any:
+    """Prefer Arrow bridge for cuDF Series host conversion on older RAPIDS releases."""
+    if hasattr(values, "to_arrow"):
+        return pd.Series(values.to_arrow().to_pylist(), index=index)
+    if hasattr(values, "to_pandas"):
+        out = values.to_pandas()
+        if hasattr(out, "index") and len(out) == len(index):
+            out.index = index
+        return out
+    return values
+
+
+def _gfql_projected_values_to_pandas_frame(projected: Dict[str, Any], row_count: int) -> pd.DataFrame:
+    index = pd.RangeIndex(row_count)
+    data: Dict[str, Any] = {}
+    for alias, value in projected.items():
+        if isinstance(value, pd.Series):
+            if len(value) != row_count:
+                raise ValueError(f"projected column {alias!r} has {len(value)} rows, expected {row_count}")
+            data[alias] = pd.Series(value.tolist(), index=index, dtype=value.dtype)
+        elif hasattr(value, "to_pandas") or hasattr(value, "to_arrow"):
+            data[alias] = _gfql_bridge_cudf_series_to_pandas(value, index)
+        else:
+            data[alias] = value
+    return pd.DataFrame(data, index=index)[list(projected.keys())]
+
+
+def _gfql_cudf_list_sort_series_requires_host_bridge(series: Any) -> bool:
+    """Detect cuDF list-series shapes that cannot participate in tokenization on GPU."""
+    try:
+        series.astype(str)
+        return False
+    except Exception:
+        return True
+
+
+ROW_PIPELINE_CALLS = frozenset(
+    {
+        "rows",
+        "semi_apply_mark",
+        "anti_semi_apply",
+        "search_any",
+        "join_apply",
+        "where_rows",
+        "select",
+        "with_",
+        "return_",
+        "order_by",
+        "skip",
+        "limit",
+        "distinct",
+        "unwind",
+        "group_by",
+        "fill_empty_row",
+        "drop_cols",
+        "count_table",
+    }
+)
+
+
+def is_row_pipeline_call(function: str) -> bool:
+    return function in ROW_PIPELINE_CALLS
+
+
+
+def _rows_where(frame: DataFrameT, mask: SeriesT) -> DataFrameT:
+    """Keep the rows where ``mask`` is True, by position: a mask evaluated on a renamed
+    view of ``frame`` may carry a fresh RangeIndex while ``frame`` keeps the labels of an
+    earlier filter, so label alignment (``.loc``) is not the contract here."""
+    return frame[mask.values]
+
+class RowPipelineMixin:
+    # Mirrors the GFQL execution-context fields declared on Plottable: this mixin
+    # is also used by `_RowPipelineAdapter`, which is not a PlotterBase, so the
+    # defaults must exist here too for typed access to be total.
+    _gfql_index_policy: str = "use"
+    _gfql_index_registry: Optional["GfqlIndexRegistry"] = None
+    _gfql_indexed_bindings_handoff: Optional["IndexedBindingsHandoff"] = None
+    _gfql_shortest_path_backend: str = "auto"
+
+    _g: Optional["Plottable"] = None
+    _gfql_start_nodes: Optional["DataFrameT"] = None
+    _gfql_rows_base_graph: Optional["Plottable"] = None
+    _gfql_rows_edge_aliases: Optional[Iterable[str]] = None
+    _nodes: Any
+    _edges: Any
+    _node: Any
+    _source: Any
+    _destination: Any
+    _edge: Any
+
+    def bind(self) -> "Plottable":
+        raise NotImplementedError("RowPipelineMixin.bind() must be implemented by host plotter")
+
+    _GFQL_ALIAS_PROP_RE = re.compile(r"^(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\.(?P<prop>[A-Za-z_][A-Za-z0-9_]*)$")
+
+    @staticmethod
+    def _gfql_has_bindings_alias_prefix(table_df: Any, alias: str) -> bool:
+        prefix = f"{alias}."
+        return any(isinstance(col, str) and col.startswith(prefix) for col in table_df.columns)
+
+    def _gfql_node_id_column(self) -> Optional[str]:
+        node_id = self._node
+        if node_id is not None:
+            return cast(str, node_id)
+        base_graph = self._gfql_base_graph()
+        if base_graph is None:
+            return None
+        return cast(Optional[str], base_graph._node)
+
+    def _gfql_base_graph(self, *, fallback_to_self: bool = False) -> Any:
+        base_graph = self._gfql_rows_base_graph
+        if base_graph is None:
+            base_graph = self._g
+        if base_graph is None and fallback_to_self:
+            return self
+        return base_graph
+
+    @staticmethod
+    def _gfql_native_shortest_path_cache(base_graph: Any) -> Optional[Dict[Any, Any]]:
+        """Per-graph cache of built igraph/cugraph state, shared across the pairwise
+        shortestPath ops of ONE query execution (each op runs on a fresh row-pipeline
+        adapter, but they all resolve the same persistent ``base_graph``).
+
+        Attached to the persistent base graph, NOT the per-op adapter, and RESET whenever the
+        bound edge-frame identity changes. A functional rebind (``g.edges(...)`` / ``g.nodes(...)``)
+        yields a new base graph with no cache attribute, and an in-place ``base_graph._edges = ...``
+        reassignment flips the edges token below -- so neither returns stale state (the BLOCKER-1
+        rebind class). NOT detected: in-place CONTENT mutation of the same bound edge frame without
+        a rebind (``base_graph._edges.iloc[...] = ...``), a library-wide assumption for bound frames.
+        Returns None when there is no graph to attach to (caching disabled; correctness unaffected --
+        ``_get_or_build_cached_state`` treats a None cache as always-rebuild).
+        """
+        edges = getattr(base_graph, "_edges", None)
+        if edges is None:
+            return None
+        cache = getattr(base_graph, "_gfql_native_sp_cache", None)
+        if not isinstance(cache, dict) or cache.get("__edges_strong_ref__") is not edges:
+            cache = {"__edges_strong_ref__": edges}
+            try:
+                base_graph._gfql_native_sp_cache = cache
+            except Exception:
+                return None  # cannot attach (e.g. frozen/slots) -> skip caching
+        return cache
+
+    @staticmethod
+    def _gfql_fresh_col_name(columns: Any, prefix: str) -> str:
+        col = prefix
+        while col in columns:
+            col = f"{col}_x"
+        return col
+
+    @staticmethod
+    def _gfql_coerce_case_branch_dtypes(a: Any, b: Any) -> "Tuple[Any, Any]":  # pragma: no cover - only reached from the cuDF CASE-mixed-dtype retry above; no cuDF coverage lane (validated on dgx)
+        """Cast two CASE branches to a common dtype for engines (cuDF) whose ``.where`` rejects
+        mismatched dtypes, where pandas coerces. Prefer a numeric common type (covers int / float /
+        null — the shortestPath hops branch); fall back to string; last resort return unchanged so
+        the caller re-raises the original error rather than masking an unexpected failure."""
+        for target in ("float64",):
+            try:
+                return a.astype(target), b.astype(target)
+            except Exception:
+                continue
+        try:
+            return a.astype("str"), b.astype("str")
+        except Exception:
+            return a, b
+
+    @staticmethod
+    def _gfql_mask_fill(series: Any, mask: Any, value: Any) -> Any:
+        out = series.copy()
+        has_mask = True
+        if hasattr(mask, "any"):
+            try:
+                has_mask = bool(mask.any())
+            except Exception:
+                has_mask = True
+        if not has_mask:
+            return out
+        if value is None and hasattr(out, "astype") and not out.__class__.__module__.startswith("cudf"):
+            out = out.astype("object")
+        out.loc[mask] = value
+        return out
+
+    @staticmethod
+    def _gfql_table_has_graph_shape(table_df: Any) -> bool:
+        cols = {str(col) for col in table_df.columns}
+        return (
+            "id" in cols
+            or "s" in cols
+            or "d" in cols
+            or "src" in cols
+            or "dst" in cols
+            or "edge_id" in cols
+            or "type" in cols
+            or any(col.startswith(LABEL_FLAG_PREFIX) for col in cols)
+        )
+
+    @staticmethod
+    def _gfql_infer_graph_table_kind(table_df: Any) -> Literal["nodes", "edges"]:
+        cols = {str(col) for col in table_df.columns}
+        if {"s", "d"} <= cols or {"src", "dst"} <= cols or "edge_id" in cols:
+            return "edges"
+        return "nodes"
+
+    @staticmethod
+    def _gfql_value_is_structural(value: Any) -> bool:
+        return isinstance(value, (list, tuple, Mapping))
+
+    @staticmethod
+    def _gfql_nullable_structural_equal(left: Any, right: Any) -> Optional[bool]:
+        if RowPipelineMixin._gfql_is_cypher_null_scalar(left) or RowPipelineMixin._gfql_is_cypher_null_scalar(right):
+            return None
+
+        left_is_list = isinstance(left, (list, tuple))
+        right_is_list = isinstance(right, (list, tuple))
+        if left_is_list or right_is_list:
+            if not (left_is_list and right_is_list):
+                return False
+            if len(left) != len(right):
+                return False
+            saw_unknown = False
+            for left_item, right_item in zip(left, right):
+                item_equal = RowPipelineMixin._gfql_nullable_structural_equal(left_item, right_item)
+                if item_equal is False:
+                    return False
+                if item_equal is None:
+                    saw_unknown = True
+            return None if saw_unknown else True
+
+        left_is_map = isinstance(left, Mapping)
+        right_is_map = isinstance(right, Mapping)
+        if left_is_map or right_is_map:
+            if not (left_is_map and right_is_map):
+                return False
+            left_keys = set(left.keys())
+            right_keys = set(right.keys())
+            if left_keys != right_keys:
+                return False
+            saw_unknown = False
+            for key in left.keys():
+                item_equal = RowPipelineMixin._gfql_nullable_structural_equal(left[key], right[key])
+                if item_equal is False:
+                    return False
+                if item_equal is None:
+                    saw_unknown = True
+            return None if saw_unknown else True
+
+        try:
+            equals = left == right
+        except Exception:
+            return False
+        if is_null_scalar(equals):
+            return None
+        return bool(equals)
+
+    def _gfql_eval_comparison_op(
+        self, table_df: Any, left: Any, right: Any, op: str,
+        left_null_mask_override: Optional[Any] = None,  # hygiene-ok: explicit-any -- scalar-or-Series mask, evaluator-wide idiom
+        right_null_mask_override: Optional[Any] = None,  # hygiene-ok: explicit-any -- scalar-or-Series mask, evaluator-wide idiom
+    ) -> Optional[Any]:
+        cmp_fn = GFQL_COMPARISON_BINARY_OPS.get(op)
+        if cmp_fn is None:
+            return None
+
+        structural_cmp = self._gfql_eval_structural_comparison_op(table_df, left, right, op)
+        if structural_cmp is not None:
+            return structural_cmp
+        if RowPipelineMixin._gfql_is_empty_series(left) or RowPipelineMixin._gfql_is_empty_series(right):
+            return self._gfql_broadcast_scalar(table_df, False).astype(bool)
+
+        left_is_list = (
+            isinstance(left, (list, tuple))
+            or (hasattr(left, "astype") and RowPipelineMixin._gfql_series_is_list_like(left))
+        )
+        right_is_list = (
+            isinstance(right, (list, tuple))
+            or (hasattr(right, "astype") and RowPipelineMixin._gfql_series_is_list_like(right))
+        )
+        if op in GFQL_COMPARISON_BINARY_OP_NAMES and (left_is_list or right_is_list):
+            list_cmp = self._gfql_eval_list_comparison_op(table_df, left, right, op)
+            if list_cmp is not None:
+                return list_cmp
+
+        temporal_cmp = self._gfql_eval_temporal_comparison_op(table_df, left, right, op)
+        if temporal_cmp is not None:
+            return temporal_cmp
+
+        if op in ("<", ">", "<=", ">="):
+            # openCypher: ordering a BOOLEAN against a NUMBER is an incomparable
+            # cross-type comparison -> null (rows drop in WHERE), never a
+            # bool-as-int coercion. Boolean-vs-boolean ordering (false < true)
+            # stays served; the numeric-vs-string guard is the sibling of this.
+            # STRICT dtype/instance detection only -- the value-based
+            # _gfql_series_bool_like heuristic counts int 0/1 columns as bools
+            # and would null genuine numeric comparisons (IC4 sum(...) > 0).
+            def _is_strict_bool(value: Any) -> bool:  # hygiene-ok: explicit-any -- heterogeneous scalar-or-Series operands, evaluator-wide idiom
+                if isinstance(value, bool):
+                    return True
+                dtype = getattr(value, "dtype", None)
+                if dtype is None or not hasattr(value, "astype"):
+                    return False
+                try:
+                    if pd.api.types.is_bool_dtype(dtype):
+                        return True
+                    if pd.api.types.is_object_dtype(dtype) and isinstance(value, pd.Series):
+                        non_null = value.dropna()
+                        return len(non_null) > 0 and bool(non_null.map(lambda v: isinstance(v, bool)).all())
+                except Exception:
+                    return False
+                return False
+
+            def _is_numeric_nonbool(value: Any) -> bool:  # hygiene-ok: explicit-any -- heterogeneous scalar-or-Series operands, evaluator-wide idiom
+                if isinstance(value, bool):
+                    return False
+                if isinstance(value, (int, float)):
+                    return True
+                return RowPipelineMixin._gfql_cypher_numeric_kind(value) is not None
+
+            if (_is_strict_bool(left) and _is_numeric_nonbool(right)) or (
+                _is_numeric_nonbool(left) and _is_strict_bool(right)
+            ):
+                return self._gfql_broadcast_scalar(table_df, None).astype("object").where(
+                    self._gfql_broadcast_scalar(table_df, False).astype(bool), pd.NA
+                )
+
+        # A computed NaN (x % 0.0) is a VALUE to IEEE-compare; only an INPUT null nulls the result.
+        left_null_mask = (
+            left_null_mask_override
+            if left_null_mask_override is not None
+            else self._gfql_null_mask(table_df, left)
+        )
+        right_null_mask = (
+            right_null_mask_override
+            if right_null_mask_override is not None
+            else self._gfql_null_mask(table_df, right)
+        )
+        if isinstance(left, float) and math.isnan(left):
+            left_null_mask = self._gfql_broadcast_scalar(table_df, False).astype(bool)
+        if isinstance(right, float) and math.isnan(right):
+            right_null_mask = self._gfql_broadcast_scalar(table_df, False).astype(bool)
+        try:
+            out = cmp_fn(left, right)
+        except TypeError:
+            out = self._gfql_safe_mixed_comparison_op(table_df, left, right, cmp_fn)
+        if hasattr(out, "where"):
+            out = out.where(~(left_null_mask | right_null_mask), pd.NA)
+        else:
+            null_mask = left_null_mask | right_null_mask
+            if hasattr(null_mask, "where"):
+                out = self._gfql_broadcast_scalar(table_df, out).where(~null_mask, pd.NA)
+            elif bool(null_mask):
+                out = None
+        return out
+
+    @staticmethod
+    def _gfql_is_duration_text_scalar(value: object) -> bool:
+        """True for a scalar ISO-8601 duration literal (what ``duration(...)`` lowers to)."""
+        if not isinstance(value, str):
+            return False
+        return parse_duration_calendar_components(value) is not None
+
+    @staticmethod
+    def _gfql_cypher_numeric_kind(value: object) -> Optional[CypherNumericKind]:
+        """'int' / 'float' for Cypher-numeric scalars and Series; None otherwise (bools excluded)."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, numbers.Integral):
+            return "int"
+        if isinstance(value, numbers.Real):
+            return "float"
+        dtype = getattr(value, "dtype", None)
+        if dtype is not None and hasattr(value, "astype"):
+            if pd.api.types.is_bool_dtype(dtype):
+                return None
+            if pd.api.types.is_integer_dtype(dtype):
+                return "int"
+            if pd.api.types.is_float_dtype(dtype):
+                return "float"
+        return None
+
+    @staticmethod
+    def _gfql_raise_on_integer_zero_divisor(right: Any, op: str) -> None:  # hygiene-ok: explicit-any -- heterogeneous scalar-or-Series operands, evaluator-wide idiom
+        """openCypher mandates an error for integer `/ 0` and `% 0`."""
+        has_zero = (
+            bool((right == 0).any())
+            if hasattr(right, "astype")
+            else right == 0
+        )
+        if has_zero:
+            raise GFQLTypeError(
+                ErrorCode.E203,
+                f"Cypher integer '{op}' by zero",
+                field="expression",
+                value=op,
+                suggestion="Guard the divisor (engine='pandas': CASE WHEN d = 0 THEN null ELSE x / d END; the CASE guard is not yet native on polars) or use a float divisor for IEEE semantics.",
+            )
+
+    @staticmethod
+    def _gfql_truncated_int_div(left: Any, right: Any) -> Any:  # hygiene-ok: explicit-any -- heterogeneous scalar-or-Series operands, evaluator-wide idiom
+        """Integer division truncated toward zero (openCypher/Java), scalar or Series."""
+        if isinstance(left, numbers.Integral) and isinstance(right, numbers.Integral):
+            quotient = abs(int(left)) // abs(int(right))
+            return -quotient if (left < 0) != (right < 0) else quotient
+        # `.where`, not np.sign: np.sign on a cudf Series needs the cupy JIT (libnvrtc).
+        quotient = abs(left) // abs(right)
+        negative = (left < 0) != (right < 0)
+        if hasattr(quotient, "where"):
+            return quotient.where(~negative, -quotient)
+        return -quotient if negative else quotient
+
+    @staticmethod
+    def _gfql_is_cypher_null_scalar(value: Any) -> bool:
+        """Cypher null semantics treat NaN as a value, not null."""
+        if not is_null_scalar(value):
+            return False
+        return not (isinstance(value, float) and math.isnan(value))
+
+    @staticmethod
+    def _gfql_cypher_value_equal(left_value: Any, right_value: Any) -> Optional[bool]:
+        """Cypher equality with three-valued null propagation for list/map values."""
+        if RowPipelineMixin._gfql_is_cypher_null_scalar(left_value) or RowPipelineMixin._gfql_is_cypher_null_scalar(right_value):
+            return None
+
+        if isinstance(left_value, tuple):
+            left_value = list(left_value)
+        if isinstance(right_value, tuple):
+            right_value = list(right_value)
+
+        if isinstance(left_value, list) and isinstance(right_value, list):
+            if len(left_value) != len(right_value):
+                return False
+            saw_unknown = False
+            for lhs_item, rhs_item in zip(left_value, right_value):
+                item_equal = RowPipelineMixin._gfql_cypher_value_equal(lhs_item, rhs_item)
+                if item_equal is False:
+                    return False
+                if item_equal is None:
+                    saw_unknown = True
+            return None if saw_unknown else True
+
+        if isinstance(left_value, dict) and isinstance(right_value, dict):
+            if set(left_value.keys()) != set(right_value.keys()):
+                return False
+            saw_unknown = False
+            for key in left_value.keys():
+                item_equal = RowPipelineMixin._gfql_cypher_value_equal(left_value[key], right_value[key])
+                if item_equal is False:
+                    return False
+                if item_equal is None:
+                    saw_unknown = True
+            return None if saw_unknown else True
+
+        if isinstance(left_value, (list, dict)) or isinstance(right_value, (list, dict)):
+            return False
+
+        try:
+            return bool(left_value == right_value)
+        except Exception:
+            return False
+
+    def _gfql_safe_mixed_comparison_op(
+        self,
+        table_df: Any,
+        left: Any,
+        right: Any,
+        cmp_fn: Callable[[Any, Any], Any],
+    ) -> Any:
+        def _is_cudf_series(value: Any) -> bool:
+            return hasattr(value, "__class__") and value.__class__.__module__.startswith("cudf")
+
+        if _is_cudf_series(left) or _is_cudf_series(right):
+            # A cuDF column holds one dtype, so a dtype-level TypeError means every row is incomparable -> null, never False.
+            false_series = self._gfql_broadcast_scalar(table_df, False)  # pragma: no cover - cuDF-only arm; no cuDF lane in the coverage gate (validated by test_incomparable_ordering_null_1934 on cuDF 25.10)
+            return false_series.where(false_series, None)  # pragma: no cover - cuDF-only arm; same gate gap
+
+        left_series = left if hasattr(left, "astype") else self._gfql_broadcast_scalar(table_df, left)
+        right_series = right if hasattr(right, "astype") else self._gfql_broadcast_scalar(table_df, right)
+        left_values = self._gfql_series_to_pylist(left_series)
+        right_values = self._gfql_series_to_pylist(right_series)
+        out_values: List[Any] = []
+        for left_value, right_value in zip(left_values, right_values):
+            if is_null_scalar(left_value) or is_null_scalar(right_value):
+                out_values.append(pd.NA)
+                continue
+            try:
+                comparison = cmp_fn(left_value, right_value)
+            except TypeError:
+                # openCypher: comparing incomparable types yields null, never false
+                # (same rule this file states for cross-type ordering ~200 lines up).
+                # A silent False here made `WHERE n.ts > datetime('...')` drop every
+                # row AND made `NOT (...)` keep every row.
+                out_values.append(pd.NA)
+                continue
+            if is_null_scalar(comparison):
+                out_values.append(pd.NA)
+            else:
+                out_values.append(bool(comparison))
+        if isinstance(left_series, pd.Series):
+            return pd.Series(out_values, index=left_series.index, dtype="object")
+        if isinstance(right_series, pd.Series):
+            return pd.Series(out_values, index=right_series.index, dtype="object")
+        fallback = self._gfql_broadcast_scalar(table_df, False)
+        if isinstance(fallback, pd.Series):
+            return pd.Series(out_values, index=fallback.index, dtype="object")
+        return fallback
+
+    def _gfql_eval_structural_comparison_op(
+        self,
+        table_df: Any,
+        left_value: Any,
+        right_value: Any,
+        op: str,
+    ) -> Optional[Any]:
+        if op not in GFQL_EQUALITY_COMPARISON_BINARY_OPS:
+            return None
+
+        left_structural = (
+            RowPipelineMixin._gfql_value_is_structural(left_value)
+            or (
+                hasattr(left_value, "astype")
+                and (
+                    RowPipelineMixin._gfql_series_is_list_like(left_value)
+                    or RowPipelineMixin._gfql_series_is_mapping_like(left_value)
+                )
+            )
+        )
+        right_structural = (
+            RowPipelineMixin._gfql_value_is_structural(right_value)
+            or (
+                hasattr(right_value, "astype")
+                and (
+                    RowPipelineMixin._gfql_series_is_list_like(right_value)
+                    or RowPipelineMixin._gfql_series_is_mapping_like(right_value)
+                )
+            )
+        )
+
+        if not (left_structural or right_structural):
+            return None
+
+        left_series = left_value if hasattr(left_value, "astype") else self._gfql_broadcast_scalar(table_df, left_value)
+        right_series = right_value if hasattr(right_value, "astype") else self._gfql_broadcast_scalar(table_df, right_value)
+        left_values = self._gfql_series_to_pylist(left_series)
+        right_values = self._gfql_series_to_pylist(right_series)
+        out_values: List[Any] = []
+        for left_item, right_item in zip(left_values, right_values):
+            eq_out = RowPipelineMixin._gfql_nullable_structural_equal(left_item, right_item)
+            if eq_out is None:
+                out_values.append(pd.NA)
+            elif op in GFQL_INEQUALITY_EQUALITY_COMPARISON_BINARY_OPS:
+                out_values.append(not bool(eq_out))
+            else:
+                out_values.append(bool(eq_out))
+
+        left_index = getattr(left_series, "index", None)
+        right_index = getattr(right_series, "index", None)
+        out_index = left_index if left_index is not None else right_index
+        if out_index is not None and hasattr(out_index, "to_pandas"):
+            try:
+                out_index = out_index.to_pandas()
+            except Exception:
+                out_index = None
+
+        if resolve_engine(EngineAbstract.AUTO, table_df) == Engine.CUDF:
+            cudf_values = [None if is_null_scalar(v) else bool(v) for v in out_values]
+            return s_cons(Engine.CUDF)(cudf_values, index=out_index)
+        return s_cons(Engine.PANDAS)(out_values, index=out_index, dtype="object")
+
+    def _gfql_eval_temporal_comparison_op(
+        self,
+        table_df: Any,
+        left_value: Any,
+        right_value: Any,
+        op: str,
+    ) -> Optional[Any]:
+        if op not in GFQL_COMPARISON_BINARY_OP_NAMES:
+            return None
+
+        left_series = left_value if hasattr(left_value, "astype") else self._gfql_broadcast_scalar(table_df, left_value)
+        right_series = right_value if hasattr(right_value, "astype") else self._gfql_broadcast_scalar(table_df, right_value)
+        left_mode = order_detect_native_temporal_mode(left_series) or order_detect_temporal_mode(left_series)
+        right_mode = order_detect_native_temporal_mode(right_series) or order_detect_temporal_mode(right_series)
+        if left_mode is None or right_mode is None:
+            return None
+
+        def _temporal_family(mode: str) -> str:
+            if mode in {"date", "date_constructor"}:
+                return "date"
+            if mode in {"time", "time_constructor"}:
+                return "time"
+            return "datetime"
+
+        if _temporal_family(left_mode) != _temporal_family(right_mode):
+            return None
+
+        left_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_cmp_left_temporal__")
+        right_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_cmp_right_temporal__")
+        work_df = table_df.reset_index(drop=True).copy()
+        work_df = RowPipelineMixin._gfql_assign_positional(work_df, **{left_col: left_series, right_col: right_series})
+
+        work_df, left_keys = build_temporal_sort_columns(
+            work_df,
+            left_col,
+            "__gfql_cmp_left_key__",
+            left_mode,
+            null_mask_fn=self._gfql_null_mask,
+            fresh_col_name_fn=RowPipelineMixin._gfql_fresh_col_name,
+        )
+        work_df, right_keys = build_temporal_sort_columns(
+            work_df,
+            right_col,
+            "__gfql_cmp_right_key__",
+            right_mode,
+            null_mask_fn=self._gfql_null_mask,
+            fresh_col_name_fn=RowPipelineMixin._gfql_fresh_col_name,
+        )
+
+        left_null_mask = self._gfql_null_mask(work_df, work_df[left_col])
+        right_null_mask = self._gfql_null_mask(work_df, work_df[right_col])
+        any_null_mask = left_null_mask | right_null_mask
+
+        eq_out = work_df[left_keys[0]] == work_df[right_keys[0]]
+        if len(left_keys) > 1:
+            eq_out = eq_out & (work_df[left_keys[1]] == work_df[right_keys[1]])
+
+        lt_out = work_df[left_keys[0]] < work_df[right_keys[0]]
+        if len(left_keys) > 1:
+            lt_out = lt_out | (
+                (work_df[left_keys[0]] == work_df[right_keys[0]])
+                & (work_df[left_keys[1]] < work_df[right_keys[1]])
+            )
+
+        if op == "=":
+            out = eq_out
+        elif op in GFQL_INEQUALITY_EQUALITY_COMPARISON_BINARY_OPS:
+            out = ~eq_out
+        elif op == "<":
+            out = lt_out
+        elif op == "<=":
+            out = lt_out | eq_out
+        elif op == ">":
+            out = ~(lt_out | eq_out)
+        else:
+            out = ~lt_out
+
+        if hasattr(out, "where"):
+            out = out.where(~any_null_mask, pd.NA)
+        return out
+
+    def _gfql_eval_list_comparison_op(
+        self,
+        table_df: Any,
+        left_value: Any,
+        right_value: Any,
+        op: str,
+    ) -> Optional[Any]:
+        left_series = left_value if hasattr(left_value, "astype") else self._gfql_broadcast_scalar(table_df, left_value)
+        right_series = right_value if hasattr(right_value, "astype") else self._gfql_broadcast_scalar(table_df, right_value)
+
+        if not RowPipelineMixin._gfql_series_is_list_like(left_series):
+            return None
+        if not RowPipelineMixin._gfql_series_is_list_like(right_series):
+            return None
+
+        if op in GFQL_EQUALITY_COMPARISON_BINARY_OPS:
+            left_values = self._gfql_series_to_pylist(left_series)
+            right_values = self._gfql_series_to_pylist(right_series)
+            out_values: List[Any] = []
+            for left_item, right_item in zip(left_values, right_values):
+                is_equal = RowPipelineMixin._gfql_cypher_value_equal(left_item, right_item)
+                if op in GFQL_INEQUALITY_EQUALITY_COMPARISON_BINARY_OPS:
+                    if is_equal is None:
+                        out_values.append(None)
+                    else:
+                        out_values.append(not is_equal)
+                else:
+                    out_values.append(is_equal)
+            out_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_list_cmp_eq__")
+            return RowPipelineMixin._gfql_tri_valued_series(table_df, out_values, out_col)
+
+        if op in GFQL_ORDERED_COMPARISON_BINARY_OPS:
+            left_values = self._gfql_series_to_pylist(left_series)
+            right_values = self._gfql_series_to_pylist(right_series)
+            ordered_out_values: List[Optional[bool]] = []
+            for left_item, right_item in zip(left_values, right_values):
+                if is_null_scalar(left_item) or is_null_scalar(right_item):
+                    ordered_out_values.append(None)
+                    continue
+                try:
+                    if op == "<":
+                        ordered_out_values.append(left_item < right_item)
+                    elif op == "<=":
+                        ordered_out_values.append(left_item <= right_item)
+                    elif op == ">":
+                        ordered_out_values.append(left_item > right_item)
+                    else:
+                        ordered_out_values.append(left_item >= right_item)
+                except Exception:
+                    ordered_out_values.append(None)
+            out_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_list_cmp_py__")
+            return RowPipelineMixin._gfql_tri_valued_series(table_df, ordered_out_values, out_col)
+
+        row_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_list_cmp_row__")
+        lhs_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_list_cmp_lhs__")
+        rhs_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_list_cmp_rhs__")
+        lhs_len_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_list_cmp_lhs_len__")
+        rhs_len_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_list_cmp_rhs_len__")
+        pos_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_list_cmp_pos__")
+        match_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_list_cmp_match__")
+        unknown_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_list_cmp_unknown__")
+
+        base = table_df.assign(**{row_col: range(len(table_df)), lhs_col: left_series, rhs_col: right_series})
+        left_null = self._gfql_null_mask(base, base[lhs_col])
+        right_null = self._gfql_null_mask(base, base[rhs_col])
+        null_mask = left_null | right_null
+
+        lhs_len = series_sequence_len(base[lhs_col]).fillna(0).astype("int64")
+        rhs_len = series_sequence_len(base[rhs_col]).fillna(0).astype("int64")
+        base = base.assign(**{lhs_len_col: lhs_len, rhs_len_col: rhs_len})
+
+        non_null = base.loc[~null_mask, [row_col, lhs_col, rhs_col, lhs_len_col, rhs_len_col]].copy()
+        if len(non_null) == 0:
+            return self._gfql_broadcast_scalar(table_df, pd.NA)
+
+        lhs_expanded = non_null[[row_col, lhs_col, lhs_len_col]].explode(lhs_col)
+        rhs_expanded = non_null[[row_col, rhs_col, rhs_len_col]].explode(rhs_col)
+
+        if len(lhs_expanded) > 0:
+            lhs_expanded = lhs_expanded.assign(**{pos_col: lhs_expanded.groupby(row_col, sort=False).cumcount()})
+            lhs_expanded = lhs_expanded.loc[lhs_expanded[pos_col] < lhs_expanded[lhs_len_col]]
+        if len(rhs_expanded) > 0:
+            rhs_expanded = rhs_expanded.assign(**{pos_col: rhs_expanded.groupby(row_col, sort=False).cumcount()})
+            rhs_expanded = rhs_expanded.loc[rhs_expanded[pos_col] < rhs_expanded[rhs_len_col]]
+
+        expanded = lhs_expanded.merge(
+            rhs_expanded[[row_col, rhs_col, pos_col]],
+            on=[row_col, pos_col],
+            how="outer",
+            sort=False,
+        )
+
+        if len(expanded) > 0:
+            lhs_elem = expanded[lhs_col]
+            rhs_elem = expanded[rhs_col]
+            lhs_elem_null = self._gfql_null_mask(expanded, lhs_elem)
+            rhs_elem_null = self._gfql_null_mask(expanded, rhs_elem)
+            both_null = lhs_elem_null & rhs_elem_null
+            elem_equal = lhs_elem == rhs_elem
+            if hasattr(elem_equal, "where"):
+                elem_equal = elem_equal.where(~(lhs_elem_null | rhs_elem_null), both_null)
+            else:
+                elem_equal = both_null if bool(lhs_elem_null | rhs_elem_null) else elem_equal
+            elem_unknown = (lhs_elem_null | rhs_elem_null) & (~both_null)
+            eval_df = expanded.assign(
+                **{
+                    match_col: elem_equal.astype("int64"),
+                    unknown_col: elem_unknown.astype("int64"),
+                }
+            )
+            match_counts = eval_df.groupby(row_col, sort=False)[match_col].sum().reset_index()
+            unknown_counts = eval_df.groupby(row_col, sort=False)[unknown_col].sum().reset_index()
+        else:
+            match_counts = non_null[[row_col]].iloc[0:0].copy()
+            match_counts[match_col] = []
+            unknown_counts = non_null[[row_col]].iloc[0:0].copy()
+            unknown_counts[unknown_col] = []
+
+        summary = base[[row_col, lhs_len_col, rhs_len_col]].merge(match_counts, on=row_col, how="left", sort=False)
+        summary = summary.merge(unknown_counts, on=row_col, how="left", sort=False)
+        summary = self._gfql_restore_row_order(summary, row_col)
+        summary = summary.assign(
+            **{
+                match_col: summary[match_col].fillna(0).astype("int64"),
+                unknown_col: summary[unknown_col].fillna(0).astype("int64"),
+            }
+        )
+        lengths_equal = summary[lhs_len_col] == summary[rhs_len_col]
+        known_equal = lengths_equal & (summary[match_col] == summary[lhs_len_col])
+        unknown_equal = lengths_equal & (summary[match_col] + summary[unknown_col] == summary[lhs_len_col]) & (~known_equal)
+
+        out = self._gfql_broadcast_scalar(summary, False)
+        out = out.where(~unknown_equal, pd.NA)
+        out = out.where(~known_equal, True)
+        out = out.where(~null_mask, pd.NA)
+        if op in GFQL_INEQUALITY_EQUALITY_COMPARISON_BINARY_OPS:
+            out = (~out.astype("boolean")).where(~out.isna(), pd.NA)
+        return out.reset_index(drop=True)
+
+    @staticmethod
+    def _gfql_report_absent_property(name: str) -> None:
+        """Route an absent row-expression property through the shared strictness
+        resolution: raise under ``strict``, warn once under ``warn``."""
+        from graphistry.compute.gfql.strictness import (
+            absent_name_is_lenient,
+            is_internal_plumbing_name,
+        )
+
+        if is_internal_plumbing_name(name):
+            return
+        if absent_name_is_lenient(name, kind="property", context="row table"):
+            return
+        from graphistry.compute.exceptions import ErrorCode, GFQLSchemaError
+
+        raise GFQLSchemaError(
+            ErrorCode.E301,
+            f'Property "{name}" does not exist in row table',
+            field=name,
+            value=name,
+            suggestion='Pass strict="warn" (default) to resolve absent properties to null',
+        )
+
+    def _gfql_eval_expr_ast(self, table_df: DataFrameT, node: Any) -> Tuple[bool, Any]:  # hygiene-ok: explicit-any -- parser AST node union
+        """Evaluate an expression AST. Every series result leaves here on the table's own
+        index, so label-aligned builders (NOT, AND/OR) and positionally built operands agree
+        whatever frame the index path handed in."""
+        ok, value = self._gfql_eval_expr_ast_values(table_df, node)
+        if ok and is_series_like(value):
+            value = RowPipelineMixin._gfql_on_table_index(table_df, value)
+        return ok, value
+
+    def _gfql_eval_expr_ast_values(self, table_df: Any, node: Any) -> Tuple[bool, Any]:
+        parser_bundle = _gfql_expr_runtime_parser_bundle()
+        if parser_bundle is None:
+            return False, None
+        _parse_expr, _validate_expr_capabilities, expr_parser_mod = parser_bundle
+
+        Identifier = expr_parser_mod.Identifier
+        Literal = expr_parser_mod.Literal
+        UnaryOp = expr_parser_mod.UnaryOp
+        BinaryOp = expr_parser_mod.BinaryOp
+        IsNullOp = expr_parser_mod.IsNullOp
+        FunctionCall = expr_parser_mod.FunctionCall
+        CaseWhen = expr_parser_mod.CaseWhen
+        QuantifierExpr = expr_parser_mod.QuantifierExpr
+        ListComprehension = expr_parser_mod.ListComprehension
+        ListLiteral = expr_parser_mod.ListLiteral
+        MapLiteral = expr_parser_mod.MapLiteral
+        PropertyAccessExpr = expr_parser_mod.PropertyAccessExpr
+        SubscriptExpr = expr_parser_mod.SubscriptExpr
+        SliceExpr = expr_parser_mod.SliceExpr
+
+        if isinstance(node, Identifier):
+            txt = node.name
+            if txt in table_df.columns:
+                return True, table_df[txt]
+            return True, self._gfql_resolve_token(table_df, txt)
+
+        if isinstance(node, Literal):
+            value = node.value
+            if isinstance(value, (list, tuple, dict)):
+                return True, self._gfql_broadcast_scalar(table_df, value)
+            return True, value
+
+        if isinstance(node, ListLiteral):
+            item_values: List[Any] = []
+            for item in node.items:
+                ok, val = self._gfql_eval_expr_ast(table_df, item)
+                if not ok:
+                    return False, None
+                item_values.append(val)
+            if not any(hasattr(val, "astype") for val in item_values):
+                return True, list(item_values)
+
+            # cuDF groupby-collect has no within-group order guarantee; build the list column-wise.
+            if resolve_engine(EngineAbstract.AUTO, table_df) == Engine.CUDF:
+                _rc = len(table_df)
+                _items: List[List[Any]] = []
+                for val in item_values:
+                    if hasattr(val, "astype"):
+                        _items.append(RowPipelineMixin._gfql_series_to_pylist(val))
+                    else:
+                        _items.append([val] * _rc)
+                _out_vals = [[_items[ci][ri] for ci in range(len(_items))] for ri in range(_rc)]
+                return True, self._gfql_series_from_row_values(table_df, _out_vals, "__gfql_ast_list__")
+
+            row_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_ast_list_row__")
+            ord_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_ast_list_ord__")
+            val_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_ast_list_val__")
+
+            base = table_df.assign(**{row_col: range(len(table_df))})[[row_col]]
+            value_cols: List[str] = []
+            for idx, val in enumerate(item_values):
+                if not hasattr(val, "astype"):
+                    val = self._gfql_broadcast_scalar(table_df, val)
+                col = RowPipelineMixin._gfql_fresh_col_name(base.columns, f"__gfql_ast_item_{idx}__")
+                base[col] = val
+                value_cols.append(col)
+
+            try:
+                melted = base.melt(id_vars=[row_col], value_vars=value_cols, var_name=ord_col, value_name=val_col)
+                order_map = {col: idx for idx, col in enumerate(value_cols)}
+                if hasattr(melted[ord_col], "map"):
+                    melted[ord_col] = safe_map_series(melted[ord_col], order_map)
+                else:
+                    melted[ord_col] = melted[ord_col].replace(order_map)
+                melted[ord_col] = melted[ord_col].astype("int64")
+                melted = melted.sort_values(by=[row_col, ord_col], kind="mergesort")
+                grouped = melted.groupby(row_col, sort=False)[val_col].agg(list).reset_index()
+                out = self._gfql_restore_row_order(
+                    base[[row_col]].merge(grouped, on=row_col, how="left", sort=False),
+                    row_col,
+                )[val_col]
+                return True, out.reset_index(drop=True)
+            except Exception:
+                row_count = len(table_df)
+                materialized_items: List[List[Any]] = []
+                for val in item_values:
+                    if hasattr(val, "astype"):
+                        materialized_items.append(RowPipelineMixin._gfql_series_to_pylist(val))
+                    else:
+                        materialized_items.append([val] * row_count)
+                out_values = [
+                    [materialized_items[col_idx][row_idx] for col_idx in range(len(materialized_items))]
+                    for row_idx in range(row_count)
+                ]
+                return True, self._gfql_series_from_row_values(table_df, out_values, "__gfql_ast_list__")
+
+        if isinstance(node, MapLiteral):
+            out_map: Dict[str, Any] = {}
+            saw_vector = False
+            for key, value_node in node.items:
+                ok, value = self._gfql_eval_expr_ast(table_df, value_node)
+                if not ok:
+                    return False, None
+                if hasattr(value, "astype"):
+                    saw_vector = True
+                out_map[str(key)] = value
+            if saw_vector:
+                row_count = len(table_df)
+                keys = list(out_map.keys())
+                columns: Dict[str, List[Any]] = {}
+                for key in keys:
+                    value = out_map[key]
+                    if hasattr(value, "astype"):
+                        column_values = RowPipelineMixin._gfql_series_to_pylist(value)
+                        if len(column_values) != row_count:
+                            raise ValueError(
+                                "unsupported row expression: map literal value length mismatch"
+                            )
+                        columns[key] = column_values
+                    else:
+                        columns[key] = [value] * row_count
+                out_maps = [
+                    {key: columns[key][row_idx] for key in keys}
+                    for row_idx in range(row_count)
+                ]
+                return True, self._gfql_series_from_row_values(table_df, out_maps, "__gfql_ast_map__")
+            return True, out_map
+
+        if isinstance(node, PropertyAccessExpr):
+            if isinstance(node.value, Identifier):
+                alias_name = node.value.name
+                if alias_name == node.property:
+                    restore_col = shadow_restore_column(alias_name)
+                    if restore_col in table_df.columns:
+                        # the alias marker overwrote this same-named user column; rows() re-keyed it
+                        return True, table_df[restore_col]
+                # Quoted aliases are raw user identifiers; punctuation in their spelling
+                # is not qualified-column syntax.
+                if (node.value.quoted or "." not in alias_name) and RowPipelineMixin._gfql_has_bindings_alias_prefix(table_df, alias_name):
+                    if node.property == NODE_IDENTITY_COLUMN:
+                        node_id = self._gfql_node_id_column()
+                        identity_col = f"{alias_name}.{node_id}" if node_id else None
+                        if identity_col is not None and identity_col in table_df.columns:
+                            return True, table_df[identity_col]
+                        return True, self._gfql_broadcast_scalar(table_df, pd.NA)
+                    binding_col = f"{alias_name}.{node.property}"
+                    if binding_col in table_df.columns:
+                        return True, table_df[binding_col]
+                    self._gfql_report_absent_property(binding_col)
+                    return True, self._gfql_broadcast_scalar(table_df, pd.NA)
+                has_bound_graph_table = (
+                    (self._node is not None and self._node in table_df.columns)
+                    or (self._edge is not None and self._edge in table_df.columns)
+                    or RowPipelineMixin._gfql_table_has_graph_shape(table_df)
+                )
+                if (
+                    (node.value.quoted or "." not in alias_name)
+                    and alias_name in table_df.columns
+                    and has_bound_graph_table
+                    and RowPipelineMixin._gfql_series_bool_like(table_df[alias_name])
+                ):
+                    alias_mask = table_df[alias_name]
+                    if node.property == NODE_IDENTITY_COLUMN:
+                        node_id = self._gfql_node_id_column()
+                        prop_value = (
+                            table_df[node_id]
+                            if node_id is not None and node_id in table_df.columns
+                            else self._gfql_broadcast_scalar(table_df, None)
+                        )
+                        if hasattr(prop_value, "where"):
+                            prop_value = self._gfql_mask_fill(prop_value, alias_mask != True, None)  # noqa: E712
+                        return True, prop_value
+                    if node.property not in table_df.columns:
+                        self._gfql_report_absent_property(f"{alias_name}.{node.property}")
+                    prop_value = (
+                        table_df[node.property]
+                        if node.property in table_df.columns
+                        else self._gfql_broadcast_scalar(table_df, None)
+                    )
+                    if hasattr(prop_value, "where"):
+                        prop_value = self._gfql_mask_fill(prop_value, alias_mask != True, None)  # noqa: E712
+                    return True, prop_value
+            ok, value = self._gfql_eval_expr_ast(table_df, node.value)
+            if not ok:
+                return False, None
+            return True, self._gfql_eval_property_access_value(
+                table_df,
+                value,
+                node.property,
+                f"ast property access .{node.property}",
+            )
+
+        if isinstance(node, IsNullOp):
+            ok, value = self._gfql_eval_expr_ast(table_df, node.value)
+            if not ok:
+                return False, None
+            out = self._gfql_null_mask(table_df, value)
+            if node.negated:
+                out = ~out
+            return True, out
+
+        if isinstance(node, UnaryOp):
+            ok, operand = self._gfql_eval_expr_ast(table_df, node.operand)
+            if not ok:
+                return False, None
+            if node.op == "+":
+                return True, operand
+            if node.op == "-":
+                return True, 0 - operand
+            if node.op == "not":
+                bool_out = self._gfql_eval_boolean_op(table_df, operand, _GFQL_MISSING_BOOL_OPERAND, "not")
+                if bool_out is None:
+                    return False, None
+                return True, bool_out
+            raise GFQLTypeError(
+                ErrorCode.E203,
+                f"Unsupported Cypher unary operator: {node.op!r}",
+                field="expression",
+                value=str(node.op),
+                suggestion=f"Use one of {sorted(GFQL_ALLOWED_UNARY_OPS)}.",
+            )
+
+        if isinstance(node, BinaryOp):
+            op = str(node.op).lower()
+
+            if op in {"or", "and"}:
+                prefer_right = (
+                    isinstance(node.right, IsNullOp)
+                    or (isinstance(node.right, Literal) and isinstance(node.right.value, bool))
+                ) and not (
+                    isinstance(node.left, IsNullOp)
+                    or (isinstance(node.left, Literal) and isinstance(node.left.value, bool))
+                )
+                first_node = node.right if prefer_right else node.left
+                second_node = node.left if prefer_right else node.right
+                ok_first, first = self._gfql_eval_expr_ast(table_df, first_node)
+                if not ok_first:
+                    return False, None
+                short = self._gfql_boolean_short_circuit_result(table_df, first, op)
+                if short is not None:
+                    return True, short
+                ok_second, second = self._gfql_eval_expr_ast(table_df, second_node)
+                if not ok_second:
+                    return False, None
+                if prefer_right:
+                    left, right = second, first
+                else:
+                    left, right = first, second
+                bool_out = self._gfql_eval_boolean_op(table_df, left, right, op)
+                if bool_out is None:
+                    return False, None
+                return True, bool_out
+
+            ok_l, left = self._gfql_eval_expr_ast(table_df, node.left)
+            ok_r, right = self._gfql_eval_expr_ast(table_df, node.right)
+            if not (ok_l and ok_r):
+                return False, None
+
+            if op == "xor":
+                bool_out = self._gfql_eval_boolean_op(table_df, left, right, op)
+                if bool_out is None:
+                    return False, None
+                return True, bool_out
+
+            def _arith_input_null_mask(operand_node: Any) -> Optional[Any]:  # hygiene-ok: explicit-any -- AST node + scalar-or-Series mask
+                """Input-null mask of an ARITHMETIC subtree; None -> caller falls back
+                to isna-of-result. Separates a genuine null input from a computed NaN."""
+                if isinstance(operand_node, BinaryOp) and str(operand_node.op).lower() in {"+", "-", "*", "/", "%"}:
+                    left_mask = _arith_input_null_mask(operand_node.left)
+                    right_mask = _arith_input_null_mask(operand_node.right)
+                    if left_mask is None or right_mask is None:
+                        return None
+                    return left_mask | right_mask
+                if isinstance(operand_node, UnaryOp) and str(operand_node.op) in {"+", "-"}:
+                    return _arith_input_null_mask(operand_node.operand)
+                ok_operand, operand_value = self._gfql_eval_expr_ast(table_df, operand_node)
+                if not ok_operand:
+                    return None
+                return self._gfql_null_mask(table_df, operand_value)
+
+            def _is_arith_node(operand_node: Any) -> bool:  # hygiene-ok: explicit-any -- AST node union
+                return isinstance(operand_node, BinaryOp) and str(operand_node.op).lower() in {"+", "-", "*", "/", "%"}
+
+            left_mask_override = _arith_input_null_mask(node.left) if _is_arith_node(node.left) else None
+            right_mask_override = _arith_input_null_mask(node.right) if _is_arith_node(node.right) else None
+            cmp_out = RowPipelineMixin._gfql_eval_comparison_op(
+                self, table_df, left, right, op,
+                left_null_mask_override=left_mask_override,
+                right_null_mask_override=right_mask_override,
+            )
+            if cmp_out is not None:
+                return True, cmp_out
+
+            if op == "in":
+                return True, self._gfql_eval_in_expr(table_df, left, right, "ast IN")
+            if op == "contains":
+                return True, self._gfql_eval_string_predicate_expr(table_df, left, right, "contains", "ast CONTAINS")
+            if op == "starts_with":
+                return True, self._gfql_eval_string_predicate_expr(table_df, left, right, "starts_with", "ast STARTS WITH")
+            if op == "ends_with":
+                return True, self._gfql_eval_string_predicate_expr(table_df, left, right, "ends_with", "ast ENDS WITH")
+            if op == "regex":
+                return True, self._gfql_eval_string_predicate_expr(table_df, left, right, "regex", "ast =~")
+
+            if op == "+":
+                if left is None or right is None:
+                    return True, None  # Cypher: null + anything -> null
+                if RowPipelineMixin._gfql_is_duration_text_scalar(left) or RowPipelineMixin._gfql_is_duration_text_scalar(right):
+                    # Literal temporal arithmetic is constant-folded in
+                    # temporal/folding.py; anything still carrying an ISO duration
+                    # here has a non-literal operand we cannot evaluate. Decline
+                    # typed, exactly as '-' already does -- Python str+str would
+                    # silently concatenate and change WHERE row sets.
+                    return False, None
+                if isinstance(left, (list, tuple)) and not isinstance(right, (list, tuple)):
+                    right_is_series = hasattr(right, "astype")
+                    right_is_list = right_is_series and RowPipelineMixin._gfql_series_is_list_like(right)
+                    if right_is_list:
+                        out = right
+                        for item in reversed(list(left)):
+                            out = self._gfql_concat_list_scalar(
+                                table_df,
+                                out,
+                                self._gfql_broadcast_scalar(table_df, item),
+                                prepend=True,
+                            )
+                        return True, out
+                    if right_is_series:
+                        left_series = self._gfql_broadcast_scalar(table_df, list(left))
+                        return True, self._gfql_concat_list_scalar(table_df, left_series, right, prepend=False)
+                    return True, list(left) + [right]
+                if isinstance(right, (list, tuple)) and not isinstance(left, (list, tuple)):
+                    left_is_series = hasattr(left, "astype")
+                    left_is_list = left_is_series and RowPipelineMixin._gfql_series_is_list_like(left)
+                    if left_is_list:
+                        out = left
+                        for item in list(right):
+                            out = self._gfql_concat_list_scalar(
+                                table_df,
+                                out,
+                                self._gfql_broadcast_scalar(table_df, item),
+                                prepend=False,
+                            )
+                        return True, out
+                    if left_is_series:
+                        right_series = self._gfql_broadcast_scalar(table_df, list(right))
+                        return True, self._gfql_concat_list_scalar(table_df, right_series, left, prepend=True)
+                    return True, [left] + list(right)
+                if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+                    return True, list(left) + list(right)
+                left_is_list = hasattr(left, "astype") and RowPipelineMixin._gfql_series_is_list_like(left)
+                right_is_list = hasattr(right, "astype") and RowPipelineMixin._gfql_series_is_list_like(right)
+                if left_is_list and not right_is_list:
+                    if not hasattr(right, "astype"):
+                        right = self._gfql_broadcast_scalar(table_df, right)
+                    return True, self._gfql_concat_list_scalar(table_df, left, right, prepend=False)
+                if right_is_list and not left_is_list:
+                    if not hasattr(left, "astype"):
+                        left = self._gfql_broadcast_scalar(table_df, left)
+                    return True, self._gfql_concat_list_scalar(table_df, right, left, prepend=True)
+                return True, left + right
+            if op == "-":
+                if left is None or right is None:
+                    return True, None
+                return True, left - right
+            if op == "*":
+                if left is None or right is None:
+                    return True, None
+                return True, left * right
+            if op == "/":
+                if left is None or right is None:
+                    return True, None
+                left_kind = RowPipelineMixin._gfql_cypher_numeric_kind(left)
+                right_kind = RowPipelineMixin._gfql_cypher_numeric_kind(right)
+                if left_kind == "int" and right_kind == "int":
+                    RowPipelineMixin._gfql_raise_on_integer_zero_divisor(right, "/")
+                    return True, RowPipelineMixin._gfql_truncated_int_div(left, right)
+                try:
+                    return True, left / right
+                except ZeroDivisionError:
+                    if isinstance(left, (int, float)) and not isinstance(left, bool) and isinstance(right, (int, float)):
+                        # float division by a zero literal: IEEE semantics (Neo4j parity)
+                        if left == 0:
+                            return True, float("nan")
+                        return True, float("inf") if left > 0 else float("-inf")
+                    return False, None
+            if op == "%":
+                if left is None or right is None:
+                    return True, None
+                if (hasattr(left, "astype") and RowPipelineMixin._gfql_series_bool_like(left)) or (
+                    hasattr(right, "astype") and RowPipelineMixin._gfql_series_bool_like(right)
+                ):
+                    return False, None
+                if isinstance(left, bool) or isinstance(right, bool):
+                    return False, None
+                left_kind = RowPipelineMixin._gfql_cypher_numeric_kind(left)
+                right_kind = RowPipelineMixin._gfql_cypher_numeric_kind(right)
+                if left_kind is not None and right_kind is not None:
+                    if left_kind == "int" and right_kind == "int":
+                        RowPipelineMixin._gfql_raise_on_integer_zero_divisor(right, "%")
+                        quotient = RowPipelineMixin._gfql_truncated_int_div(left, right)
+                        return True, left - quotient * right
+                    import numpy as np
+                    return True, np.fmod(left, right)
+                return True, left % right
+
+            return False, None
+
+        if isinstance(node, FunctionCall):
+            fn = str(node.name).lower()
+            if fn in {"__node_keys__", "__edge_keys__"}:
+                if len(node.args) < 1 or not isinstance(node.args[0], Identifier):
+                    return False, None
+                alias_names: List[str] = [node.args[0].name]
+                for extra_arg in node.args[1:]:
+                    if isinstance(extra_arg, Identifier):
+                        alias_names.append(extra_arg.name)
+                    elif isinstance(extra_arg, Literal) and isinstance(extra_arg.value, str):
+                        alias_names.append(extra_arg.value)
+                    else:
+                        return False, None
+                source_alias_name = alias_names[0]
+                source_alias = source_alias_name
+                source_table_df = table_df
+                entity_id = (self._node if fn == "__node_keys__" else self._edge)
+                prefixed_id_col = f"{source_alias_name}.{entity_id}" if entity_id else None
+                if prefixed_id_col is not None and prefixed_id_col in table_df.columns:
+                    prefix = f"{source_alias_name}."
+                    alias_cols = [
+                        col for col in table_df.columns
+                        if isinstance(col, str) and col.startswith(prefix)
+                    ]
+                    source_table_df = table_df[alias_cols].copy().rename(
+                        columns={col: col[len(prefix):] for col in alias_cols}
+                    )
+                    source_alias = str(entity_id)
+                elif source_alias not in table_df.columns:
+                    return False, None
+                out = entity_keys_series(
+                    source_table_df,
+                    alias_col=source_alias,
+                    table=("nodes" if fn == "__node_keys__" else "edges"),
+                    excluded=tuple(alias_names),
+                )
+                null_mask = self._gfql_null_mask(source_table_df, source_table_df[source_alias])
+                if hasattr(out, "where"):
+                    out = self._gfql_mask_fill(out, null_mask, None)
+                return True, out
+            if fn in {"__node_entity__", "__edge_entity__"}:
+                if len(node.args) < 1 or not isinstance(node.args[0], Identifier):
+                    return False, None
+                entity_alias_names: List[str] = [node.args[0].name]
+                for extra_arg in node.args[1:]:
+                    if isinstance(extra_arg, Identifier):
+                        entity_alias_names.append(extra_arg.name)
+                    elif isinstance(extra_arg, Literal) and isinstance(extra_arg.value, str):
+                        entity_alias_names.append(extra_arg.value)
+                    else:
+                        return False, None
+                source_alias_name = entity_alias_names[0]
+                source_alias = source_alias_name
+                source_table_df = table_df
+                # On bindings-row tables, prefer alias.{id} even when a same-name
+                # marker column exists for the alias.
+                entity_id = (self._node if fn == "__node_entity__" else self._edge)
+                id_col = f"{source_alias_name}.{entity_id}" if entity_id else None
+                if id_col is not None and id_col in table_df.columns:
+                    prefix = f"{source_alias_name}."
+                    alias_cols = [
+                        col for col in table_df.columns
+                        if isinstance(col, str) and col.startswith(prefix)
+                    ]
+                    source_table_df = table_df[alias_cols].copy().rename(
+                        columns={col: col[len(prefix):] for col in alias_cols}
+                    )
+                    source_alias = str(entity_id)
+                elif source_alias not in table_df.columns:
+                    return False, None
+                out = self._gfql_format_entity_series(
+                    source_table_df,
+                    alias_col=source_alias,
+                    table=("nodes" if fn == "__node_entity__" else "edges"),
+                    excluded=tuple(entity_alias_names),
+                )
+                null_mask = self._gfql_null_mask(source_table_df, source_table_df[source_alias])
+                if hasattr(out, "where"):
+                    out = self._gfql_mask_fill(out, null_mask, None)
+                return True, out
+            if fn == "labels" and len(node.args) == 1 and isinstance(node.args[0], Identifier):
+                alias_name = node.args[0].name
+                node_id = self._gfql_node_id_column()
+                if (
+                    "." not in alias_name
+                    and alias_name in table_df.columns
+                    and node_id is not None
+                    and node_id in table_df.columns
+                    and RowPipelineMixin._gfql_series_bool_like(table_df[alias_name])
+                ):
+                    out = format_node_labels_text(
+                        table_df,
+                        alias_col=alias_name,
+                        labels_are_list_like=(
+                            "labels" in table_df.columns
+                            and RowPipelineMixin._gfql_series_is_list_like(table_df["labels"])
+                        ),
+                    )
+                    null_mask = self._gfql_null_mask(table_df, table_df[alias_name])
+                    if hasattr(out, "where"):
+                        out = self._gfql_mask_fill(out, null_mask, None)
+                    return True, out
+            if fn == "type" and len(node.args) == 1 and isinstance(node.args[0], Identifier):
+                alias_name = node.args[0].name
+                edge_like_cols = {"s", "d", "src", "dst", "edge_id"}
+                if (
+                    "." not in alias_name
+                    and alias_name in table_df.columns
+                    and "type" in table_df.columns
+                    and any(col in table_df.columns for col in edge_like_cols)
+                    and RowPipelineMixin._gfql_series_bool_like(table_df[alias_name])
+                ):
+                    null_mask = self._gfql_null_mask(table_df, table_df[alias_name])
+                    out = table_df["type"]
+                    if hasattr(out, "where"):
+                        out = self._gfql_mask_fill(out, null_mask, None)
+                    return True, out
+            if fn == "properties" and len(node.args) == 1 and isinstance(node.args[0], Identifier):
+                alias_name = node.args[0].name
+                if (
+                    "." not in alias_name
+                    and alias_name in table_df.columns
+                    and RowPipelineMixin._gfql_series_bool_like(table_df[alias_name])
+                ):
+                    edge_like_cols = {"s", "d", "src", "dst", "edge_id"}
+                    table_name = "edges" if any(col in table_df.columns for col in edge_like_cols) else "nodes"
+                    entity_text = self._gfql_format_entity_series(
+                        table_df,
+                        alias_col=alias_name,
+                        table=table_name,
+                        excluded=(alias_name,),
+                    )
+                    if not hasattr(entity_text, "str"):
+                        return False, None
+                    null_mask = self._gfql_null_mask(table_df, table_df[alias_name])
+                    props = entity_text.str.extract(r"(\{.*\})", expand=False)
+                    props = props.where(props.notna(), "{}")
+                    props = self._gfql_mask_fill(props, null_mask, None)
+                    return True, props
+
+            if fn == "keys" and len(node.args) == 1:
+                arg = node.args[0]
+                ok, inner = self._gfql_eval_expr_ast(table_df, arg)
+                if not ok:
+                    return False, None
+                if hasattr(inner, "astype"):
+                    null_mask = self._gfql_null_mask(table_df, inner)
+                    if hasattr(null_mask, "all") and bool(null_mask.all()):
+                        out = self._gfql_broadcast_scalar(table_df, None)
+                        if hasattr(out, "where"):
+                            out = self._gfql_mask_fill(out, null_mask, None)
+                        return True, out
+                    return False, None
+                if is_null_scalar(inner):
+                    return True, None
+                if isinstance(inner, dict):
+                    return True, list(inner.keys())
+                return False, None
+
+            values: List[Any] = []
+            for arg in node.args:
+                ok, val = self._gfql_eval_expr_ast(table_df, arg)
+                if not ok:
+                    return False, None
+                values.append(val)
+
+            if fn == "__cypher_case_eq__" and len(values) == 2:
+                left = values[0]
+                right = values[1]
+                left_null_mask = self._gfql_null_mask(table_df, left)
+                right_null_mask = self._gfql_null_mask(table_df, right)
+                any_null_mask = left_null_mask | right_null_mask
+                # Simple CASE compares with '=', so null matches nothing and falls to ELSE.
+                left_scalar_null = not hasattr(left, "astype") and is_null_scalar(left)
+                right_scalar_null = not hasattr(right, "astype") and is_null_scalar(right)
+                if right_scalar_null or left_scalar_null:
+                    return True, self._gfql_broadcast_scalar(table_df, False).astype(bool)
+                left_is_bool = (
+                    RowPipelineMixin._gfql_series_bool_like(left)
+                    if hasattr(left, "astype")
+                    else isinstance(left, bool)
+                )
+                right_is_bool = (
+                    RowPipelineMixin._gfql_series_bool_like(right)
+                    if hasattr(right, "astype")
+                    else isinstance(right, bool)
+                )
+                left_is_numeric = (
+                    RowPipelineMixin._gfql_series_numeric_non_bool_like(left)
+                    if hasattr(left, "astype")
+                    else RowPipelineMixin._gfql_scalar_numeric_non_bool(left)
+                )
+                right_is_numeric = (
+                    RowPipelineMixin._gfql_series_numeric_non_bool_like(right)
+                    if hasattr(right, "astype")
+                    else RowPipelineMixin._gfql_scalar_numeric_non_bool(right)
+                )
+                if (left_is_bool and right_is_numeric) or (left_is_numeric and right_is_bool):
+                    return True, self._gfql_broadcast_scalar(table_df, False).where(~any_null_mask, False)
+                out = left == right
+                if hasattr(out, "where"):
+                    out = out.where(~any_null_mask, False)
+                elif hasattr(any_null_mask, "any") and bool(any_null_mask.any()):
+                    out = False
+                return True, out
+
+            if fn == "properties" and len(values) == 1:
+                inner = values[0]
+                if is_null_scalar(inner):
+                    return True, None
+                if isinstance(inner, Mapping):
+                    return True, RowPipelineMixin._gfql_format_cypher_map_scalar(inner)
+                return True, self._gfql_eval_entity_graph_fn(table_df, inner, "properties", "ast properties()")
+
+            if fn in {"labels", "type"} and len(values) == 1:
+                return True, self._gfql_eval_entity_graph_fn(table_df, values[0], fn, f"ast {fn}()")
+
+            if fn == "range" and len(values) in {2, 3}:
+                return True, self._gfql_eval_range_expr(table_df, values, "range(...)")
+
+            if fn == "size" and len(values) == 1:
+                inner = values[0]
+                if is_null_scalar(inner):
+                    return True, None
+                if hasattr(inner, "astype"):
+                    try:
+                        return True, series_sequence_len(inner)
+                    except Exception as exc:
+                        # Never fall through to len(series): that is the frame's height.
+                        if not RowPipelineMixin._gfql_series_holds_no_typed_cell(inner):
+                            raise ValueError(
+                                "unsupported row expression: size() requires list/string input"
+                            ) from exc
+                        if len(inner) > 0:
+                            return True, self._gfql_broadcast_scalar(table_df, None)
+                try:
+                    return True, len(inner)
+                except Exception:
+                    return False, None
+
+            if fn == "abs" and len(values) == 1:
+                inner = values[0]
+                if hasattr(inner, "abs"):
+                    return True, inner.abs()
+                return True, abs(inner)
+
+            if fn == "sqrt" and len(values) == 1:
+                inner = values[0]
+                if hasattr(inner, "astype"):
+                    return True, inner.astype(float) ** 0.5
+                if is_null_scalar(inner):
+                    return True, None
+                return True, float(inner) ** 0.5
+
+            # neo4j/openCypher numeric fns: floor/ceil (alias ceiling), round(x[, precision]).
+            # Return FLOAT like neo4j; null in -> null out.
+            if fn in {"floor", "ceil", "ceiling"} and len(values) == 1:
+                inner = values[0]
+                use_ceil = fn in {"ceil", "ceiling"}
+                if hasattr(inner, "astype"):
+                    null_mask = self._gfql_null_mask(table_df, inner)
+                    f = inner.astype(float)
+                    if hasattr(f, "ceil" if use_ceil else "floor"):  # cuDF native
+                        out = f.ceil() if use_ceil else f.floor()
+                    else:  # pandas: no Series.floor/ceil method
+                        import numpy as np
+                        out = np.ceil(f) if use_ceil else np.floor(f)
+                    return True, out.where(~null_mask, pd.NA)
+                if is_null_scalar(inner):
+                    return True, None
+                return True, float(math.ceil(inner) if use_ceil else math.floor(inner))
+
+            if fn == "round" and len(values) in {1, 2}:
+                # floor+frac, NOT floor(x+0.5): the addition itself rounds up 1 ulp below a tie.
+                inner = values[0]
+                ndigits = int(values[1]) if len(values) == 2 else 0
+                if ndigits < 0:
+                    # neo4j raises on negative precision; decline (no silent wrong value).
+                    return False, None
+                if ndigits > 308:
+                    # 10.0**p overflows at p>=309 (CPython pow raises); rounding a float64
+                    # beyond 308 decimals is the identity anyway — return the input as
+                    # float (+0.0 zero-sign normalize), matching polars' native behavior
+                    # at large precision (dgx-repro'd).
+                    inner_id = values[0]
+                    if hasattr(inner_id, "astype"):
+                        null_mask = self._gfql_null_mask(table_df, inner_id)
+                        return True, (inner_id.astype(float) + 0.0).where(~null_mask, pd.NA)
+                    if is_null_scalar(inner_id):
+                        return True, None
+                    return True, float(inner_id) + 0.0
+                if hasattr(inner, "astype"):
+                    null_mask = self._gfql_null_mask(table_df, inner)
+                    f = inner.astype(float)
+
+                    def _floor_series(s: Any) -> Any:
+                        if hasattr(s, "floor"):  # cuDF native
+                            return s.floor()
+                        import numpy as np
+                        return np.floor(s)
+
+                    import numpy as np
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        # ±inf input makes the tie subtract inf-inf=NaN on EITHER
+                        # branch, and p>0's scale multiply may overflow to inf —
+                        # every such row is guarded to the correct identity below;
+                        # suppress the benign RuntimeWarning noise (waves 3-4).
+                        if ndigits == 0:
+                            fl = _floor_series(f)
+                            out = fl + ((f - fl) >= 0.5).astype(float)  # ties toward +inf
+                        else:
+                            scale = 10.0 ** ndigits
+                            shifted = f * scale
+                            a = shifted.abs()
+                            fl = _floor_series(a)
+                            mag = fl + ((a - fl) >= 0.5).astype(float)  # ties away
+                            sig = (shifted > 0).astype(float) - (shifted < 0).astype(float)
+                            out = mag * sig / scale + 0.0  # +0.0 normalizes -0.0
+                            # scaled overflow (|x·10^p| = inf): rounding is the identity
+                            out = out.where(a != float("inf"), f)
+                    return True, out.where(~null_mask, pd.NA)
+                if is_null_scalar(inner):
+                    return True, None
+                x = float(inner)
+                if not math.isfinite(x):
+                    return True, x
+                if ndigits == 0:
+                    fl0 = math.floor(x)
+                    return True, float(fl0 + (1 if (x - fl0) >= 0.5 else 0))
+                scale = 10.0 ** ndigits
+                shifted_x = x * scale
+                if not math.isfinite(shifted_x):
+                    return True, x  # scaled overflow -> identity
+                a2 = abs(shifted_x)
+                fl2 = math.floor(a2)
+                mag2 = fl2 + (1 if (a2 - fl2) >= 0.5 else 0)
+                return True, math.copysign(mag2, shifted_x) / scale + 0.0
+
+            # neo4j/openCypher toLower/toUpper (the idiomatic case-insensitive-match helper),
+            # plus the GQL-conformance aliases lower/upper (ISO GQL §20.24; neo4j accepts both).
+            if fn in {"tolower", "toupper", "lower", "upper"} and len(values) == 1:
+                inner = values[0]
+                to_lower = fn in {"tolower", "lower"}
+                if hasattr(inner, "str"):
+                    null_mask = self._gfql_null_mask(table_df, inner)
+                    out = inner.str.lower() if to_lower else inner.str.upper()
+                    return True, out.where(~null_mask, pd.NA)
+                if is_null_scalar(inner):
+                    return True, None
+                if not isinstance(inner, str):
+                    # neo4j requires a String (type error). A numeric SERIES lands here
+                    # too (no .str accessor): str(inner) would broadcast the lowercased
+                    # Series REPR to every row — decline instead (dgx-repro'd).
+                    return False, None
+                return True, inner.lower() if to_lower else inner.upper()
+
+            if fn == "tofloat" and len(values) == 1:
+                inner = values[0]
+                if hasattr(inner, "astype"):
+                    null_mask = self._gfql_null_mask(table_df, inner)
+                    out = inner.astype(float)
+                    return True, out.where(~null_mask, pd.NA)
+                if is_null_scalar(inner):
+                    return True, None
+                return True, float(inner)
+
+            if fn == "tointeger" and len(values) == 1:
+                inner = values[0]
+                if hasattr(inner, "astype"):
+                    null_mask = self._gfql_null_mask(table_df, inner)
+                    engine = resolve_engine(EngineAbstract.AUTO, table_df)
+                    if engine == Engine.PANDAS and isinstance(inner, pd.Series):
+                        out = _pandas_series_to_int64(inner)
+                    elif engine == Engine.CUDF:
+                        out = _cudf_series_to_int64(inner)
+                    else:
+                        numeric = s_to_numeric(engine)(inner, errors="coerce")
+                        finite_mask = numeric.notna() & (numeric.abs() != float("inf"))
+                        in_range = numeric.ge(_INT64_MIN) & numeric.lt(_INT64_LIMIT_HIGH)
+                        safe_numeric = numeric.where(finite_mask & in_range)
+                        out = safe_numeric.astype("Int64")
+                    return True, out.where(~null_mask, pd.NA)
+                if is_null_scalar(inner):
+                    return True, None
+                if isinstance(inner, str):
+                    # A string with no integer value is null; invalid TYPES below still error.
+                    return True, _to_cypher_int64_scalar(inner)
+                return True, _to_cypher_int64_scalar(inner)
+
+            if fn == "substring" and len(values) in {2, 3}:
+                inner = values[0]
+                start = values[1]
+                length = values[2] if len(values) == 3 else None
+                if any(hasattr(value, "astype") for value in (start, length) if value is not None):
+                    return False, None
+                if not isinstance(start, int) or isinstance(start, bool):
+                    return False, None
+                if length is not None and (not isinstance(length, int) or isinstance(length, bool)):
+                    return False, None
+                stop = None if length is None else start + length
+                if hasattr(inner, "str") and hasattr(inner.str, "slice"):
+                    return True, inner.str.slice(start, stop)
+                if is_null_scalar(inner):
+                    return True, None
+                if not isinstance(inner, str):
+                    return False, None
+                return True, inner[start:stop]
+
+            if fn == "toboolean" and len(values) == 1:
+                inner = values[0]
+                if hasattr(inner, "astype"):
+                    null_mask = self._gfql_null_mask(table_df, inner)
+                    normalized = inner.astype(str).str.strip().str.lower()
+                    true_mask = normalized.isin(["true", "t", "1", "yes"])
+                    false_mask = normalized.isin(["false", "f", "0", "no"])
+                    unsupported_mask = ~(true_mask | false_mask | null_mask)
+                    if hasattr(unsupported_mask, "any") and bool(unsupported_mask.any()):
+                        return False, None
+                    out = true_mask.where(~false_mask, False)
+                    return True, out.where(~null_mask, pd.NA)
+                if is_null_scalar(inner):
+                    return True, None
+                if isinstance(inner, bool):
+                    return True, inner
+                if isinstance(inner, (int, float)):
+                    return True, inner != 0
+                txt_inner = str(inner).strip().lower()
+                if txt_inner in {"true", "t", "1", "yes"}:
+                    return True, True
+                if txt_inner in {"false", "f", "0", "no"}:
+                    return True, False
+                return False, None
+
+            if fn == "tostring" and len(values) == 1:
+                inner = values[0]
+                if hasattr(inner, "astype"):
+                    null_mask = self._gfql_null_mask(table_df, inner)
+                    dtype_txt = str(getattr(inner, "dtype", "")).lower()
+                    is_float = ("float" in dtype_txt) or ("double" in dtype_txt)
+                    is_cudf = type(inner).__module__.startswith("cudf")
+                    if is_float and is_cudf:
+                        # libcudf float->string does not match Python/pandas float repr
+                        # (scientific-notation thresholds, exponent formatting) -> a silent
+                        # cross-engine divergence (issue #1663 finding 2; polars declines this
+                        # too). Round-trip the float column through the pandas oracle on the host
+                        # (arrow -> pandas float -> str = the exact pandas-engine result) so cuDF
+                        # is string-IDENTICAL to pandas. Niche op; one host transfer of one column.
+                        #
+                        # MAINTENANCE NOTE (2026-07-04, persona-tested engine-fidelity review):
+                        # This is a HIDDEN device->host->device transfer inside a 'cudf' timing —
+                        # correct-for-parity but invisible to a benchmarker attributing time to the
+                        # cuDF engine. We deliberately did NOT add a warn-once here yet: (a) this
+                        # branch sits in _gfql_eval_expr_ast (the AST-eval FALLBACK); 9 cypher
+                        # toString(float) shapes all took the vectorized projection path instead and
+                        # did NOT reach here, so its live reachability via the cypher surface is
+                        # UNCONFIRMED (may be non-cypher-only, or dead) — instrumenting it before
+                        # confirming that would ship an unfirable/misleading warning; and (b) the
+                        # honesty knob belongs to the deferred UNIFIED engine-fidelity work, not a
+                        # 3rd bespoke mode. When that lands: pick ONE of — confirm reachability +
+                        # warn-once + a triggering test; add an opt-in 'native' mode that tolerates
+                        # the on-device repr (no host transfer) for benchmark users; or, if proven
+                        # dead, delete this branch. Do NOT bolt a standalone warn on in isolation.
+                        # (See plan PHASE 13 P13.5; the same applies to the sibling
+                        # _gfql_series_to_pylist host-transfer sites.)
+                        host_str = pd.Series(inner.to_arrow().to_pylist()).astype(str)
+                        out = s_cons(Engine.CUDF)(host_str.to_numpy(), index=inner.index)
+                    else:
+                        out = inner.astype(str)
+                    if hasattr(out, "str"):
+                        out = out.str.replace(r"^True$", "true", regex=True)
+                        out = out.str.replace(r"^False$", "false", regex=True)
+                    return True, self._gfql_mask_fill(out, null_mask, None)
+                if is_null_scalar(inner):
+                    return True, None
+                if isinstance(inner, bool):
+                    return True, ("true" if inner else "false")
+                return True, str(inner)
+
+            if fn == "coalesce" and len(values) >= 1:
+                out = values[0]
+                if not hasattr(out, "astype"):
+                    out = self._gfql_broadcast_scalar(table_df, out)
+                for candidate in values[1:]:
+                    if not hasattr(candidate, "astype"):
+                        candidate = self._gfql_broadcast_scalar(table_df, candidate)
+                    null_mask = self._gfql_null_mask(table_df, out)
+                    out = out.where(~null_mask, candidate)
+                return True, out
+
+            if fn == "sign" and len(values) == 1:
+                inner = values[0]
+                if hasattr(inner, "astype"):
+                    null_mask = self._gfql_null_mask(table_df, inner)
+                    gt = inner > 0
+                    lt = inner < 0
+                    out = self._gfql_broadcast_scalar(table_df, 0)
+                    out = out.where(~gt, 1)
+                    out = out.where(~lt, -1)
+                    return True, out.where(~null_mask, pd.NA)
+                if is_null_scalar(inner):
+                    return True, None
+                if inner > 0:
+                    return True, 1
+                if inner < 0:
+                    return True, -1
+                return True, 0
+
+            if fn in {"head", "tail", "reverse", "nodes", "relationships"} and len(values) == 1:
+                inner = values[0]
+                if fn in {"nodes", "relationships"}:
+                    return True, inner
+                if hasattr(inner, "str"):
+                    try:
+                        return True, eval_sequence_fn_series(inner, fn)
+                    except Exception as exc:
+                        raise ValueError(
+                            f"unsupported row expression: {fn}() requires list/string input"
+                        ) from exc
+                if is_null_scalar(inner):
+                    return True, None
+                try:
+                    return True, eval_sequence_fn_scalar(inner, fn)
+                except Exception as exc:
+                    raise ValueError(
+                        f"unsupported row expression: {fn}() requires list/string input"
+                    ) from exc
+
+            return False, None
+
+        if isinstance(node, CaseWhen):
+            ok_cond, cond_value = self._gfql_eval_expr_ast(table_df, node.condition)
+            if not ok_cond:
+                return False, None
+            ok_true, true_value = self._gfql_eval_expr_ast(table_df, node.when_true)
+            ok_false, false_value = self._gfql_eval_expr_ast(table_df, node.when_false)
+            if not (ok_true and ok_false):
+                return False, None
+            if not hasattr(true_value, "astype"):
+                true_value = self._gfql_broadcast_scalar(table_df, true_value)
+            if not hasattr(false_value, "astype"):
+                false_value = self._gfql_broadcast_scalar(table_df, false_value)
+            cond_mask = self._gfql_bool_mask(table_df, cond_value)
+            cond_null = self._gfql_null_mask(table_df, cond_value)
+            cond_true = cond_mask & ~cond_null
+            try:
+                return True, true_value.where(cond_true, false_value)
+            except TypeError:  # pragma: no cover - cuDF-only (.where mixed-dtype); no cuDF lane in the coverage gate (validated on dgx)
+                # cuDF rejects `.where` across mismatched branch dtypes ("cudf does not support
+                # mixed types"), where pandas coerces to a common type. This surfaced as a hard
+                # GFQLTypeError for e.g. `CASE WHEN path IS NULL THEN -1 ELSE length(path) END`
+                # over an UNREACHABLE shortestPath (the hops branch is an object/null column while
+                # the other branch is int -1). Unify the two branches to a common dtype and retry so
+                # CASE is engine-consistent (cuDF returns -1 like pandas instead of raising).
+                tv, fv = RowPipelineMixin._gfql_coerce_case_branch_dtypes(true_value, false_value)
+                return True, tv.where(cond_true, fv)
+
+        if isinstance(node, QuantifierExpr):
+            source_ok, list_value = self._gfql_eval_expr_ast(table_df, node.source)
+            if not source_ok:
+                return False, None
+            list_series = (
+                list_value if hasattr(list_value, "astype") else self._gfql_broadcast_scalar(table_df, list_value)
+            )
+
+            row_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_q_row_ast__")
+            list_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_q_list_ast__")
+            total_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_q_total_ast__")
+
+            base = table_df.reset_index(drop=True).copy()
+            base = RowPipelineMixin._gfql_assign_positional(base, **{row_col: range(len(base)), list_col: list_series})
+            list_null_mask = self._gfql_null_mask(base, base[list_col])
+            try:
+                total_series = series_sequence_len(base[list_col])
+            except Exception as exc:
+                if not RowPipelineMixin._gfql_series_holds_no_typed_cell(base[list_col]):
+                    raise ValueError(
+                        f"unsupported row expression: {str(node.fn).lower()}() requires list/string input"
+                    ) from exc
+                total_series = self._gfql_broadcast_scalar(base, pd.NA)
+            if hasattr(total_series, "where"):
+                total_series = total_series.where(~list_null_mask, 0).fillna(0)
+            base = base.assign(**{total_col: total_series})
+
+            non_null = base.loc[~list_null_mask].copy()
+            expanded = non_null.explode(list_col)
+            if len(expanded) > 0:
+                expanded = expanded.reset_index(drop=True)
+                expanded = expanded.assign(
+                    **{"__gfql_q_pos_ast__": expanded.groupby(row_col, sort=False).cumcount()}
+                )
+                expanded = expanded.loc[expanded["__gfql_q_pos_ast__"] < expanded[total_col]]
+                expanded = expanded.assign(**{node.var: expanded[list_col]})
+                pred_ok, pred_value = self._gfql_eval_expr_ast(expanded, node.predicate)
+                if not pred_ok:
+                    return False, None
+                if not hasattr(pred_value, "astype"):
+                    pred_value = self._gfql_broadcast_scalar(expanded, pred_value)
+                pred_mask = self._gfql_bool_mask(expanded, pred_value)
+                pred_null = self._gfql_null_mask(expanded, pred_value)
+                stats = expanded.assign(
+                    __gfql_q_true_ast__=(pred_mask & ~pred_null).astype("int64"),
+                    __gfql_q_null_ast__=pred_null.astype("int64"),
+                )
+                grouped = stats.groupby(row_col, sort=False).agg(
+                    true_count=("__gfql_q_true_ast__", "sum"),
+                    null_count=("__gfql_q_null_ast__", "sum"),
+                )
+                grouped = grouped.reset_index()
+            else:
+                grouped = non_null[[row_col]].iloc[0:0].copy()
+                grouped["true_count"] = []
+                grouped["null_count"] = []
+
+            summary = base[[row_col, total_col]].merge(grouped, on=row_col, how="left", sort=False)
+            summary = self._gfql_restore_row_order(summary, row_col)
+            summary = summary.assign(
+                true_count=summary["true_count"].fillna(0),
+                null_count=summary["null_count"].fillna(0),
+            )
+            total = summary[total_col]
+            true_count = summary["true_count"]
+            null_count = summary["null_count"]
+            false_count = total - true_count - null_count
+
+            fn = str(node.fn).lower()
+            if fn == "any":
+                out = true_count > 0
+                unknown = (true_count == 0) & (null_count > 0)
+            elif fn == "all":
+                out = false_count == 0
+                unknown = (false_count == 0) & (null_count > 0)
+            elif fn == "none":
+                out = true_count == 0
+                unknown = (true_count == 0) & (null_count > 0)
+            elif fn == "single":
+                out = true_count == 1
+                unknown = (true_count <= 1) & (null_count > 0)
+            else:
+                return False, None
+            out = out.where(~unknown, pd.NA)
+            out = out.where(~list_null_mask, pd.NA)
+            return True, out.reset_index(drop=True)
+
+        if isinstance(node, ListComprehension):
+            projection = node.projection
+            projection_consumes_var = False
+
+            def _mark_projection_var(consumed_node: object) -> None:
+                nonlocal projection_consumes_var
+                if isinstance(consumed_node, Identifier) and consumed_node.name == node.var:
+                    projection_consumes_var = True
+
+            if projection is not None:
+                expr_parser_mod.walk_expr_nodes(projection, enter=_mark_projection_var)
+            if (
+                isinstance(projection, FunctionCall)
+                and projection.name.lower() in {"tofloat", "tointeger"}
+                and projection_consumes_var
+                and isinstance(node.source, ListLiteral)
+                and any(
+                    isinstance(item, (ListLiteral, MapLiteral))
+                    or (
+                        isinstance(item, Literal)
+                        and isinstance(item.value, (list, dict))
+                    )
+                    for item in node.source.items
+                )
+            ):
+                return False, None
+            source_ok, list_value = self._gfql_eval_expr_ast(table_df, node.source)
+            if not source_ok:
+                return False, None
+            list_series = (
+                list_value if hasattr(list_value, "astype") else self._gfql_broadcast_scalar(table_df, list_value)
+            )
+
+            row_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_lc_row_ast__")
+            list_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_lc_list_ast__")
+            len_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_lc_len_ast__")
+            out_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_lc_out_ast__")
+
+            base = table_df.reset_index(drop=True).copy()
+            base = RowPipelineMixin._gfql_assign_positional(base, **{row_col: range(len(base)), list_col: list_series})
+            null_mask = self._gfql_null_mask(base, base[list_col])
+            try:
+                lengths = series_sequence_len(base[list_col])
+            except Exception as exc:
+                if not RowPipelineMixin._gfql_series_holds_no_typed_cell(base[list_col]):
+                    raise ValueError(
+                        "unsupported row expression: list comprehension requires list/string input"
+                    ) from exc
+                lengths = self._gfql_broadcast_scalar(base, pd.NA)
+            if hasattr(lengths, "fillna"):
+                lengths = lengths.fillna(0)
+            base = base.assign(**{len_col: lengths})
+
+            non_null = base.loc[~null_mask].copy()
+            expanded = non_null.explode(list_col)
+            if len(expanded) > 0:
+                expanded = expanded.reset_index(drop=True)
+                expanded = expanded.assign(
+                    **{
+                        "__gfql_lc_pos_ast__": expanded.groupby(row_col, sort=False).cumcount(),
+                        node.var: expanded[list_col],
+                    }
+                )
+                expanded = expanded.loc[expanded["__gfql_lc_pos_ast__"] < expanded[len_col]]
+
+                if node.predicate is not None:
+                    pred_ok, pred_value = self._gfql_eval_expr_ast(expanded, node.predicate)
+                    if not pred_ok:
+                        return False, None
+                    if not hasattr(pred_value, "astype"):
+                        pred_value = self._gfql_broadcast_scalar(expanded, pred_value)
+                    pred_mask = self._gfql_bool_mask(expanded, pred_value)
+                    expanded = expanded.loc[pred_mask]
+
+                proj_node = node.projection if node.projection is not None else Identifier(node.var)
+                proj_ok, projected = self._gfql_eval_expr_ast(expanded, proj_node)
+                if not proj_ok:
+                    return False, None
+                if not hasattr(projected, "astype"):
+                    projected = self._gfql_broadcast_scalar(expanded, projected)
+                expanded = expanded.assign(**{out_col: projected})
+                grouped = expanded.groupby(row_col, sort=False)[out_col].agg(list).reset_index()
+            else:
+                grouped = non_null[[row_col]].iloc[0:0].copy()
+                grouped[out_col] = []
+
+            merged = base[[row_col, len_col]].merge(grouped, on=row_col, how="left", sort=False)
+            merged = self._gfql_restore_row_order(merged, row_col)
+            result = (
+                merged[out_col].copy()
+                if out_col in merged.columns
+                else self._gfql_broadcast_scalar(merged, None)
+            )
+
+            empty_mask = merged[len_col] == 0
+            if hasattr(empty_mask, "any") and bool(empty_mask.any()):
+                result = self._gfql_mask_fill_sequence_value(merged, result, empty_mask, [])
+
+            missing_mask = result.isna() if hasattr(result, "isna") else None
+            if missing_mask is not None:
+                filtered_empty_mask = missing_mask & (~null_mask)
+                if hasattr(filtered_empty_mask, "any") and bool(filtered_empty_mask.any()):
+                    result = self._gfql_mask_fill_sequence_value(merged, result, filtered_empty_mask, [])
+
+            if hasattr(null_mask, "any") and bool(null_mask.any()):
+                result = self._gfql_mask_fill_sequence_value(merged, result, null_mask, None)
+
+            return True, result.reset_index(drop=True)
+
+        if isinstance(node, SubscriptExpr):
+            ok_base, base_value = self._gfql_eval_expr_ast(table_df, node.value)
+            ok_key, key_value = self._gfql_eval_expr_ast(table_df, node.key)
+            if not (ok_base and ok_key):
+                return False, None
+            if is_null_scalar(base_value) or is_null_scalar(key_value):
+                return True, None
+            if hasattr(key_value, "iloc"):
+                key_constant, key_scalar = RowPipelineMixin._gfql_series_scalar_if_constant(key_value)
+                if key_constant:
+                    key_value = key_scalar
+            if isinstance(key_value, str):
+                if (
+                    isinstance(node.value, Identifier)
+                    and node.value.name in table_df.columns
+                    and RowPipelineMixin._gfql_series_bool_like(table_df[node.value.name])
+                    and RowPipelineMixin._gfql_table_has_graph_shape(table_df)
+                ):
+                    entity_value = self._gfql_format_entity_series(
+                        table_df,
+                        alias_col=node.value.name,
+                        table=RowPipelineMixin._gfql_infer_graph_table_kind(table_df),
+                    )
+                    return True, self._gfql_eval_property_access_value(
+                        table_df,
+                        entity_value,
+                        key_value,
+                        "ast subscript",
+                    )
+                if hasattr(base_value, "astype") and (
+                    RowPipelineMixin._gfql_series_is_mapping_like(base_value)
+                    or RowPipelineMixin._gfql_series_is_entity_text_like(base_value)
+                ):
+                    return True, self._gfql_eval_property_access_value(
+                        table_df,
+                        base_value,
+                        key_value,
+                        "ast subscript",
+                    )
+                if isinstance(base_value, Mapping) or is_entity_text_scalar(base_value):
+                    return True, self._gfql_eval_property_access_value(
+                        table_df,
+                        base_value,
+                        key_value,
+                        "ast subscript",
+                    )
+            if isinstance(base_value, dict):
+                return True, base_value.get(str(key_value))
+            if (
+                isinstance(key_value, int)
+                and not isinstance(key_value, bool)
+                and hasattr(base_value, "iloc")
+            ):
+                return True, self._gfql_eval_dynamic_list_subscript(
+                    table_df,
+                    base_value,
+                    self._gfql_broadcast_scalar(table_df, key_value),
+                    "ast subscript",
+                )
+            if hasattr(key_value, "iloc"):
+                return True, self._gfql_eval_dynamic_list_subscript(
+                    table_df, base_value, key_value, "ast subscript"
+                )
+            if (
+                isinstance(key_value, int)
+                and not isinstance(key_value, bool)
+                and isinstance(base_value, str)
+            ):
+                raise ValueError(
+                    "unsupported row expression: dynamic subscript requires list-like base "
+                    "in 'ast subscript'"
+                )
+            if hasattr(base_value, "str"):
+                return True, base_value.str.get(key_value)
+            try:
+                return True, base_value[key_value]
+            except Exception:
+                return False, None
+
+        if isinstance(node, SliceExpr):
+            ok_base, base_value = self._gfql_eval_expr_ast(table_df, node.value)
+            if not ok_base:
+                return False, None
+            start_present = node.start is not None
+            end_present = node.stop is not None
+            start_value = None
+            end_value = None
+            if node.start is not None:
+                ok_start, start_value = self._gfql_eval_expr_ast(table_df, node.start)
+                if not ok_start:
+                    return False, None
+            if node.stop is not None:
+                ok_end, end_value = self._gfql_eval_expr_ast(table_df, node.stop)
+                if not ok_end:
+                    return False, None
+            return True, self._gfql_eval_slice_subscript(
+                table_df,
+                base_value,
+                start_value,
+                end_value,
+                start_present,
+                end_present,
+                "ast slice",
+            )
+
+        return False, None
+    @staticmethod
+    def _gfql_order_expr_static_supported(expr: str) -> bool:
+        txt = expr.strip()
+        if txt == "":
+            return False
+
+        parser_bundle = _gfql_expr_runtime_parser_bundle()
+        if parser_bundle is None:
+            return False
+        parser, capability_checker, _expr_parser_mod = parser_bundle
+        try:
+            node = parser(txt)
+        except Exception:
+            return False
+        if is_order_aggregate_alias_ast(node):
+            return True
+        try:
+            capability_errors = capability_checker(node)
+        except Exception:
+            return False
+        if len(capability_errors) > 0:
+            return False
+        return order_expr_ast_static_supported(node)
+
+    @staticmethod
+    def _gfql_series_to_pylist(values: Any) -> List[Any]:
+        if hasattr(values, "to_arrow"):
+            try:
+                return list(values.to_arrow().to_pylist())
+            except Exception:
+                pass
+        if hasattr(values, "to_pandas"):
+            try:
+                return list(values.to_pandas().tolist())
+            except Exception:
+                pass
+        if hasattr(values, "tolist"):
+            try:
+                return list(values.tolist())
+            except Exception:
+                pass
+        return list(values)
+
+    def _gfql_mask_fill_sequence_value(self, table_df: Any, series: Any, mask: Any, value: Any) -> Any:
+        out = series.copy()
+        has_mask = True
+        if hasattr(mask, "any"):
+            try:
+                has_mask = bool(mask.any())
+            except Exception:
+                has_mask = True
+        if not has_mask:
+            return out
+
+        try:
+            out.loc[out.index[mask]] = value
+            return out
+        except Exception:
+            mask_values = [
+                False if is_null_scalar(flagged) else bool(flagged)
+                for flagged in self._gfql_series_to_pylist(mask)
+            ]
+            filled_values = self._gfql_series_to_pylist(out)
+            for idx, flagged in enumerate(mask_values):
+                if flagged:
+                    filled_values[idx] = list(value) if isinstance(value, list) else value
+            fill_col = getattr(out, "name", None)
+            if not isinstance(fill_col, str) or fill_col in table_df.columns:
+                fill_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_seq_fill__")
+            return RowPipelineMixin._gfql_on_table_index(table_df, table_df.reset_index(drop=True).assign(**{fill_col: filled_values})[fill_col])
+
+    @staticmethod
+    def _gfql_restore_row_order(table_df: Any, row_col: str) -> Any:
+        if row_col not in table_df.columns:
+            return table_df
+        try:
+            return table_df.sort_values(by=[row_col], kind="mergesort").reset_index(drop=True)
+        except TypeError:
+            return table_df.sort_values(by=[row_col]).reset_index(drop=True)
+
+    def _gfql_format_entity_series(self, table_df: Any, *, alias_col: str, table: str, excluded: Sequence[str] = ()) -> Any:
+        excluded_cols = tuple(dict.fromkeys((alias_col,) + tuple(str(name) for name in excluded)))
+        if table == "nodes":
+            return format_node_entity_text(
+                table_df,
+                alias_col=alias_col,
+                excluded=excluded_cols,
+                labels_are_list_like=(
+                    "labels" in table_df.columns
+                    and RowPipelineMixin._gfql_series_is_list_like(table_df["labels"])
+                ),
+            )
+        return format_edge_entity_text(
+            table_df,
+            alias_col=alias_col,
+            property_columns=edge_property_columns(table_df, alias_col, excluded_cols),
+            type_col="type",
+            nullify_missing_alias_rows=False,
+        )
+
+    @staticmethod
+    def _gfql_series_is_entity_text_like(series: Any) -> bool:
+        if not hasattr(series, "isna") or not hasattr(series, "astype"):
+            return is_entity_text_scalar(series)
+        null_mask = series.isna()
+        non_null = ~null_mask
+        if hasattr(non_null, "any") and not bool(non_null.any()):
+            return False
+        text = series.astype(str)
+        if not hasattr(text, "str"):
+            return False
+        try:
+            actual_string = (series == text).where(non_null, False)
+        except Exception:
+            actual_string = non_null & False
+        entity_like = series_str_match(
+            text.str.strip(),
+            r"^(?:\((?::[A-Za-z_][A-Za-z0-9_]*)*(?:\s*\{.*\})?\)|\[:[^\]\s]+(?:\s+\{.*\})?\]|\(\)|\[\])$",
+            na=False,
+        )
+        return bool(entity_like.where(~null_mask, True).where(actual_string, False).all())
+
+    def _gfql_eval_entity_graph_fn(
+        self,
+        table_df: Any,
+        value: Any,
+        fn: str,
+        expr: str,
+    ) -> Any:
+        if hasattr(value, "astype"):
+            null_mask = self._gfql_null_mask(table_df, value)
+            if RowPipelineMixin._gfql_series_is_entity_text_like(value):
+                if fn == "labels":
+                    out = entity_labels_series(value)
+                elif fn == "type":
+                    out = entity_type_series(value)
+                elif fn == "properties":
+                    out = entity_properties_series(value)
+                else:
+                    raise ValueError(f"unsupported row expression graph function: {fn} in {expr!r}")
+                if hasattr(out, "where"):
+                    out = self._gfql_mask_fill(out, null_mask, None)
+                return out
+            if hasattr(null_mask, "all") and bool(null_mask.all()):
+                out = self._gfql_broadcast_scalar(table_df, None)
+                if hasattr(out, "where"):
+                    out = self._gfql_mask_fill(out, null_mask, None)
+                return out
+            raise ValueError(
+                f"unsupported row expression: {fn}() requires a graph element, entity value, or null in {expr!r}"
+            )
+
+        if is_null_scalar(value):
+            return None
+        if not is_entity_text_scalar(value):
+            raise ValueError(
+                f"unsupported row expression: {fn}() requires a graph element, entity value, or null in {expr!r}"
+            )
+        if fn == "labels":
+            return entity_labels_scalar(value)
+        if fn == "type":
+            return entity_type_scalar(value)
+        if fn == "properties":
+            return entity_properties_scalar(value)
+        raise ValueError(f"unsupported row expression graph function: {fn} in {expr!r}")
+
+    def _gfql_eval_property_access_value(
+        self,
+        table_df: Any,
+        value: Any,
+        prop: str,
+        expr: str,
+    ) -> Any:
+        def _coerce_duration_property(value_text: str) -> Any:
+            resolved = resolve_duration_text_property(value_text, prop)
+            if resolved is None:
+                return None
+            if re.fullmatch(r"-?\d+", resolved):
+                return int(resolved)
+            return resolved
+
+        if hasattr(value, "astype"):
+            null_mask = self._gfql_null_mask(table_df, value)
+            scalar_ok, scalar_value = RowPipelineMixin._gfql_series_scalar_if_constant(value)
+            if scalar_ok and isinstance(scalar_value, str):
+                duration_value = _coerce_duration_property(scalar_value)
+                if duration_value is not None:
+                    out = self._gfql_broadcast_scalar(table_df, duration_value)
+                    if hasattr(out, "where"):
+                        out = self._gfql_mask_fill(out, null_mask, None)
+                    return out
+            if RowPipelineMixin._gfql_series_is_mapping_like(value):
+                if hasattr(value, "struct"):
+                    try:
+                        out = value.struct.field(prop)
+                    except KeyError:
+                        out = self._gfql_broadcast_scalar(table_df, None)
+                else:
+                    out = value.str.get(prop)
+                if hasattr(out, "where"):
+                    out = self._gfql_mask_fill(out, null_mask, None)
+                return out
+            if RowPipelineMixin._gfql_series_is_entity_text_like(value):
+                out = entity_property_series(value, prop)
+                if hasattr(out, "where"):
+                    fill_mask = null_mask.to_pandas() if isinstance(out, pd.Series) and hasattr(null_mask, "to_pandas") else null_mask
+                    out = self._gfql_mask_fill(out, fill_mask, None)
+                return out
+            if hasattr(null_mask, "all") and bool(null_mask.all()):
+                out = self._gfql_broadcast_scalar(table_df, None)
+                if hasattr(out, "where"):
+                    out = self._gfql_mask_fill(out, null_mask, None)
+                return out
+            raise ValueError(
+                f"unsupported row expression: property access requires a graph element alias, entity value, or map in {expr!r}"
+            )
+
+        if is_null_scalar(value):
+            return None
+        if isinstance(value, str):
+            duration_value = _coerce_duration_property(value)
+            if duration_value is not None:
+                return duration_value
+        if isinstance(value, Mapping):
+            return value.get(prop)
+        if is_entity_text_scalar(value):
+            return entity_property_scalar(value, prop)
+        raise ValueError(
+            f"unsupported row expression: property access requires a graph element alias, entity value, or map in {expr!r}"
+        )
+
+    @staticmethod
+    def _gfql_series_holds_no_typed_cell(series: SeriesT) -> bool:
+        """No non-null cell exists, so the element type is unknown rather than wrong.
+
+        An empty column (a zero-row intermediate) or an all-null one carries no evidence
+        that its values are not sequences, so a sequence op over it must not be refused on
+        dtype alone — an empty ``collect()`` is still a list.
+        """
+        if len(series) == 0:
+            return True
+        isna = getattr(series, "isna", None)
+        if isna is None:
+            return False
+        null_mask = isna()
+        return hasattr(null_mask, "all") and bool(null_mask.all())
+
+    @staticmethod
+    def _gfql_series_is_list_like(series: Any) -> bool:
+        if not hasattr(series, "isna") or not hasattr(series, "astype"):
+            return False
+        # numeric/bool/complex columns can never be list-like — skip the spurious
+        # astype(str)+regex scan (byte-identical; the scan returns False anyway).
+        if is_non_textual_scalar_dtype(getattr(series, "dtype", None)):
+            return False
+        null_mask = series.isna()
+        non_null = ~null_mask
+        if hasattr(non_null, "any") and not bool(non_null.any()):
+            return False
+        sample = series[non_null].head(16) if hasattr(series, "head") else series
+        sample_values = [value for value in RowPipelineMixin._gfql_series_to_pylist(sample) if not is_null_scalar(value)]
+        if sample_values and all(isinstance(value, (list, tuple)) for value in sample_values):
+            return True
+        if any(isinstance(value, str) for value in sample_values):
+            return False  # an actual string row is forced False below; the all() cannot hold
+        if not RowPipelineMixin._gfql_sample_renders_as(sample, r"^(?:\[.*\]|\(.*\))$"):
+            return False
+        text = series.astype(str)
+        if not hasattr(text, "str"):
+            return False
+        try:
+            actual_string = (series == text).where(non_null, False)
+        except Exception:
+            actual_string = non_null & False
+        list_like = series_str_match(text.str.strip(), r"^(?:\[.*\]|\(.*\))$", na=False)
+        return bool(list_like.where(~null_mask, True).where(~actual_string, False).all())
+
+    @staticmethod
+    def _gfql_sample_renders_as(sample: Any, pattern: str) -> bool:  # hygiene-ok: explicit-any -- backend series sample, evaluator-wide idiom
+        """Whether every sampled value renders to text matching ``pattern``. The column rule is an
+        all-rows conjunction, so a sample that fails it rules the column out before rendering it."""
+        if not hasattr(sample, "astype"):
+            return True
+        text = sample.astype(str)
+        if not hasattr(text, "str"):
+            return True
+        return bool(series_str_match(text.str.strip(), pattern, na=False).all())
+
+    @staticmethod
+    def _gfql_series_is_mapping_like(series: Any) -> bool:
+        if not hasattr(series, "isna") or not hasattr(series, "astype"):
+            return False
+        null_mask = series.isna()
+        non_null = ~null_mask
+        if hasattr(non_null, "any") and not bool(non_null.any()):
+            return False
+        sample_source = series[non_null]
+        if hasattr(sample_source, "head"):
+            sample_values = RowPipelineMixin._gfql_series_to_pylist(sample_source.head(16))
+            if hasattr(sample_source, "tail"):
+                sample_values.extend(RowPipelineMixin._gfql_series_to_pylist(sample_source.tail(16)))
+        else:
+            sample_values = RowPipelineMixin._gfql_series_to_pylist(sample_source)
+        sample_values = [value for value in sample_values if not is_null_scalar(value)]
+        if sample_values and all(isinstance(value, Mapping) for value in sample_values):
+            return True
+        if any(isinstance(value, str) for value in sample_values):
+            return False  # an actual string row is forced False below; the all() cannot hold
+        if not RowPipelineMixin._gfql_sample_renders_as(sample_source.head(16) if hasattr(sample_source, "head") else sample_source, r"^\{.*\}$"):
+            return False
+        try:
+            text = series.astype(str)
+        except Exception:
+            return False
+        if not hasattr(text, "str"):
+            return False
+        try:
+            actual_string = (series == text).where(non_null, False)
+        except Exception:
+            actual_string = non_null & False
+        mapping_like = series_str_match(text.str.strip(), r"^\{.*\}$", na=False)
+        return bool(mapping_like.where(~null_mask, True).where(~actual_string, False).all())
+
+    @staticmethod
+    def _gfql_series_scalar_if_constant(series: Any) -> Tuple[bool, Any]:
+        if not hasattr(series, "dropna"):
+            return True, series
+        non_null = series.dropna()
+        if len(non_null) == 0:
+            return True, None
+        try:
+            if hasattr(non_null, "nunique") and int(non_null.nunique(dropna=True)) == 1:
+                if hasattr(non_null, "iloc"):
+                    return True, non_null.iloc[0]
+                values = list(non_null)
+                return True, values[0] if len(values) > 0 else None
+        except Exception:
+            return False, None
+        return False, None
+
+    @staticmethod
+    def _gfql_series_bool_like(series: Any) -> bool:
+        dtype_txt = str(getattr(series, "dtype", "")).lower()
+        if dtype_txt in {"bool", "boolean"}:
+            return True
+        if not hasattr(series, "dropna"):
+            return isinstance(series, bool)
+        if hasattr(series, "isna") and hasattr(series, "isin"):
+            try:
+                null_mask = series.isna()
+                non_null = ~null_mask
+                if hasattr(non_null, "any") and not bool(non_null.any()):
+                    return False
+                valid = series.isin([True, False])
+                if hasattr(valid, "where"):
+                    valid = valid.where(non_null, True)
+                if hasattr(valid, "all"):
+                    return bool(valid.all())
+            except Exception:
+                pass
+        sample = series.dropna().head(128)
+        values = RowPipelineMixin._gfql_series_to_pylist(sample)
+        return len(values) > 0 and all(isinstance(v, bool) for v in values)
+
+    @staticmethod
+    def _gfql_scalar_numeric_non_bool(value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    @staticmethod
+    def _gfql_series_int_non_bool_like(series: Any) -> bool:
+        dtype_txt = str(getattr(series, "dtype", "")).lower()
+        if dtype_txt in {"bool", "boolean"}:
+            return False
+        if any(token in dtype_txt for token in ("int", "long", "short", "uint")):
+            return True
+        if any(token in dtype_txt for token in ("float", "double", "decimal")):
+            return False
+        if not hasattr(series, "isna") or not hasattr(series, "astype"):
+            return isinstance(series, int) and not isinstance(series, bool)
+        null_mask = series.isna()
+        non_null = ~null_mask
+        if hasattr(non_null, "any") and not bool(non_null.any()):
+            return True
+        text = series.astype(str)
+        if not hasattr(text, "str"):
+            return False
+        try:
+            actual_string = (series == text).where(non_null, False)
+        except Exception:
+            actual_string = non_null & False
+        int_like = series_str_match(text, r"^[+-]?\d+$", na=False)
+        return bool(int_like.where(~null_mask, True).where(~actual_string, False).all())
+
+    @staticmethod
+    def _gfql_series_object_non_null_str_like(series: Any) -> bool:
+        dtype_txt = str(getattr(series, "dtype", "")).lower()
+        if dtype_txt != "object":
+            return False
+        if not hasattr(series, "dropna"):
+            return isinstance(series, str)
+        sample = series.dropna().head(128)
+        values = RowPipelineMixin._gfql_series_to_pylist(sample)
+        return len(values) > 0 and all(isinstance(v, str) for v in values)
+
+    @staticmethod
+    def _gfql_series_numeric_non_bool_like(series: Any) -> bool:
+        dtype_txt = str(getattr(series, "dtype", "")).lower()
+        if dtype_txt in {"bool", "boolean"}:
+            return False
+        if any(token in dtype_txt for token in ("int", "float", "double", "decimal")):
+            return True
+        if not hasattr(series, "dropna"):
+            return RowPipelineMixin._gfql_scalar_numeric_non_bool(series)
+        sample = series.dropna().head(128)
+        values = RowPipelineMixin._gfql_series_to_pylist(sample)
+        return len(values) > 0 and all(RowPipelineMixin._gfql_scalar_numeric_non_bool(v) for v in values)
+
+    @staticmethod
+    def _gfql_format_cypher_scalar_literal(value: Any) -> str:
+        if value is None or is_null_scalar(value):
+            return "null"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, str):
+            return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+        return str(value)
+
+    @staticmethod
+    def _gfql_format_cypher_map_scalar(value: Mapping[str, Any]) -> str:
+        parts = [
+            f"{key}: {RowPipelineMixin._gfql_format_cypher_scalar_literal(item)}"
+            for key, item in value.items()
+        ]
+        return "{" + ", ".join(parts) + "}"
+
+    def _gfql_eval_string_predicate_expr(
+        self,
+        table_df: Any,
+        left: Any,
+        right: Any,
+        op_name: str,
+        expr: str,
+    ) -> Any:
+        if hasattr(left, "astype") or hasattr(right, "astype"):
+            left_series = left if hasattr(left, "astype") else self._gfql_broadcast_scalar(table_df, left)
+            if hasattr(right, "astype"):
+                raise ValueError(
+                    f"unsupported row expression: {op_name} rhs must be scalar in vectorized mode for {expr!r}"
+                )
+
+            left_null = self._gfql_null_mask(table_df, left_series)
+            right_null = self._gfql_null_mask(table_df, right)
+            any_null = left_null | right_null
+            left_txt = left_series.astype(str)
+            needle = str(right)
+
+            try:
+                out = apply_string_predicate_series(left_txt, needle, op_name)
+            except NotImplementedError:
+                # An engine decline is a pattern/engine limit, not a bad op name: keep its class.
+                raise
+            except re.error as exc:
+                raise ValueError(f"invalid regex pattern in {expr!r}: {exc}") from exc
+            except ValueError:
+                raise ValueError(f"unsupported row expression predicate op: {op_name} in {expr!r}")
+            except Exception as exc:
+                raise ValueError(
+                    f"unsupported row expression predicate op: {op_name} in {expr!r}"
+                ) from exc
+
+            if hasattr(out, "where"):
+                return out.where(~any_null, pd.NA)
+            return out
+
+        if is_null_scalar(left) or is_null_scalar(right):
+            return None
+        left_txt = str(left)
+        right_txt = str(right)
+        try:
+            return apply_string_predicate_scalar(left_txt, right_txt, op_name)
+        except re.error as exc:
+            raise ValueError(f"invalid regex pattern in {expr!r}: {exc}") from exc
+        except ValueError as exc:
+            raise ValueError(f"unsupported row expression predicate op: {op_name} in {expr!r}") from exc
+
+    def _gfql_broadcast_scalar(self, table_df: Any, value: Any) -> Any:
+        tmp_col = "__gfql_tmp_scalar__"
+        while tmp_col in table_df.columns:
+            tmp_col = f"{tmp_col}_x"
+
+        engine = resolve_engine(EngineAbstract.AUTO, table_df)
+
+        # cuDF treats NaN as null by default; preserve NaN for Cypher parity.
+        is_nan_number = isinstance(value, float) and math.isnan(value)
+        if engine == Engine.CUDF and is_nan_number:
+            repeated_nan = [float("nan") for _ in range(len(table_df))]
+            out = s_cons(Engine.CUDF)(repeated_nan, nan_as_null=False)
+            if hasattr(out, "name"):
+                out.name = tmp_col
+            return out
+
+        # Treat list/map literals as scalar row values by explicit broadcasting.
+        # Plain `assign(col=[...])` interprets list values as column vectors.
+        if isinstance(value, (list, tuple, dict)):
+            repeated_obj = [value for _ in range(len(table_df))]
+            try:
+                return table_df.assign(**{tmp_col: repeated_obj})[tmp_col]
+            except Exception:
+                if engine == Engine.CUDF:
+                    try:
+                        out = s_cons(Engine.CUDF)(repeated_obj)
+                        if hasattr(out, "name"):
+                            out.name = tmp_col
+                        return out
+                    except Exception:
+                        return pd.Series(repeated_obj, dtype="object")
+                raise
+
+        return table_df.assign(**{tmp_col: value})[tmp_col]
+
+    def _gfql_series_from_row_values(self, table_df: Any, values: List[Any], prefix: str) -> Any:
+        tmp_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, prefix)
+        engine = resolve_engine(EngineAbstract.AUTO, table_df)
+
+        try:
+            out = table_df.reset_index(drop=True).assign(**{tmp_col: values})[tmp_col]
+        except Exception:
+            if engine == Engine.CUDF:
+                try:
+                    out = s_cons(Engine.CUDF)(values)
+                    if hasattr(out, "name"):
+                        out.name = tmp_col
+                    return out
+                except Exception:
+                    pass
+            return pd.Series(values, dtype="object")
+
+        return RowPipelineMixin._gfql_on_table_index(table_df, out)
+
+    @staticmethod
+    def _gfql_tri_valued_series(table_df: Any, values: List[Any], col: str) -> Any:  # hygiene-ok: explicit-any -- backend frame + tri-valued Python values, evaluator-wide idiom
+        """A tri-valued (True/False/None) result list as a column on the table's index; an empty list is still boolean."""
+        out = table_df.reset_index(drop=True).assign(**{col: values})[col]
+        if len(values) == 0:
+            out = out.astype(bool)
+        return RowPipelineMixin._gfql_on_table_index(table_df, out)
+
+    @staticmethod
+    def _gfql_is_empty_series(value: object) -> bool:
+        return is_series_like(value) and len(value) == 0  # type: ignore[arg-type]
+
+    @staticmethod
+    def _gfql_assign_positional(frame: DataFrameT, **columns: object) -> DataFrameT:
+        """``assign`` by position, not label: evaluator series may carry the table's own (gappy) labels."""
+        aligned = {
+            name: RowPipelineMixin._gfql_on_table_index(frame, value) if is_series_like(value) else value  # type: ignore[arg-type]
+            for name, value in columns.items()
+        }
+        return frame.assign(**aligned)
+
+    @staticmethod
+    def _gfql_on_table_index(table_df: DataFrameT, series: SeriesT) -> SeriesT:
+        """Give a positionally built series the table's own index so label-aligned consumers line up."""
+        if len(series) != len(table_df.index):
+            return series
+        out = series.copy(deep=False)
+        out.index = table_df.index
+        return out
+
+    def _gfql_truth_masks(self, table_df: Any, value: Any) -> Optional[Tuple[Any, Any, Any]]:
+        if not hasattr(value, "astype"):
+            if is_null_scalar(value):
+                series = self._gfql_broadcast_scalar(table_df, pd.NA)
+            elif isinstance(value, bool):
+                series = self._gfql_broadcast_scalar(table_df, value)
+            else:
+                return None
+        else:
+            series = value
+        if not hasattr(series, "isin") or not hasattr(series, "where"):
+            return None
+        null_mask = self._gfql_null_mask(table_df, series)
+        dtype_name = str(getattr(series, "dtype", "")).lower()
+        if any(token in dtype_name for token in ("int", "float", "double", "long", "short", "uint")):
+            return None
+        valid_mask = series.isin([True, False]) | null_mask
+        if hasattr(valid_mask, "all") and not bool(valid_mask.all()):
+            return None
+        true_mask = series.isin([True]) & ~null_mask
+        false_mask = series.isin([False]) & ~null_mask
+        return true_mask, false_mask, null_mask.astype(bool)
+
+    def _gfql_series_from_truth_masks(
+        self,
+        table_df: Any,
+        true_mask: Any,
+        false_mask: Any,
+        null_mask: Any,
+    ) -> Any:
+        out = self._gfql_broadcast_scalar(table_df, False)
+        if hasattr(out, "astype") and resolve_engine(EngineAbstract.AUTO, table_df) == Engine.PANDAS:
+            out = out.astype("object")
+        if hasattr(out, "where"):
+            out = out.where(~true_mask, True)
+            out = out.where(~false_mask, False)
+            out = out.where(~null_mask, pd.NA)
+            return out
+        return out
+
+    def _gfql_boolean_short_circuit_result(self, table_df: Any, value: Any, op: str) -> Optional[Any]:
+        if op not in {"or", "and"}:
+            return None
+        masks = self._gfql_truth_masks(table_df, value)
+        if masks is None:
+            return None
+        true_mask, false_mask, null_mask = masks
+        if op == "or":
+            if hasattr(false_mask, "any") and bool(false_mask.any()):
+                return None
+            if hasattr(null_mask, "any") and bool(null_mask.any()):
+                return None
+            return self._gfql_series_from_truth_masks(table_df, true_mask, false_mask, null_mask)
+        if hasattr(true_mask, "any") and bool(true_mask.any()):
+            return None
+        if hasattr(null_mask, "any") and bool(null_mask.any()):
+            return None
+        return self._gfql_series_from_truth_masks(table_df, true_mask, false_mask, null_mask)
+
+    def _gfql_eval_boolean_op(self, table_df: Any, left: Any, right: Any, op: str) -> Optional[Any]:
+        if op == "not":
+            masks = self._gfql_truth_masks(table_df, left)
+            if masks is None:
+                return None
+            true_mask, false_mask, null_mask = masks
+            return self._gfql_series_from_truth_masks(table_df, false_mask, true_mask, null_mask)
+
+        if right is _GFQL_MISSING_BOOL_OPERAND:
+            return None
+
+        left_masks = self._gfql_truth_masks(table_df, left)
+        right_masks = self._gfql_truth_masks(table_df, right)
+        if left_masks is None or right_masks is None:
+            return None
+        left_true, left_false, _left_null = left_masks
+        right_true, right_false, _right_null = right_masks
+
+        if op == "and":
+            true_mask = left_true & right_true
+            false_mask = left_false | right_false
+        elif op == "or":
+            true_mask = left_true | right_true
+            false_mask = left_false & right_false
+        elif op == "xor":
+            true_mask = (left_true & right_false) | (left_false & right_true)
+            false_mask = (left_true & right_true) | (left_false & right_false)
+        else:
+            return None
+
+        null_mask = ~(true_mask | false_mask)
+        return self._gfql_series_from_truth_masks(table_df, true_mask, false_mask, null_mask)
+
+    def _gfql_bool_mask(self, table_df: Any, value: Any) -> Any:
+        if hasattr(value, "astype"):
+            mask = value
+            if len(mask) == 0 or bool(mask.isna().all()):
+                return self._gfql_broadcast_scalar(table_df, False).astype(bool)  # nothing to keep; cuDF rejects where(object, False)
+            # Avoid pandas object-dtype fillna() downcast FutureWarning while
+            # keeping NA -> False semantics in a vectorized backend-agnostic way.
+            if hasattr(mask, "isna") and hasattr(mask, "where"):
+                mask = mask.where(~mask.isna(), False)
+            elif hasattr(mask, "fillna"):
+                mask = mask.fillna(False)
+            return mask.astype(bool)
+        return self._gfql_broadcast_scalar(table_df, bool(value)).astype(bool)
+
+    def _gfql_null_mask(self, table_df: Any, value: Any) -> Any:
+        if hasattr(value, "isna"):
+            return value.isna()
+        try:
+            marker = pd.isna(value)
+        except Exception:
+            marker = is_null_scalar(value)
+        if isinstance(marker, bool):
+            return self._gfql_broadcast_scalar(table_df, marker).astype(bool)
+        return self._gfql_broadcast_scalar(
+            table_df,
+            is_null_scalar(value),
+        ).astype(bool)
+
+    def _gfql_range_arg_series(
+        self,
+        table_df: Any,
+        value: Any,
+        *,
+        label: str,
+        expr: str,
+    ) -> Any:
+        series = value if hasattr(value, "astype") else self._gfql_broadcast_scalar(table_df, value)
+        null_mask = self._gfql_null_mask(table_df, series)
+        if hasattr(null_mask, "any") and bool(null_mask.any()):
+            raise ValueError(f"unsupported row expression: range() {label} must be an integer in {expr!r}")
+
+        dtype_txt = str(getattr(series, "dtype", "")).lower()
+        if dtype_txt in {"bool", "boolean"}:
+            raise ValueError(f"unsupported row expression: range() {label} must be an integer in {expr!r}")
+        if any(token in dtype_txt for token in ("int", "long", "short", "uint")):
+            return series.astype("int64") if hasattr(series, "astype") else series
+        if any(token in dtype_txt for token in ("float", "double", "decimal")):
+            raise ValueError(f"unsupported row expression: range() {label} must be an integer in {expr!r}")
+
+        if not hasattr(series, "dropna"):
+            if isinstance(series, int) and not isinstance(series, bool):
+                return self._gfql_broadcast_scalar(table_df, series)
+            raise ValueError(f"unsupported row expression: range() {label} must be an integer in {expr!r}")
+
+        if not RowPipelineMixin._gfql_series_int_non_bool_like(series):
+            raise ValueError(f"unsupported row expression: range() {label} must be an integer in {expr!r}")
+        return series.astype("int64") if hasattr(series, "astype") else series
+
+    def _gfql_eval_range_expr(self, table_df: Any, values: Sequence[Any], expr: str) -> Any:
+        if len(values) not in {2, 3}:
+            raise ValueError(f"unsupported row expression: range() expects 2 or 3 arguments in {expr!r}")
+
+        start_series = self._gfql_range_arg_series(table_df, values[0], label="start", expr=expr)
+        stop_series = self._gfql_range_arg_series(table_df, values[1], label="stop", expr=expr)
+        step_series = (
+            self._gfql_range_arg_series(table_df, values[2], label="step", expr=expr)
+            if len(values) == 3
+            else self._gfql_broadcast_scalar(table_df, 1).astype("int64")
+        )
+
+        zero_step_mask = step_series == 0
+        if hasattr(zero_step_mask, "any") and bool(zero_step_mask.any()):
+            raise ValueError(f"unsupported row expression: range() step must be non-zero in {expr!r}")
+
+        row_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_range_row__")
+        start_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_range_start__")
+        stop_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_range_stop__")
+        step_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_range_step__")
+        len_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_range_len__")
+        pos_list_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_range_pos_list__")
+        pos_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_range_pos__")
+        out_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_range_out__")
+
+        base = table_df.reset_index(drop=True).copy()
+        base = RowPipelineMixin._gfql_assign_positional(
+            base,
+            **{
+                row_col: range(len(base)),
+                start_col: start_series,
+                stop_col: stop_series,
+                step_col: step_series,
+            }
+        )
+
+        positive_mask = base[step_col] > 0
+        negative_mask = base[step_col] < 0
+        keep_positive = positive_mask & (base[stop_col] >= base[start_col])
+        keep_negative = negative_mask & (base[stop_col] <= base[start_col])
+
+        zero_lengths = (base[start_col] * 0).astype("int64")
+        positive_lengths = (((base[stop_col] - base[start_col]) // base[step_col]) + 1).where(keep_positive, 0)
+        negative_lengths = (((base[start_col] - base[stop_col]) // (-base[step_col])) + 1).where(keep_negative, 0)
+        lengths = zero_lengths + positive_lengths.astype("int64") + negative_lengths.astype("int64")
+        base = base.assign(**{len_col: lengths})
+
+        if len(base) == 0:
+            return base[len_col]
+
+        max_len = int(base[len_col].max()) if len(base) > 0 else 0
+        result: Any = self._gfql_broadcast_scalar(base, [])
+        if max_len <= 0:
+            return result.reset_index(drop=True)
+
+        non_empty = base.loc[base[len_col] > 0, [row_col, start_col, step_col, len_col]].copy()
+        pos_template = self._gfql_broadcast_scalar(non_empty, list(range(max_len)))
+        expanded = non_empty.assign(**{pos_list_col: pos_template}).explode(pos_list_col)
+        if len(expanded) == 0:
+            return result.reset_index(drop=True)
+
+        expanded = expanded.reset_index(drop=True)
+        expanded = expanded.rename(columns={pos_list_col: pos_col})
+        expanded[pos_col] = expanded[pos_col].astype("int64")
+        expanded = expanded.loc[expanded[pos_col] < expanded[len_col]]
+        expanded = expanded.assign(**{out_col: expanded[start_col] + expanded[pos_col] * expanded[step_col]})
+
+        grouped = expanded.groupby(row_col, sort=False)[out_col].agg(list).reset_index()
+        merged = base[[row_col]].merge(grouped, on=row_col, how="left", sort=False)
+        merged = self._gfql_restore_row_order(merged, row_col)
+        result = merged[out_col].copy()
+        missing_mask = result.isna() if hasattr(result, "isna") else None
+        if missing_mask is not None and bool(missing_mask.any()):
+            result = self._gfql_mask_fill_sequence_value(merged, result, missing_mask, [])
+        if hasattr(result, "reset_index"):
+            return result.reset_index(drop=True)
+        return result
+
+    def _gfql_resolve_token(self, table_df: Any, token: str) -> Any:
+        txt = token.strip()
+        if txt in table_df.columns:
+            return table_df[txt]
+        node_id = self._gfql_node_id_column()
+        if txt == NODE_IDENTITY_COLUMN and node_id is not None and node_id in table_df.columns:
+            return table_df[node_id]
+        if txt == EDGE_IDENTITY_COLUMN and self._edge is not None and self._edge in table_df.columns:
+            return table_df[self._edge]
+        prop_match = RowPipelineMixin._GFQL_ALIAS_PROP_RE.fullmatch(txt)
+        if prop_match is not None:
+            alias = prop_match.group("alias")
+            prop = prop_match.group("prop")
+            if RowPipelineMixin._gfql_has_bindings_alias_prefix(table_df, alias):
+                if prop == NODE_IDENTITY_COLUMN:
+                    node_id = self._gfql_node_id_column()
+                    identity_col = f"{alias}.{node_id}" if node_id else None
+                    if identity_col is not None and identity_col in table_df.columns:
+                        return table_df[identity_col]
+                    return self._gfql_broadcast_scalar(table_df, pd.NA)
+                qualified = f"{alias}.{prop}"
+                if qualified in table_df.columns:
+                    return table_df[qualified]
+                return self._gfql_broadcast_scalar(table_df, pd.NA)
+            if (
+                alias in table_df.columns
+                and hasattr(table_df[alias], "str")
+                and RowPipelineMixin._gfql_series_is_mapping_like(table_df[alias])
+            ):
+                try:
+                    return table_df[alias].str.get(prop)
+                except Exception:
+                    pass
+            if prop in table_df.columns:
+                return table_df[prop]
+            if alias in table_df.columns:
+                if not RowPipelineMixin._gfql_table_has_graph_shape(table_df):
+                    raise ValueError(
+                        f"unsupported row expression: property access requires a graph element alias in {token!r}"
+                    )
+                if prop == NODE_IDENTITY_COLUMN:
+                    node_id = self._gfql_node_id_column()
+                    if node_id is not None and node_id in table_df.columns:
+                        return table_df[node_id]
+                return self._gfql_broadcast_scalar(table_df, pd.NA)
+        # A bare alias on a bindings-row table resolves to its identity column, alias.{node_id}.
+        if "." not in txt and RowPipelineMixin._gfql_has_bindings_alias_prefix(table_df, txt):
+            edge_aliases = self._gfql_rows_edge_aliases
+            if edge_aliases is not None and txt in edge_aliases:
+                # Relationship aliases should render as entities (parity with
+                # Cypher RETURN <relAlias>) instead of collapsing to id-like
+                # scalar columns such as `<rel>.id`.
+                return self._gfql_render_relationship_alias(table_df, txt)
+            node_id = self._gfql_node_id_column()
+            id_col = f"{txt}.{node_id}" if node_id else None
+            if id_col is not None and id_col in table_df.columns:
+                return table_df[id_col]
+            raise ValueError(f"unsupported token in row expression: {token!r}")
+        raise ValueError(f"unsupported token in row expression: {token!r}")
+
+    def _gfql_render_relationship_alias(self, table_df: Any, alias: str) -> Any:
+        """Render relationship-alias rows as Cypher-style ``[:TYPE {props}]`` strings."""
+        prefix = f"{alias}."
+        alias_cols = [col for col in table_df.columns if isinstance(col, str) and col.startswith(prefix)]
+        if len(alias_cols) == 0:
+            return self._gfql_broadcast_scalar(table_df, pd.NA)
+
+        alias_df = table_df[alias_cols].copy().rename(columns={col: col[len(prefix):] for col in alias_cols})
+        presence_col = RowPipelineMixin._gfql_fresh_col_name(alias_df.columns, "__gfql_rel_alias__")
+        present_mask: Optional[Any] = None
+        for col in alias_df.columns:
+            col_present = ~alias_df[col].isna()
+            present_mask = col_present if present_mask is None else (present_mask | col_present)
+        if present_mask is None:
+            return self._gfql_broadcast_scalar(table_df, pd.NA)
+        alias_df[presence_col] = present_mask.where(present_mask, pd.NA)
+
+        excluded = [
+            str(x)
+            for x in (
+                self._source,
+                self._destination,
+                self._edge,
+                alias,
+                presence_col,
+            )
+            if x is not None
+        ]
+        property_columns = edge_property_columns(alias_df, presence_col, excluded)
+        return format_edge_entity_text(
+            alias_df,
+            alias_col=presence_col,
+            property_columns=property_columns,
+            type_col="type",
+            nullify_missing_alias_rows=True,
+        )
+
+    def _gfql_eval_dynamic_list_subscript(
+        self,
+        table_df: Any,
+        base_value: Any,
+        key_value: Any,
+        expr: str,
+    ) -> Any:
+        if not hasattr(base_value, "iloc"):
+            base_value = self._gfql_broadcast_scalar(table_df, base_value)
+
+        normalized_values: List[Any] = []
+        saw_string_parse = False
+        parse_failed = False
+        for value in RowPipelineMixin._gfql_series_to_pylist(base_value):
+            if is_null_scalar(value):
+                normalized_values.append(None)
+                continue
+            if isinstance(value, (list, tuple)):
+                normalized_values.append(list(value))
+                continue
+            if isinstance(value, str):
+                try:
+                    parsed_value = ast.literal_eval(value)
+                except Exception:
+                    parsed_value = None
+                if isinstance(parsed_value, (list, tuple)):
+                    normalized_values.append(list(parsed_value))
+                    saw_string_parse = True
+                    continue
+            parse_failed = True
+            break
+        if parse_failed:
+            raise ValueError(
+                f"unsupported row expression: dynamic subscript requires list-like base in {expr!r}"
+            )
+        if saw_string_parse:
+            if resolve_engine(EngineAbstract.AUTO, table_df) == Engine.CUDF:
+                try:
+                    base_value = s_cons(Engine.CUDF)(
+                        normalized_values,
+                        index=getattr(base_value, "index", None),
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                    RuntimeError,
+                    AttributeError,
+                    NotImplementedError,
+                ) as exc:
+                    if _gfql_cudf_list_sort_requires_host_bridge():
+                        host_index = getattr(base_value, "index", None)
+                        if host_index is not None and hasattr(host_index, "to_pandas"):
+                            try:
+                                host_index = host_index.to_pandas()
+                            except Exception:
+                                host_index = None
+                        base_value = pd.Series(normalized_values, index=host_index, dtype="object")
+                    else:
+                        raise ValueError(
+                            "internal engine-boundary violation: dynamic list subscript string parsing "
+                            "in cuDF mode must materialize as cuDF series"
+                        ) from exc
+            else:
+                host_index = getattr(base_value, "index", None)
+                if host_index is not None and hasattr(host_index, "to_pandas"):
+                    try:
+                        host_index = host_index.to_pandas()
+                    except Exception:
+                        host_index = None
+                base_value = pd.Series(normalized_values, index=host_index, dtype="object")
+        if not RowPipelineMixin._gfql_series_is_list_like(base_value):
+            raise ValueError(
+                f"unsupported row expression: dynamic subscript requires list-like base in {expr!r}"
+            )
+
+        key_dtype = str(getattr(key_value, "dtype", "")).lower()
+        key_is_int_like = "int" in key_dtype and "bool" not in key_dtype
+        if not key_is_int_like:
+            if key_dtype != "object":
+                raise ValueError(
+                    f"unsupported row expression: dynamic subscript keys must be integer typed in {expr!r}"
+                )
+            if not RowPipelineMixin._gfql_series_int_non_bool_like(key_value):
+                raise ValueError(
+                    f"unsupported row expression: dynamic subscript keys must be integer typed in {expr!r}"
+                )
+
+        row_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_dynsub_row__")
+        base_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_dynsub_base__")
+        key_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_dynsub_key__")
+        pos_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_dynsub_pos__")
+
+        if resolve_engine(EngineAbstract.AUTO, table_df) == Engine.CUDF:
+            if isinstance(base_value, pd.Series):
+                try:
+                    base_value = s_cons(Engine.CUDF)(
+                        base_value.tolist(),
+                        index=getattr(table_df, "index", None),
+                    )
+                except Exception as exc:
+                    if not _gfql_cudf_list_sort_requires_host_bridge():
+                        raise ValueError(
+                            "internal engine-boundary violation: base series in cuDF mode remained pandas"
+                        ) from exc
+            if isinstance(key_value, pd.Series):
+                try:
+                    key_value = s_cons(Engine.CUDF)(
+                        key_value.tolist(),
+                        index=getattr(table_df, "index", None),
+                    )
+                except Exception as exc:
+                    if not _gfql_cudf_list_sort_requires_host_bridge():
+                        raise ValueError(
+                            "internal engine-boundary violation: key series in cuDF mode remained pandas"
+                        ) from exc
+            if not isinstance(base_value, pd.Series) and not isinstance(key_value, pd.Series):
+                try:
+                    out = base_value.list.get(key_value)
+                    return out.reset_index(drop=True) if hasattr(out, "reset_index") else out
+                except (
+                    TypeError,
+                    ValueError,
+                    RuntimeError,
+                    AttributeError,
+                    NotImplementedError,
+                ) as exc:
+                    if not _gfql_cudf_list_sort_requires_host_bridge():
+                        raise ValueError(
+                            "internal engine-boundary violation: cuDF dynamic list subscript "
+                            "must execute via list.get in cuDF mode"
+                        ) from exc
+
+        if isinstance(base_value, pd.Series) or isinstance(key_value, pd.Series):
+            base_assign = base_value.to_pandas() if hasattr(base_value, "to_pandas") else base_value
+            key_assign = key_value.to_pandas() if hasattr(key_value, "to_pandas") else key_value
+            if hasattr(base_assign, "reset_index"):
+                base_assign = base_assign.reset_index(drop=True)
+            if hasattr(key_assign, "reset_index"):
+                key_assign = key_assign.reset_index(drop=True)
+            base = pd.DataFrame({row_col: range(len(table_df))})
+            base = base.assign(
+                **{
+                    base_col: base_assign,
+                    key_col: key_assign,
+                }
+            )[[row_col, base_col, key_col]]
+        else:
+            base = table_df.assign(
+                **{
+                    row_col: range(len(table_df)),
+                    base_col: base_value,
+                    key_col: key_value,
+                }
+            )[[row_col, base_col, key_col]]
+
+        if isinstance(base, pd.DataFrame):
+            # openCypher negative subscripts index from the end; normalize per-row so the positional join matches (out-of-range stays null).
+            key_values = list(base[key_col])
+            if any(isinstance(k, (int, float)) and not isinstance(k, bool) and k == k and k < 0 for k in key_values):
+                normalized_keys: List[Any] = []
+                for k, v in zip(key_values, list(base[base_col])):
+                    if k is None or (isinstance(k, float) and k != k) or not isinstance(k, (int, float)) or isinstance(k, bool):
+                        normalized_keys.append(k)
+                        continue
+                    k_int = int(k)
+                    if k_int < 0 and isinstance(v, (list, tuple)):
+                        k_int += len(v)
+                        if k_int < 0:
+                            normalized_keys.append(None)
+                            continue
+                    normalized_keys.append(k_int)
+                base[key_col] = pd.Series(normalized_keys, index=base.index, dtype="object")
+                key_dtype = "object"
+
+        expanded = base[[row_col, base_col]].explode(base_col)
+        expanded = expanded.assign(
+            **{pos_col: expanded.groupby(row_col, sort=False).cumcount()}
+        )[[row_col, pos_col, base_col]]
+        if key_dtype == "object" and hasattr(expanded[pos_col], "astype"):
+            expanded[pos_col] = expanded[pos_col].astype("object")
+
+        merged = base[[row_col, key_col]].merge(
+            expanded,
+            left_on=[row_col, key_col],
+            right_on=[row_col, pos_col],
+            how="left",
+            sort=False,
+        )
+        return merged[base_col].reset_index(drop=True)
+
+    def _gfql_eval_slice_subscript(
+        self,
+        table_df: Any,
+        base_value: Any,
+        start_value: Any,
+        end_value: Any,
+        start_present: bool,
+        end_present: bool,
+        expr: str,
+    ) -> Any:
+        if not hasattr(base_value, "astype"):
+            base_value = self._gfql_broadcast_scalar(table_df, base_value)
+
+        if hasattr(start_value, "astype"):
+            start_ok, start_scalar = RowPipelineMixin._gfql_series_scalar_if_constant(start_value)
+            if not start_ok:
+                raise ValueError(f"unsupported row expression: dynamic slice start is not supported in {expr!r}")
+            start_value = start_scalar
+        if hasattr(end_value, "astype"):
+            end_ok, end_scalar = RowPipelineMixin._gfql_series_scalar_if_constant(end_value)
+            if not end_ok:
+                raise ValueError(f"unsupported row expression: dynamic slice end is not supported in {expr!r}")
+            end_value = end_scalar
+
+        if (start_present and is_null_scalar(start_value)) or (
+            end_present and is_null_scalar(end_value)
+        ):
+            return self._gfql_broadcast_scalar(table_df, None)
+
+        def _coerce_bound(v: Any, label: str) -> Optional[int]:
+            if is_null_scalar(v):
+                return None
+            if isinstance(v, bool):
+                raise ValueError(f"unsupported row expression: {label} bound must be integer/null in {expr!r}")
+            if isinstance(v, int):
+                return v
+            if isinstance(v, float):
+                if not float(v).is_integer():
+                    raise ValueError(f"unsupported row expression: {label} bound must be integer/null in {expr!r}")
+                return int(v)
+            if isinstance(v, str) and re.fullmatch(r"-?\d+", v.strip()):
+                return int(v.strip())
+            raise ValueError(f"unsupported row expression: {label} bound must be integer/null in {expr!r}")
+
+        start_i = _coerce_bound(start_value, "slice start")
+        end_i = _coerce_bound(end_value, "slice end")
+
+        if RowPipelineMixin._gfql_series_is_list_like(base_value):
+            row_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_slice_row__")
+            list_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_slice_list__")
+            len_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_slice_len__")
+            start_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_slice_start__")
+            stop_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_slice_stop__")
+            pos_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_slice_pos__")
+            out_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_slice_out__")
+
+            base = table_df.assign(**{row_col: range(len(table_df)), list_col: base_value})
+            null_mask = self._gfql_null_mask(base, base[list_col])
+            try:
+                lengths = series_sequence_len(base[list_col])
+            except Exception as exc:
+                raise ValueError(f"unsupported row expression: slice subscript requires list/string base in {expr!r}") from exc
+            if hasattr(lengths, "fillna"):
+                lengths = lengths.fillna(0)
+            lengths = lengths.astype("int64")
+
+            if start_i is None:
+                start_norm = lengths * 0
+            elif start_i >= 0:
+                start_norm = lengths * 0 + start_i
+            else:
+                start_norm = lengths + start_i
+
+            if end_i is None:
+                stop_norm = lengths
+            elif end_i >= 0:
+                stop_norm = lengths * 0 + end_i
+            else:
+                stop_norm = lengths + end_i
+
+            start_norm = start_norm.clip(lower=0, upper=lengths)
+            stop_norm = stop_norm.clip(lower=0, upper=lengths)
+            base = base.assign(**{len_col: lengths, start_col: start_norm, stop_col: stop_norm})
+
+            non_null = base.loc[~null_mask, [row_col, list_col, len_col, start_col, stop_col]].copy()
+            expanded = non_null[[row_col, list_col]].explode(list_col)
+            if len(expanded) > 0:
+                expanded = expanded.reset_index(drop=True)
+                expanded = expanded.assign(
+                    **{pos_col: expanded.groupby(row_col, sort=False).cumcount()}
+                )
+                bounds = non_null[[row_col, len_col, start_col, stop_col]]
+                expanded = expanded.merge(bounds, on=row_col, how="left", sort=False)
+                keep_mask = (
+                    (expanded[pos_col] < expanded[len_col])
+                    & (expanded[pos_col] >= expanded[start_col])
+                    & (expanded[pos_col] < expanded[stop_col])
+                )
+                expanded = expanded.loc[keep_mask, [row_col, list_col]].rename(columns={list_col: out_col})
+                grouped = expanded.groupby(row_col, sort=False)[out_col].agg(list).reset_index()
+            else:
+                grouped = non_null[[row_col]].iloc[0:0].copy()
+                grouped[out_col] = []
+
+            merged = base[[row_col, start_col, stop_col]].merge(grouped, on=row_col, how="left", sort=False)
+            merged = self._gfql_restore_row_order(merged, row_col)
+            result = (
+                merged[out_col].copy()
+                if out_col in merged.columns
+                else self._gfql_broadcast_scalar(merged, None)
+            )
+            empty_mask = merged[start_col] >= merged[stop_col]
+            if hasattr(empty_mask, "any") and bool(empty_mask.any()):
+                result = self._gfql_mask_fill_sequence_value(merged, result, empty_mask, [])
+            if hasattr(null_mask, "any") and bool(null_mask.any()):
+                result = self._gfql_mask_fill_sequence_value(merged, result, null_mask, None)
+            return result.reset_index(drop=True)
+
+        if not hasattr(base_value, "str"):
+            raise ValueError(f"unsupported row expression: slice subscript requires list/string base in {expr!r}")
+        try:
+            return base_value.str.slice(start=start_i, stop=end_i)
+        except Exception as exc:
+            raise ValueError(
+                f"unsupported row expression: slice subscript failed for {expr!r}: {exc}"
+            ) from exc
+
+    def _gfql_concat_list_scalar(
+        self,
+        table_df: Any,
+        list_series: Any,
+        scalar_series: Any,
+        prepend: bool = False,
+    ) -> Any:
+        def _python_fallback() -> Any:
+            list_values = self._gfql_series_to_pylist(list_series)
+            scalar_values = self._gfql_series_to_pylist(scalar_series)
+            out_values: List[Any] = []
+            for list_value, scalar_value in zip(list_values, scalar_values):
+                if is_null_scalar(list_value):
+                    out_values.append(None)
+                    continue
+                seq = list(list_value) if isinstance(list_value, (list, tuple)) else [list_value]
+                scalar_item = None if is_null_scalar(scalar_value) else scalar_value
+                out_values.append(([scalar_item] + seq) if prepend else (seq + [scalar_item]))
+            if resolve_engine(EngineAbstract.AUTO, table_df) == Engine.CUDF:
+                try:
+                    out = s_cons(Engine.CUDF)(out_values)
+                    if hasattr(list_series, "name") and hasattr(out, "name"):
+                        out.name = list_series.name
+                    return out
+                except Exception:
+                    try:
+                        tmp_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_list_add_fallback__")
+                        out = table_df.assign(**{tmp_col: out_values})[tmp_col]
+                        if hasattr(list_series, "name") and hasattr(out, "name"):
+                            out.name = list_series.name
+                        return out
+                    except Exception:
+                        pass
+            return pd.Series(out_values)
+
+        if (
+            resolve_engine(EngineAbstract.AUTO, table_df) == Engine.CUDF
+            and RowPipelineMixin._gfql_series_bool_like(scalar_series)
+        ):
+            return _python_fallback()
+
+        try:
+            row_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_list_add_row__")
+            list_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_list_add_list__")
+            val_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_list_add_val__")
+            pos_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_list_add_pos__")
+            len_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_list_add_len__")
+
+            base = table_df.assign(**{row_col: range(len(table_df)), list_col: list_series, val_col: scalar_series})
+            null_mask = self._gfql_null_mask(base, base[list_col])
+            lengths = series_sequence_len(base[list_col]).fillna(0)
+            base = base.assign(**{len_col: lengths.astype("int64")})
+
+            non_null = base.loc[~null_mask, [row_col, list_col, val_col, len_col]]
+            expanded = non_null[[row_col, list_col, len_col]].explode(list_col)
+            if len(expanded) > 0:
+                expanded = expanded.assign(
+                    **{pos_col: expanded.groupby(row_col, sort=False).cumcount()}
+                )
+                expanded = expanded.loc[expanded[pos_col] < expanded[len_col]]
+                expanded = expanded[[row_col, pos_col, list_col]].rename(columns={list_col: val_col})
+            else:
+                expanded = non_null[[row_col]].iloc[0:0].copy()
+                expanded[pos_col] = []
+                expanded[val_col] = []
+
+            append_rows = non_null[[row_col, val_col, len_col]].copy()
+            append_rows = append_rows.assign(**{pos_col: 0 if prepend else append_rows[len_col]})
+            append_rows = append_rows[[row_col, pos_col, val_col]]
+
+            if prepend:
+                if len(expanded) > 0:
+                    expanded = expanded.assign(**{pos_col: expanded[pos_col] + 1})
+                combined = concat_frames([append_rows, expanded])
+            else:
+                combined = concat_frames([expanded, append_rows])
+            if combined is None:
+                combined = non_null[[row_col]].iloc[0:0].copy()
+                combined[pos_col] = []
+                combined[val_col] = []
+            if len(combined) > 0:
+                combined = combined.sort_values(by=[row_col, pos_col], kind="mergesort")
+                grouped = combined.groupby(row_col, sort=False)[val_col].agg(list).reset_index()
+            else:
+                grouped = non_null[[row_col]].iloc[0:0].copy()
+                grouped[val_col] = []
+
+            out = self._gfql_restore_row_order(
+                base[[row_col, len_col]].merge(grouped, on=row_col, how="left", sort=False),
+                row_col,
+            )[val_col]
+            out = self._gfql_mask_fill(out, null_mask, None)
+            return out.reset_index(drop=True)
+        except Exception:
+            return _python_fallback()
+
+    def _gfql_eval_temporal_in_expr(
+        self,
+        table_df: Any,  # hygiene-ok: explicit-any -- pandas/cuDF table, evaluator-wide idiom
+        left_series: Any,  # hygiene-ok: explicit-any -- heterogeneous scalar-or-Series operand, evaluator-wide idiom
+        right_value: Any,  # hygiene-ok: explicit-any -- arbitrary cypher list value, evaluator-wide idiom
+    ) -> Optional[Any]:  # hygiene-ok: explicit-any -- scalar-or-Series mask, evaluator-wide idiom
+        """``<temporal> IN [<temporal literals>]`` via the temporal comparison path.
+
+        Plain value equality compares the ISO TEXT, so ``n.ts_txt IN [datetime('...')]``
+        never matched: ``datetime()`` renders a UTC 'Z' suffix the column does not carry
+       . ``=`` against the same literal already compares as instants; this
+        makes IN agree with it. Returns None (fall through) unless every element engages
+        the temporal path, so non-temporal IN is untouched.
+        """
+        if not isinstance(right_value, (list, tuple)) or len(right_value) == 0:
+            return None
+        if (
+            order_detect_native_temporal_mode(left_series) is None
+            and order_detect_temporal_mode(left_series) is None
+        ):
+            return None
+        element_masks: List[Optional[Any]] = []
+        for element in right_value:
+            if is_null_scalar(element):
+                element_masks.append(None)
+                continue
+            element_mask = self._gfql_eval_temporal_comparison_op(table_df, left_series, element, "=")
+            if element_mask is None:
+                return None
+            element_masks.append(element_mask)
+
+        row_count = len(table_df)
+        per_element_values = [
+            self._gfql_series_to_pylist(mask) if mask is not None else [None] * row_count
+            for mask in element_masks
+        ]
+        out_values: List[Any] = []
+        for row_index in range(row_count):
+            saw_true = False
+            saw_unknown = False
+            for values in per_element_values:
+                item = values[row_index]
+                if is_null_scalar(item):
+                    saw_unknown = True
+                elif bool(item):
+                    saw_true = True
+                    break
+            out_values.append(True if saw_true else (None if saw_unknown else False))
+        out_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_in_temporal__")
+        return RowPipelineMixin._gfql_tri_valued_series(table_df, out_values, out_col)
+
+    def _gfql_eval_in_expr(
+        self,
+        table_df: Any,
+        left_value: Any,
+        right_value: Any,
+        expr: str,
+    ) -> Any:
+        left_series = left_value if hasattr(left_value, "astype") else self._gfql_broadcast_scalar(table_df, left_value)
+        right_series = right_value if hasattr(right_value, "astype") else self._gfql_broadcast_scalar(table_df, right_value)
+
+        temporal_in = self._gfql_eval_temporal_in_expr(table_df, left_series, right_value)
+        if temporal_in is not None:
+            return temporal_in
+
+        left_is_column = hasattr(left_value, "astype")  # a cell reads null as `=` does; a literal keeps NaN as a value
+        out_values = self._gfql_in_literal_list_values(left_series, right_value, left_is_column=left_is_column)
+        if out_values is None:
+            lhs_values = self._gfql_series_to_pylist(left_series)
+            rhs_values = self._gfql_series_to_pylist(right_series)
+            lhs_null = (self._gfql_series_to_pylist(self._gfql_null_mask(table_df, left_series)) if left_is_column
+                        else [RowPipelineMixin._gfql_is_cypher_null_scalar(v)
+                              for v in self._gfql_series_to_pylist(left_series)])
+            out_values = []
+            for lhs_item, rhs_item, lhs_is_null in zip(lhs_values, rhs_values, lhs_null):
+                if is_null_scalar(rhs_item):
+                    out_values.append(None)
+                    continue
+                if not isinstance(rhs_item, (list, tuple)):
+                    raise ValueError(f"unsupported row expression: IN rhs must be list-like in {expr!r}")
+                if bool(lhs_is_null) and len(rhs_item):
+                    out_values.append(None)  # the row reads null to `=`, so IN is unknown too
+                    continue
+                saw_unknown = False
+                saw_true = False
+                for rhs_elem in rhs_item:
+                    is_equal = RowPipelineMixin._gfql_cypher_value_equal(lhs_item, rhs_elem)
+                    if is_equal is True:
+                        saw_true = True
+                        break
+                    if is_equal is None:
+                        saw_unknown = True
+                if saw_true:
+                    out_values.append(True)
+                elif saw_unknown:
+                    out_values.append(None)
+                else:
+                    out_values.append(False)
+        out_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_in_tri__")
+        return RowPipelineMixin._gfql_tri_valued_series(table_df, out_values, out_col)
+
+    @staticmethod
+    def _gfql_in_literal_list_values(
+        left_series: Any,  # hygiene-ok: explicit-any -- pandas/cuDF Series, evaluator-wide idiom
+        right_value: Any,  # hygiene-ok: explicit-any -- arbitrary cypher list value, evaluator-wide idiom
+        left_is_column: bool = True,
+    ) -> Optional[List[Any]]:  # hygiene-ok: explicit-any -- tri-state row values, evaluator-wide idiom
+        """``<column> IN [<scalar literals>]`` through ``isin``, or None to leave it to the loop.
+
+        Same truth table as the element loop: a row is TRUE when a non-null element equals
+        it, else NULL when the row is null or the list holds a null, else FALSE; an empty
+        list is FALSE for every row. Only a constant list of plain scalars qualifies:
+        list/map elements need the structural equality the loop implements, and a per-row
+        list is not a constant. A COLUMN cell reads null exactly as the comparison operators
+        read it (``isna``), so ``x IN [...]`` and ``x = ...`` are unknown on the same rows;
+        with ``left_is_column=False`` the left side is a scalar literal, where NaN stays a
+        value that equals nothing, which is also what ``=`` does with it.
+        """
+        if not isinstance(right_value, (list, tuple)) or not hasattr(left_series, "isin"):
+            return None
+        probe: List[Any] = []
+        rhs_has_null = False
+        for element in right_value:
+            if RowPipelineMixin._gfql_is_cypher_null_scalar(element):
+                rhs_has_null = True
+                continue
+            if isinstance(element, (list, tuple, dict)):
+                return None  # structural equality is the loop's job
+            if isinstance(element, float) and math.isnan(element):
+                continue
+            probe.append(element)
+        probe_bools = [isinstance(element, bool) for element in probe]
+        series_is_bool = str(getattr(left_series, "dtype", "")).lower() in ("bool", "boolean")
+        if probe and (any(probe_bools) != all(probe_bools) or any(probe_bools) != series_is_bool):
+            return None  # `True == 1` holds in the loop but not in every engine's isin; the loop decides
+        try:
+            hit = np.asarray(RowPipelineMixin._gfql_series_to_pylist(left_series.isin(probe)), dtype=bool) if probe \
+                else np.zeros(len(left_series), dtype=bool)
+            missing = np.asarray(RowPipelineMixin._gfql_series_to_pylist(left_series.isna()), dtype=bool)
+        except Exception:
+            return None  # e.g. unhashable row values -> the loop's structural equality decides
+        if not left_is_column and missing.any():
+            sparse = RowPipelineMixin._gfql_series_to_pylist(left_series.iloc[np.flatnonzero(missing)])
+            missing[np.flatnonzero(missing)] = np.fromiter(
+                (RowPipelineMixin._gfql_is_cypher_null_scalar(v) for v in sparse), dtype=bool, count=len(sparse))
+        # an empty list has nothing to compare against, so even a null row is FALSE
+        unknown = (missing | rhs_has_null) if len(right_value) else np.zeros_like(missing)
+        return [True if h else (None if u else False) for h, u in zip(hit.tolist(), unknown.tolist())]
+
+    @staticmethod
+    def _gfql_parse_row_expr(expr: str) -> Any:  # hygiene-ok: explicit-any -- parser AST node union
+        """Parse and capability-check a row expression without evaluating it."""
+        txt = expr.strip()
+        parser_bundle = _gfql_expr_runtime_parser_bundle()
+        if parser_bundle is None:
+            raise ValueError(
+                f"unsupported row expression: parser backend unavailable in {expr!r}"
+            )
+
+        parser, capability_checker, _expr_parser_mod = parser_bundle
+        try:
+            ast_node = parser(txt)
+            capability_errors = capability_checker(ast_node)
+        except Exception as exc:
+            raise ValueError(f"unsupported row expression: parser validation failed in {expr!r}") from exc
+
+        if len(capability_errors) > 0:
+            raise ValueError(
+                f"unsupported row expression: {', '.join(capability_errors)} in {expr!r}"
+            )
+        return ast_node
+
+    def _gfql_eval_string_expr(self, table_df: Any, expr: str) -> Any:
+        ast_node = RowPipelineMixin._gfql_parse_row_expr(expr)
+
+        try:
+            ast_ok, ast_value = self._gfql_eval_expr_ast(table_df, ast_node)
+        except Exception as exc:
+            if isinstance(exc, (ValueError, NotImplementedError, GFQLValidationError)):
+                # An honest decline or an already-typed Cypher error keeps its own taxonomy.
+                raise
+            raise ValueError(f"unsupported row expression: AST evaluator unsupported in {expr!r}") from exc
+
+        if ast_ok:
+            return ast_value
+
+        raise ValueError(f"unsupported row expression: AST evaluator unsupported in {expr!r}")
+
+    _gfql_row_table = row_frame_ops.row_table
+    _gfql_empty_frame = row_frame_ops.empty_frame
+    _gfql_get_active_table = row_frame_ops.get_active_table
+    rows = row_frame_ops.rows
+
+    @staticmethod
+    def _gfql_bindings_error(message: str) -> NoReturn:
+        raise GFQLValidationError(
+            ErrorCode.E108,
+            message,
+            field="rows",
+            value="binding_ops",
+            suggestion="Use a single connected scalar path or a simpler Cypher projection.",
+            language="cypher",
+        )
+
+    @staticmethod
+    def _gfql_validate_binding_ops(ops: Sequence[Any]) -> None:
+        if len(ops) == 0:
+            RowPipelineMixin._gfql_bindings_error(
+                "Cypher multi-alias row bindings require at least one node or edge operation"
+            )
+        all_nodes = all(hasattr(op, "filter_dict") and not hasattr(op, "edge_match") for op in ops)
+        if not all_nodes and (
+            len(ops) % 2 == 0
+            or any((idx % 2 == 0) != hasattr(op, "filter_dict") for idx, op in enumerate(ops))
+            or any((idx % 2 == 1) != hasattr(op, "edge_match") for idx, op in enumerate(ops))
+        ):
+            RowPipelineMixin._gfql_bindings_error(
+                "Cypher multi-alias row bindings currently require either node-only cartesian bindings or a single connected alternating node/edge path"
+            )
+        seen_aliases = set()
+        for op in ops:
+            alias = getattr(op, "_name", None)
+            if not isinstance(alias, str):
+                continue
+            if alias in seen_aliases:
+                RowPipelineMixin._gfql_bindings_error(
+                    f"Cypher multi-alias row bindings require unique aliases; duplicate alias '{alias}' found"
+                )
+            seen_aliases.add(alias)
+
+    @staticmethod
+    def _gfql_binding_ops_mode(ops: Sequence[Any]) -> Literal["connected_path", "node_cartesian"]:
+        RowPipelineMixin._gfql_validate_binding_ops(ops)
+        if all(hasattr(op, "filter_dict") and not hasattr(op, "edge_match") for op in ops):
+            return "node_cartesian"
+        return "connected_path"
+
+    @staticmethod
+    def _gfql_unshadow_alias_marker_column(
+        lookup_source: Optional[DataFrameT],
+        alias: str,
+        base_frame: Optional[DataFrameT],
+        key_col: str,
+    ) -> Optional[DataFrameT]:
+        """Restore a user column that the alias marker overwrote, for property lookup.
+
+        ``ASTNode``/``ASTEdge.execute`` stamp the alias flag as ``<alias> = True``, so a
+        graph whose entity column is named like the alias (``MATCH (kind:P) ... kind.kind``)
+        had that column read back as ``True``. The binding column is rebuilt from ids, not
+        from the marker, so restoring the user values here only affects property reads.
+        """
+        if base_frame is None or lookup_source is None:
+            return lookup_source
+        if alias == key_col:
+            return lookup_source
+        if alias not in getattr(base_frame, "columns", []) or alias not in lookup_source.columns:
+            return lookup_source
+        if key_col not in lookup_source.columns or key_col not in base_frame.columns:
+            return lookup_source
+        return lookup_source.drop(columns=[alias]).merge(
+            base_frame[[key_col, alias]], on=key_col, how="left"
+        )
+
+    @staticmethod
+    def _gfql_restore_alias_property_dtypes(bindings: "DataFrameT", base_nodes: Optional["DataFrameT"], alias: str) -> "DataFrameT":
+        """A traversal frame carries id-only stub rows, so its property columns arrive widened; once the bound rows hold no null, the node table's dtype is the answer's dtype."""
+        if base_nodes is None:
+            return bindings
+        for prop in base_nodes.columns:
+            col = f"{alias}.{prop}"
+            if col not in bindings.columns:
+                continue
+            want, have = str(base_nodes[prop].dtype), str(bindings[col].dtype)
+            if want == have or have not in ("float64", "float32", "object"):
+                continue
+            if want not in ("int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "bool"):
+                continue
+            if bool(bindings[col].isna().any()):
+                continue
+            bindings[col] = bindings[col].astype(want)
+        return bindings
+
+    @staticmethod
+    def _gfql_node_alias_lookup_frame(lookup_source: Any, node_id: str, alias: str) -> Any:
+        """Build node IDs and alias-qualified properties for a left merge."""
+        other = [col for col in lookup_source.columns if col != node_id]
+        renamed = lookup_source.rename(columns={col: f"{alias}.{col}" for col in other})
+        ids = lookup_source[node_id]
+        lookup = renamed.assign(**{alias: ids, f"{alias}.{node_id}": ids})
+        return lookup[[node_id, alias, f"{alias}.{node_id}", *[f"{alias}.{col}" for col in other]]]
+
+    @staticmethod
+    def _gfql_node_filter_has_label(filter_dict: Any) -> bool:
+        if not isinstance(filter_dict, Mapping):
+            return False
+        return any(str(key).startswith(LABEL_FLAG_PREFIX) and value is True for key, value in filter_dict.items())
+
+    @staticmethod
+    def _gfql_edge_match_type(edge_match: Any) -> Optional[str]:
+        if not isinstance(edge_match, Mapping):
+            return None
+        edge_type = edge_match.get("type")
+        return edge_type if isinstance(edge_type, str) else None
+
+    @staticmethod
+    def _gfql_has_edge_destination_label(edge_type: str) -> Optional[str]:
+        prefix = "HAS_"
+        if not edge_type.startswith(prefix):
+            return None
+        suffix = edge_type[len(prefix):]
+        if suffix == "":
+            return None
+        return "".join(part.capitalize() for part in suffix.split("_") if part)
+
+    @staticmethod
+    def _gfql_has_edge_destination_label_col(edge_op: Any, columns: Any) -> Optional[str]:
+        edge_type = RowPipelineMixin._gfql_edge_match_type(getattr(edge_op, "edge_match", None))
+        if edge_type is None:
+            return None
+        label = RowPipelineMixin._gfql_has_edge_destination_label(edge_type)
+        if label is None:
+            return None
+        label_col = f"label__{label}"
+        return label_col if label_col in columns else None
+
+    @staticmethod
+    def _gfql_disambiguate_has_edge_destination_nodes(
+        candidate_nodes: Any,
+        *,
+        node_id_col: str,
+        edge_op: Any,
+        next_node_op: Any,
+    ) -> Any:
+        """Narrow unlabeled ``HAS_<Label>`` destinations when node ids collide across labels."""
+        if RowPipelineMixin._gfql_node_filter_has_label(getattr(next_node_op, "filter_dict", None)):
+            return candidate_nodes
+        if node_id_col not in candidate_nodes.columns:
+            return candidate_nodes
+        if not bool(candidate_nodes[node_id_col].duplicated(keep=False).any()):
+            return candidate_nodes
+        label_col = RowPipelineMixin._gfql_has_edge_destination_label_col(edge_op, candidate_nodes.columns)
+        if label_col is None:
+            return candidate_nodes
+        return candidate_nodes[candidate_nodes[label_col].fillna(False).astype(bool)].copy()
+
+    @staticmethod
+    def _gfql_drop_reused_relationship_rows(
+        frame: DataFrameT, trail_cols: Sequence[str], ident_col: str
+    ) -> DataFrameT:
+        """Keep only rows whose newly bound relationship is not already on the path.
+
+        One combined mask and ONE slice, so the frame is copied once per hop rather
+        than once per already-bound relationship.
+        """
+        if not trail_cols or len(frame) == 0:
+            return frame
+        ident = frame[ident_col]
+        keep = None
+        for used_col in trail_cols:
+            used = frame[used_col]
+            unused = ident.ne(used) | used.isna()
+            keep = unused if keep is None else (keep & unused)
+        return frame if keep is None else frame[keep]
+
+    @staticmethod
+    def _gfql_relabel_columns(frame: DataFrameT, mapping: Mapping[str, str]) -> DataFrameT:
+        """Metadata-only column relabel of a frame the walk owns -- never copies blocks."""
+        frame.columns = [mapping.get(col, col) for col in frame.columns]
+        return frame
+
+    def _gfql_multihop_binding_rows(
+        self,
+        state_df: Any,
+        step_pairs: Any,
+        *,
+        min_hops: int,
+        max_hops: Optional[int],
+        to_fixed_point: bool,
+        avoid_immediate_backtrack: bool = False,
+        hop_column: Optional[str] = None,
+        trail_cols: Optional[List[str]] = None,
+        ident_col: str = DEFAULT_ROW_EDGE_IDENTITY_COL,
+    ) -> Tuple[Any, List[str]]:
+        reachable: List[Any] = []
+        current = state_df.copy()
+        prev_col = WALK_PREV_COL
+        shortest_path_mode = is_shortest_path_hops_column(hop_column)
+        # A relationship binds at most once per path; shortestPath is exempt (BFS never reuses one).
+        trail_tracking = (
+            not shortest_path_mode and ident_col in getattr(step_pairs, "columns", [])
+        )
+        outer_trail_cols = list(trail_cols or [])
+        segment_trail_cols: List[str] = []
+
+        def _state_key_cols(frame: Any) -> List[str]:
+            excluded = {prev_col}
+            if hop_column is not None:
+                excluded.add(hop_column)
+            return [col for col in frame.columns if col not in excluded]
+
+        seen_states: Optional[Any] = None
+        if avoid_immediate_backtrack and prev_col not in current.columns:
+            current = current.assign(**{prev_col: None})
+        key_cols = _state_key_cols(current)
+        if min_hops == 0:
+            # drop() already returns a walk-owned frame; assigning below never aliases the input.
+            zero_hop = current.drop(columns=[prev_col], errors="ignore")
+            if hop_column is not None:
+                zero_hop[hop_column] = 0
+            reachable.append(zero_hop)
+            if shortest_path_mode:
+                seen_states = current[key_cols].drop_duplicates(subset=key_cols, keep="first")
+        max_iters = max_hops if max_hops is not None else max(len(step_pairs), 1) + 1
+        exhausted = False
+        for hop in range(1, max_iters + 1):
+            current = current.merge(step_pairs, left_on=WALK_CURRENT_COL, right_on=WALK_FROM_COL, how="inner")
+            if len(current) == 0:
+                exhausted = True
+                break
+            if trail_tracking:
+                current = RowPipelineMixin._gfql_drop_reused_relationship_rows(
+                    current, outer_trail_cols + segment_trail_cols, ident_col
+                )
+                if len(current) == 0:
+                    exhausted = True
+                    break
+                hop_trail_col = trail_column_name(len(outer_trail_cols) + len(segment_trail_cols))
+                # The merge above made this hop's frame the walk's own: relabel in place.
+                current = RowPipelineMixin._gfql_relabel_columns(current, {ident_col: hop_trail_col})
+                segment_trail_cols.append(hop_trail_col)
+            if avoid_immediate_backtrack:
+                prev_missing = current[prev_col].isna()
+                backtrack_mask = prev_missing | current[WALK_TO_COL].ne(current[prev_col]).fillna(False)
+                current = current[backtrack_mask]
+                if len(current) == 0:
+                    exhausted = True
+                    break
+                current = RowPipelineMixin._gfql_relabel_columns(
+                    current.drop(columns=[WALK_CURRENT_COL, prev_col]),
+                    {WALK_FROM_COL: prev_col, WALK_TO_COL: WALK_CURRENT_COL},
+                )
+            else:
+                current = RowPipelineMixin._gfql_relabel_columns(
+                    current.drop(columns=[WALK_CURRENT_COL, WALK_FROM_COL]),
+                    {WALK_TO_COL: WALK_CURRENT_COL},
+                )
+            if shortest_path_mode:
+                if len(current) > 0:
+                    current = current.drop_duplicates(subset=key_cols, keep="first")
+                if seen_states is not None and len(current) > 0:
+                    seen_flag = "__gfql_seen_state__"
+                    current = current.merge(
+                        seen_states.assign(**{seen_flag: 1}),
+                        on=key_cols,
+                        how="left",
+                        sort=False,
+                    )
+                    current = current[current[seen_flag].isna()].drop(columns=[seen_flag])
+                if len(current) == 0:
+                    exhausted = True
+                    break
+                # current_state contains only newly-reached states (anti-joined above),
+                # so concat with seen_states produces no duplicates.
+                current_state = current[key_cols].drop_duplicates(subset=key_cols, keep="first")
+                if seen_states is None:
+                    seen_states = current_state
+                else:
+                    combined = concat_frames([seen_states, current_state])
+                    if combined is not None:
+                        seen_states = combined
+            if hop >= min_hops:
+                reached = current.drop(columns=[prev_col], errors="ignore")
+                if hop_column is not None:
+                    reached[hop_column] = hop
+                reachable.append(reached)
+            if max_hops is not None and hop >= max_hops:
+                break
+        if max_hops is None and to_fixed_point and not exhausted:
+            self._gfql_bindings_error(
+                "Cypher multi-alias row bindings currently require terminating variable-length segments"
+            )
+        if segment_trail_cols and reachable and reachable[0].__class__.__module__.startswith("cudf"):
+            # cuDF aligns concat schemas strictly, so pad the shallower hops' absent trail
+            # columns there; pandas pd.concat aligns and NaN-fills mismatched schemas natively.
+            reachable = [
+                frame.assign(**{
+                    col: float("nan")
+                    for col in segment_trail_cols
+                    if col not in frame.columns
+                })
+                for frame in reachable
+            ]
+        merged = concat_frames(reachable)
+        if merged is None:
+            return state_df.iloc[0:0], segment_trail_cols
+        if shortest_path_mode and len(merged) > 0:
+            merged = merged.drop_duplicates(keep="first")
+        return merged, segment_trail_cols
+
+    def _gfql_apply_alias_prefilter(
+        self,
+        frame: DataFrameT,
+        alias: Optional[str],
+        alias_prefilters: Optional[AliasPrefilters],
+        *,
+        is_edge: bool = False,
+        src_col: Optional[str] = None,
+        dst_col: Optional[str] = None,
+    ) -> DataFrameT:
+        """L4 single-alias predicate pushdown: pre-filter one alias's frame BEFORE the
+        binding join, using residual predicates the Cypher lowering pass peeled off the
+        post-join ``where_rows`` / ``search_any``.
+
+        Parity contract: a single-alias predicate's truth on a binding row depends only
+        on that alias's columns, which the (inner) binding join copies verbatim into the
+        row table. Filtering the alias frame first therefore removes exactly the rows the
+        post-join filter would. We reuse the SAME evaluator (``_gfql_eval_string_expr`` +
+        ``_gfql_bool_mask``) and the SAME ``search_any_mask`` kernel to guarantee
+        byte-identical semantics; only inner-joined (non-optional) aliases are ever
+        pushed (guaranteed by the pass). NULL is dropped (Cypher WHERE keeps only TRUE),
+        matching ``where_rows``.
+        """
+        if not alias or not alias_prefilters or frame is None:
+            return frame
+        specs = alias_prefilters.get(alias)
+        if not specs or len(frame) == 0:
+            return frame
+        reserved = set()
+        if is_edge:
+            if src_col is not None:
+                reserved.add(src_col)
+            if dst_col is not None:
+                reserved.add(dst_col)
+        for spec in specs:
+            kind = spec.get("kind")
+            if kind == "expr":
+                # Rename to alias-qualified columns so the shared evaluator resolves
+                # ``alias.prop`` exactly as it would against the full binding table.
+                view = frame.rename(columns={c: f"{alias}.{c}" for c in frame.columns})
+                value = self._gfql_eval_string_expr(view, spec["text"])
+                mask = self._gfql_bool_mask(view, value)
+                frame = _rows_where(frame, mask)
+            elif kind == "search_any":
+                from graphistry.compute.gfql.search_any import search_any_mask
+                term = spec.get("term")
+                if not isinstance(term, str):
+                    raise GFQLValidationError(
+                        ErrorCode.E108,
+                        "searchAny pushdown requires a string term",
+                        field="term",
+                        value=term,
+                        language="cypher",
+                    )
+                columns = spec.get("columns")
+                if columns is not None and not all(isinstance(col, str) for col in columns):
+                    raise GFQLValidationError(
+                        ErrorCode.E108,
+                        "searchAny pushdown columns= must be a list of strings",
+                        field="columns",
+                        value=columns,
+                        language="cypher",
+                    )
+                # Match the post-join op's searched column set: alias property columns
+                # only (src/dst are join keys, never ``alias.``-prefixed in bindings).
+                search_cols = [
+                    c for c in frame.columns
+                    if isinstance(c, str) and c not in reserved and not c.startswith("__gfql_")
+                ]
+                sub = frame[search_cols]
+                mask = search_any_mask(
+                    sub,
+                    term,
+                    case_sensitive=bool(spec.get("case_sensitive", False)),
+                    regex=bool(spec.get("regex", False)),
+                    columns=columns,
+                )
+                if mask is None:
+                    # columns= referenced an absent column; the pass validates this can't
+                    # happen, but never silently drop rows — bail out of the pushdown.
+                    raise GFQLValidationError(
+                        ErrorCode.E108,
+                        "searchAny pushdown columns= includes a column absent from the alias frame",
+                        field="columns",
+                        value=spec.get("columns"),
+                        language="cypher",
+                    )
+                frame = _rows_where(frame, mask)
+        return frame
+
+    def _gfql_connected_bindings_state(
+        self,
+        ops: Sequence["ASTObject"],
+        alias_prefilters: Optional[AliasPrefilters] = None,
+    ) -> Tuple[DataFrameT, Dict[str, DataFrameT]]:
+        from graphistry.compute.gfql.same_path.edge_semantics import EdgeSemantics
+        from graphistry.compute.ast import ASTEdge, ASTNode, serialize_binding_ops
+
+        if self._nodes is None or self._edges is None:
+            return self._gfql_empty_frame(), {}
+
+        RowPipelineMixin._gfql_validate_binding_ops(ops)
+        base_graph = self._gfql_base_graph()
+        if base_graph is None:
+            self._gfql_bindings_error(
+                "Cypher multi-alias row bindings require a graph-backed row pipeline context"
+            )
+        node_id_col = base_graph._node
+        src_col = base_graph._source
+        dst_col = base_graph._destination
+        if node_id_col is None and base_graph._edges is not None and src_col is not None and dst_col is not None:
+            try:
+                base_graph = base_graph.materialize_nodes()
+                node_id_col = base_graph._node
+            except Exception:
+                node_id_col = None
+        if node_id_col is None or src_col is None or dst_col is None:
+            self._gfql_bindings_error(
+                "Cypher multi-alias row bindings require node id, edge source, and edge destination columns"
+            )
+        src_col = str(src_col)
+        dst_col = str(dst_col)
+        base_nodes = base_graph._nodes
+        if base_nodes is None or node_id_col not in base_nodes.columns:
+            return self._nodes.iloc[0:0].copy(), {}
+
+        base_df = self._nodes if self._nodes is not None else self._edges
+        engine = resolve_engine(EngineAbstract.AUTO, base_df)
+        start_nodes = self._gfql_start_nodes
+        from graphistry.compute.gfql.index.handoff import read_handoff
+
+        handoff = read_handoff(self)
+        binding_ops = serialize_binding_ops(ops)
+        if handoff is not None and handoff.serves(binding_ops, engine) and not alias_prefilters:
+            assert handoff.state is not None  # narrowed by serves()
+            return handoff.state.state, handoff.state.alias_frames
+        previously_declined = handoff is not None and handoff.declined(binding_ops)
+        if (
+            not previously_declined
+            and not RowPipelineMixin._gfql_is_shortest_path_scalar_binding_ops(ops)
+        ):
+            from graphistry.compute.gfql.index import bindings as indexed_bindings
+            indexed_state = indexed_bindings.try_indexed_connected_bindings_state(
+                base_graph,
+                ops,
+                engine=engine,
+                start_nodes=start_nodes,
+                alias_prefilters=alias_prefilters,
+            )
+            if indexed_state is not None:
+                return indexed_state.state, indexed_state.alias_frames
+        first_op = ops[0]
+        if not isinstance(first_op, ASTNode):
+            self._gfql_bindings_error(
+                "Cypher multi-alias row bindings currently require node steps in even positions"
+            )
+        first_nodes = first_op.execute(
+            g=base_graph,
+            prev_node_wavefront=start_nodes,
+            target_wave_front=None,
+            engine=engine,
+        )._nodes
+        if first_nodes is None or node_id_col not in first_nodes.columns:
+            return self._nodes.iloc[0:0].copy(), {}
+        # L4 single-alias predicate pushdown: pre-filter the seed alias frame
+        # BEFORE it becomes the traversal wavefront (shrinks every downstream hop).
+        first_alias = first_op._name
+        first_nodes = self._gfql_apply_alias_prefilter(
+            first_nodes, first_alias, alias_prefilters
+        )
+        owner_graph = self._g
+        if owner_graph is None:
+            self._gfql_bindings_error(
+                "Cypher multi-alias row bindings require a bound graph"
+            )
+        preserve_start_multiplicity = owner_graph._gfql_preserve_start_node_multiplicity
+        if preserve_start_multiplicity:
+            state_df = first_nodes[[node_id_col]].copy()
+        else:
+            state_df = (
+                first_nodes[[node_id_col]]
+                .drop_duplicates(subset=[node_id_col], keep="first")
+                .copy()
+            )
+        state_df = state_df.rename(columns={node_id_col: WALK_CURRENT_COL})
+        alias_frames: Dict[str, DataFrameT] = {}
+        if isinstance(first_alias, str):
+            state_df[first_alias] = state_df[WALK_CURRENT_COL]
+            alias_frames[first_alias] = (
+                first_nodes.drop_duplicates(subset=[node_id_col], keep="first")
+                if preserve_start_multiplicity
+                else first_nodes
+            )
+
+        # Positional, not index-based: per-hop frames reset their index so it cannot identify an edge.
+        trail_cols: List[str] = []
+        previous_relationship_scope = 0
+        base_edges_frame = base_graph._edges
+        ident_col = (
+            generate_safe_column_name(ROW_EDGE_IDENTITY_BASE, base_edges_frame)
+            if base_edges_frame is not None
+            else DEFAULT_ROW_EDGE_IDENTITY_COL
+        )
+        if base_edges_frame is not None:
+            identified_edges = base_edges_frame.copy(deep=False)
+            identified_edges[ident_col] = range(len(base_edges_frame))
+            base_graph = base_graph.edges(identified_edges)
+            # same rows, same order, one column added: the resident adjacency stays valid
+            from graphistry.compute.gfql.index import get_registry, set_registry
+            registry = get_registry(base_graph)
+            if not registry.is_empty():
+                base_graph = set_registry(base_graph, registry.rebind_edges(identified_edges, base_edges_frame))
+
+        for edge_idx in range(1, len(ops), 2):
+            edge_op = ops[edge_idx]
+            if not isinstance(edge_op, ASTEdge):
+                self._gfql_bindings_error(
+                    "Cypher multi-alias row bindings currently require edge steps in odd positions"
+                )
+            current_nodes = base_nodes[base_nodes[node_id_col].isin(state_df[WALK_CURRENT_COL])].copy()
+            if len(current_nodes) == 0:
+                return state_df.iloc[0:0], alias_frames
+            sem = EdgeSemantics.from_edge(edge_op)
+            finite_multihop = sem.is_multihop and not edge_op.to_fixed_point and (
+                edge_op.max_hops is not None
+                or edge_op.hops is not None
+            )
+            candidate_wavefront = base_nodes if sem.is_multihop and not finite_multihop else current_nodes
+            candidate_edge_op = edge_op
+            if sem.is_multihop:
+                candidate_edge_op = copy.copy(edge_op)
+                candidate_edge_op.hops = 1
+                candidate_edge_op.min_hops = 1
+                candidate_edge_op.max_hops = 1
+                candidate_edge_op.to_fixed_point = False
+            edge_result = candidate_edge_op.execute(
+                g=base_graph,
+                prev_node_wavefront=candidate_wavefront,
+                target_wave_front=None,
+                engine=engine,
+            )
+            edges_df_step = edge_result._edges
+            step_nodes = edge_result._nodes
+            edge_alias = getattr(edge_op, "_name", None)
+            if sem.is_multihop and edge_alias is not None:
+                self._gfql_bindings_error(
+                    "Cypher multi-alias row bindings do not yet support variable-length relationship aliases"
+                )
+            # L4 pushdown: pre-filter this hop's edge frame by the edge alias's
+            # single-alias residual (single-hop only; searchAny/e.prop predicates)
+            # before orientation + join. src/dst are excluded from searchAny to match
+            # the post-join binding table (where they are consumed as join keys).
+            if not sem.is_multihop and isinstance(edge_alias, str) and edges_df_step is not None:
+                edges_df_step = self._gfql_apply_alias_prefilter(
+                    edges_df_step, edge_alias, alias_prefilters,
+                    is_edge=True, src_col=src_col, dst_col=dst_col,
+                )
+            if not sem.is_multihop and (edges_df_step is None or len(edges_df_step) == 0):
+                return state_df.iloc[0:0], alias_frames
+
+            relationship_scope = edge_op.relationship_scope
+            if relationship_scope != previous_relationship_scope:
+                state_df = state_df.drop(columns=trail_cols, errors="ignore")
+                trail_cols = []
+                previous_relationship_scope = relationship_scope
+
+            rename_map = {}
+            if isinstance(edge_alias, str) and edges_df_step is not None:
+                # Same marker shadowing as the node side, keyed on the edge identity column.
+                unshadowed = self._gfql_unshadow_alias_marker_column(
+                    edges_df_step, edge_alias, base_graph._edges, ident_col
+                )
+                assert unshadowed is not None  # non-None in, non-None out
+                edges_df_step = unshadowed
+                rename_map = {
+                    col: f"{edge_alias}.{col}"
+                    for col in edges_df_step.columns
+                    if col not in {src_col, dst_col, ident_col}
+                }
+            hop_column = getattr(edge_op, "label_node_hops", None)
+            shortest_path_mode = is_shortest_path_hops_column(hop_column)
+            if edges_df_step is None or len(edges_df_step) == 0:
+                oriented = self._gfql_empty_frame(
+                    edges_df_step if edges_df_step is not None else state_df,
+                    columns=[WALK_FROM_COL, WALK_TO_COL],
+                )
+                if ident_col not in oriented.columns:
+                    oriented[ident_col] = self._gfql_broadcast_scalar(oriented, None)
+            else:
+                oriented = sem.orient_edges(
+                    edges_df_step,
+                    src_col,
+                    dst_col,
+                    dedupe=False,
+                ).rename(columns=rename_map)
+                if not shortest_path_mode and ident_col in oriented.columns:
+                    # A self-loop's two undirected orientations are the SAME binding: drop the twin.
+                    oriented = oriented.drop_duplicates(
+                        subset=[WALK_FROM_COL, WALK_TO_COL, ident_col], keep="first"
+                    )
+
+            if sem.is_multihop:
+                step_cols = [WALK_FROM_COL, WALK_TO_COL] + (
+                    [ident_col]
+                    if not shortest_path_mode and ident_col in oriented.columns
+                    else []
+                )
+                oriented_parts = [oriented]
+                if finite_multihop:
+                    adjacency_wavefront = step_nodes
+                    seen_edge_ids = (
+                        series_values(edges_df_step[ident_col])
+                        if ident_col in edges_df_step.columns
+                        else None
+                    )
+                    for _ in range(1, sem.max_hops):
+                        if (
+                            adjacency_wavefront is None
+                            or node_id_col not in adjacency_wavefront.columns
+                            or len(adjacency_wavefront) == 0
+                        ):
+                            break
+                        adjacency_result = candidate_edge_op.execute(
+                            g=base_graph,
+                            prev_node_wavefront=adjacency_wavefront,
+                            target_wave_front=None,
+                            engine=engine,
+                        )
+                        adjacency_edges = adjacency_result._edges
+                        if adjacency_edges is None or len(adjacency_edges) == 0:
+                            break
+                        adjacency_oriented = sem.orient_edges(
+                            adjacency_edges,
+                            src_col,
+                            dst_col,
+                            dedupe=False,
+                        ).rename(columns=rename_map)
+                        if seen_edge_ids is not None and ident_col in adjacency_oriented.columns:
+                            new_edge_ids = domain_diff(
+                                series_values(adjacency_oriented[ident_col]),
+                                seen_edge_ids,
+                            )
+                            if len(new_edge_ids) == 0:
+                                break
+                            seen_edge_ids = domain_union(seen_edge_ids, new_edge_ids)
+                        oriented_parts.append(adjacency_oriented[step_cols])
+                        adjacency_wavefront = adjacency_result._nodes
+                if len(oriented_parts) > 1:
+                    concatenated_oriented = concat_frames(oriented_parts)
+                    if concatenated_oriented is not None:
+                        oriented = concatenated_oriented
+                        if not shortest_path_mode and ident_col in step_cols:
+                            oriented = oriented.drop_duplicates(
+                                subset=[WALK_FROM_COL, WALK_TO_COL, ident_col], keep="first"
+                            )
+                step_pairs = oriented[step_cols]
+                if ident_col not in step_cols:
+                    step_pairs = step_pairs.drop_duplicates(keep="first")
+                min_hops = edge_op.min_hops if edge_op.min_hops is not None else (
+                    edge_op.hops if edge_op.hops is not None else 1
+                )
+                max_hops = edge_op.max_hops if edge_op.max_hops is not None else (
+                    edge_op.hops if edge_op.hops is not None else None
+                )
+                state_df, segment_trail_cols = self._gfql_multihop_binding_rows(
+                    state_df,
+                    step_pairs,
+                    min_hops=min_hops,
+                    max_hops=max_hops,
+                    to_fixed_point=bool(edge_op.to_fixed_point),
+                    avoid_immediate_backtrack=sem.is_undirected and shortest_path_mode,
+                    hop_column=edge_op.label_node_hops,
+                    trail_cols=trail_cols,
+                    ident_col=ident_col,
+                )
+                trail_cols = trail_cols + segment_trail_cols
+            else:
+                path_order = None
+                if engine == Engine.CUDF:
+                    path_order = generate_safe_column_name_from("__gfql_path_order__", list(state_df.columns) + list(oriented.columns))
+                    state_df = state_df.assign(**{path_order: range(len(state_df))})
+                state_df = state_df.merge(oriented, left_on=WALK_CURRENT_COL, right_on=WALK_FROM_COL, how="inner")
+                if path_order is not None:
+                    tie_cols = [ident_col] if ident_col in state_df.columns else []
+                    state_df = state_df.sort_values([path_order, *tie_cols]).drop(columns=[path_order])
+                state_df = state_df.drop(columns=[WALK_CURRENT_COL, WALK_FROM_COL]).rename(columns={WALK_TO_COL: WALK_CURRENT_COL})
+                if not shortest_path_mode and ident_col in state_df.columns:
+                    state_df = RowPipelineMixin._gfql_drop_reused_relationship_rows(
+                        state_df, trail_cols, ident_col
+                    )
+                    new_trail_col = trail_column_name(len(trail_cols))
+                    state_df = state_df.rename(columns={ident_col: new_trail_col})
+                    trail_cols = trail_cols + [new_trail_col]
+
+            if len(state_df) == 0:
+                return state_df, alias_frames
+
+            next_node_idx = edge_idx + 1
+            next_node_op = ops[next_node_idx]
+            if not isinstance(next_node_op, ASTNode):
+                self._gfql_bindings_error(
+                    "Cypher multi-alias row bindings currently require node steps in even positions"
+                )
+            # Continue from base nodes when edge_result._nodes cannot fully
+            # represent the next alias row domain: multihop zero-hop rows, and
+            # duplicate-id graphs needing HAS_<Label> endpoint disambiguation.
+            candidate_source = (
+                base_nodes
+                if (
+                    sem.is_multihop
+                    or (
+                        edge_op.direction == "forward"
+                        and RowPipelineMixin._gfql_has_edge_destination_label_col(edge_op, base_nodes.columns) is not None
+                        and bool(base_nodes[node_id_col].duplicated(keep=False).any())
+                    )
+                )
+                else (
+                    step_nodes
+                    if step_nodes is not None and node_id_col in step_nodes.columns and len(step_nodes) > 0
+                    else base_nodes
+                )
+            )
+            candidate_nodes = candidate_source[candidate_source[node_id_col].isin(state_df[WALK_CURRENT_COL])].copy()
+            if not sem.is_multihop and edge_op.direction == "forward":
+                candidate_nodes = self._gfql_disambiguate_has_edge_destination_nodes(
+                    candidate_nodes,
+                    node_id_col=str(node_id_col),
+                    edge_op=edge_op,
+                    next_node_op=next_node_op,
+                )
+            next_nodes = next_node_op.execute(
+                g=base_graph,
+                prev_node_wavefront=candidate_nodes,
+                target_wave_front=None,
+                engine=engine,
+            )._nodes
+            if next_nodes is None or node_id_col not in next_nodes.columns:
+                return state_df.iloc[0:0], alias_frames
+            # L4 pushdown: pre-filter the endpoint alias frame by its single-alias
+            # residual before the isin-restrict, so only satisfying endpoints survive.
+            node_alias = next_node_op._name
+            next_nodes = self._gfql_apply_alias_prefilter(
+                next_nodes, node_alias, alias_prefilters
+            )
+            state_df = state_df[state_df[WALK_CURRENT_COL].isin(next_nodes[node_id_col])].copy()
+            if isinstance(node_alias, str):
+                state_df[node_alias] = state_df[WALK_CURRENT_COL]
+                hop_column = edge_op.label_node_hops
+                if hop_column is not None and hop_column in state_df.columns:
+                    hop_lookup = (
+                        state_df[[WALK_CURRENT_COL, hop_column]]
+                        .rename(columns={WALK_CURRENT_COL: node_id_col})
+                        .groupby(node_id_col, sort=False)[hop_column]
+                        .min()
+                        .reset_index()
+                    )
+                    next_nodes = next_nodes.drop(columns=[hop_column], errors="ignore").merge(
+                        hop_lookup,
+                        on=node_id_col,
+                        how="left",
+                        sort=False,
+                    )
+                alias_frames[node_alias] = next_nodes
+
+        if trail_cols:
+            state_df = state_df.drop(columns=[c for c in trail_cols if c in state_df.columns])
+        return state_df, alias_frames
+
+    def _gfql_connected_bindings_row_table(
+        self,
+        binding_ops: List[Dict[str, JSONVal]],
+        alias_prefilters: Optional[AliasPrefilters] = None,
+        attach_prop_aliases: Optional[List[str]] = None,
+        attach_prop_columns: Optional[Dict[str, List[str]]] = None,
+    ) -> "Plottable":
+        from graphistry.compute.ast import ASTEdge, ASTNode, from_json as ast_from_json
+
+        if self._nodes is None or self._edges is None:
+            return self._gfql_row_table(self._gfql_empty_frame())
+
+        ops = [ast_from_json(op_json, validate=False) for op_json in binding_ops]
+        if self._gfql_is_shortest_path_scalar_binding_ops(ops):
+            return self._gfql_shortest_path_scalar_bindings_row_table(ops)
+        return self._gfql_connected_bindings_row_table_from_ops(
+            ops,
+            alias_prefilters=alias_prefilters,
+            attach_prop_aliases=attach_prop_aliases,
+            attach_prop_columns=attach_prop_columns,
+        )
+
+    @staticmethod
+    def _gfql_is_shortest_path_scalar_binding_ops(ops: Sequence[Any]) -> bool:
+        from graphistry.compute.ast import ASTEdge, ASTNode
+
+        if len(ops) != 3:
+            return False
+        start_op, edge_op, end_op = ops
+        if not isinstance(start_op, ASTNode) or not isinstance(edge_op, ASTEdge) or not isinstance(end_op, ASTNode):
+            return False
+        start_alias = getattr(start_op, "_name", None)
+        end_alias = getattr(end_op, "_name", None)
+        hop_column = getattr(edge_op, "label_node_hops", None)
+        return (
+            isinstance(start_alias, str)
+            and isinstance(end_alias, str)
+            and is_shortest_path_hops_column(hop_column)
+        )
+
+    def _gfql_connected_bindings_row_table_from_ops(
+        self,
+        ops: Sequence["ASTObject"],
+        alias_prefilters: Optional[AliasPrefilters] = None,
+        attach_prop_aliases: Optional[List[str]] = None,
+        attach_prop_columns: Optional[Dict[str, List[str]]] = None,
+    ) -> "Plottable":
+        from graphistry.compute.ast import ASTEdge
+
+        state_df, alias_frames = self._gfql_connected_bindings_state(ops, alias_prefilters=alias_prefilters)
+        bindings = self._gfql_connected_bindings_row_frame_from_state(
+            ops, state_df, alias_frames, attach_prop_aliases, attach_prop_columns
+        )
+        out = self._gfql_row_table(bindings)
+        edge_aliases = {
+            alias
+            for op in ops
+            for alias in [getattr(op, "_name", None)]
+            if isinstance(op, ASTEdge) and isinstance(alias, str)
+        }
+        out._gfql_rows_edge_aliases = edge_aliases
+        return out
+
+    def _gfql_add_missing_binding_columns(
+        self, bindings: DataFrameT, ops: Sequence["ASTObject"]
+    ) -> DataFrameT:
+        """Ensure an EMPTY bindings frame still carries every declared alias column.
+
+        The walk assembles the schema incrementally, so an emptied hop returns a frame that
+        never acquired the columns later steps would have added -- edge-alias columns
+        (``e1.w``) and ``alias.alias`` markers. Node aliases survive via the row-frame merge's
+        empty lookup, but edge aliases have no ``.id`` fallback, so ``count(e1)`` /
+        ``e1.w``-in-WHERE dereferenced a missing column. Declared columns are derivable from
+        ``ops`` + the base edge frame, so add whatever is missing here (0-row only, no effect
+        on non-empty output). See #25/#27.
+        """
+        from graphistry.compute.ast import ASTEdge, ASTNode
+
+        base_graph = self._gfql_base_graph()
+        edges = base_graph._edges if base_graph is not None else None
+        src_col = base_graph._source if base_graph is not None else None
+        dst_col = base_graph._destination if base_graph is not None else None
+        # (column_name, source_series) — carry the source dtype so an edge property like
+        # `e1.w` stays int64 at 0 rows instead of an untyped object column (which would upcast
+        # a sum/avg and escape via UNION ALL). Mirrors the node path's typed empty slice. The
+        # `alias.alias` marker has no source dtype, so None-broadcast is fine for it.
+        missing: List[Tuple[str, Optional[Any]]] = []
+        for op in ops:
+            alias = getattr(op, "_name", None)
+            if not isinstance(alias, str):
+                continue
+            missing.append((f"{alias}.{alias}", None))  # the alias.alias marker
+            if isinstance(op, ASTEdge) and edges is not None:
+                for col in edges.columns:
+                    if col in (src_col, dst_col):
+                        continue
+                    missing.append((f"{alias}.{col}", edges[col]))
+        for col, source in missing:
+            if col not in bindings.columns:
+                if source is not None:
+                    bindings[col] = source.iloc[0:0].reindex(bindings.index)
+                else:
+                    bindings[col] = self._gfql_broadcast_scalar(bindings, None)
+        return bindings
+
+    def _gfql_connected_bindings_row_frame_from_state(
+        self,
+        ops: Sequence["ASTObject"],
+        state_df: DataFrameT,
+        alias_frames: Dict[str, DataFrameT],
+        attach_prop_aliases: Optional[List[str]] = None,
+        attach_prop_columns: Optional[Dict[str, List[str]]] = None,
+    ) -> DataFrameT:
+        from graphistry.compute.ast import ASTNode
+
+        node_id = self._node
+        if node_id is None:
+            self._gfql_bindings_error(
+                "Cypher multi-alias row bindings require a node id column"
+            )
+        base_graph = self._gfql_base_graph()
+        base_nodes = base_graph._nodes if base_graph is not None else None
+        empty_lookup_source = (
+            base_nodes.iloc[0:0].copy()
+            if base_nodes is not None and node_id in base_nodes.columns
+            else self._gfql_empty_frame(base_nodes, columns=[node_id])
+        )
+        # attach_prop_aliases names the aliases whose PROPERTIES are read downstream; None = all.
+        attach_set = None if attach_prop_aliases is None else set(attach_prop_aliases)
+
+        bindings = state_df.copy()
+        node_aliases = [
+            op._name
+            for op in ops
+            if isinstance(op, ASTNode) and isinstance(op._name, str)
+        ]
+        for alias in node_aliases:
+            alias = str(alias)
+            if alias not in bindings.columns:
+                bindings[alias] = self._gfql_broadcast_scalar(bindings, None)
+            if attach_set is not None and alias not in attach_set:
+                continue  # properties unreferenced — keep only the bare id column
+            lookup_source = alias_frames.get(alias)
+            if lookup_source is None or node_id not in lookup_source.columns:
+                lookup_source = empty_lookup_source
+            lookup_source = self._gfql_unshadow_alias_marker_column(
+                lookup_source, alias, base_nodes, node_id
+            )
+            if attach_prop_columns is not None:
+                # projection pushdown: only the property columns the next select reads
+                wanted = set(attach_prop_columns.get(alias) or ())
+                if not wanted:
+                    continue
+                id_col = str(node_id)
+                source_frame = lookup_source
+                if source_frame is not None:
+                    lookup_source = source_frame[
+                        [id_col] + [col for col in source_frame.columns if col != id_col and col in wanted]
+                    ]
+            lookup = self._gfql_node_alias_lookup_frame(lookup_source, node_id, alias)
+            order_cols = []
+            if resolve_engine(EngineAbstract.AUTO, bindings) == Engine.CUDF:
+                order_col = generate_safe_column_name_from("__gfql_binding_order__", list(bindings.columns) + list(lookup.columns))
+                lookup_order = generate_safe_column_name_from("__gfql_lookup_order__", list(bindings.columns) + list(lookup.columns))
+                bindings = bindings.assign(**{order_col: range(len(bindings))})
+                lookup = lookup.assign(**{lookup_order: range(len(lookup))})
+                order_cols = [order_col, lookup_order]
+            bindings = bindings.merge(
+                lookup,
+                left_on=alias,
+                right_on=node_id,
+                how="left",
+                suffixes=("", f"__{alias}_join__"),
+            )
+            if order_cols:
+                bindings = bindings.sort_values(order_cols).drop(columns=order_cols)
+            dup_col = f"{node_id}__{alias}_join__"
+            if dup_col in bindings.columns:
+                bindings = bindings.drop(columns=[dup_col])
+            bindings = self._gfql_restore_alias_property_dtypes(bindings, base_nodes, alias)
+            for hop_col in [col for col in bindings.columns if is_shortest_path_hops_column(str(col))]:
+                alias_hop_col = f"{alias}.{hop_col}"
+                if alias_hop_col in bindings.columns:
+                    bindings[alias_hop_col] = bindings[hop_col]
+
+        drop_cols = [WALK_CURRENT_COL]
+        bindings = bindings.drop(columns=[col for col in drop_cols if col in bindings.columns])
+        if len(bindings) == 0:
+            bindings = self._gfql_add_missing_binding_columns(bindings, ops)
+        return bindings
+
+    def _gfql_shortest_path_scalar_native(
+        self,
+        seed_table: Any,
+        ops: Sequence[Any],
+        start_alias: str,
+        end_alias: str,
+        hop_column: str,
+        backend: str = "auto",
+    ) -> Optional[Any]:
+        """
+        Attempt to compute shortestPath hop distances via igraph/cugraph.
+
+        Returns a reachable_hops DataFrame (columns: start_alias, end_alias,
+        hop_column, f"{end_alias}.{hop_column}") on success, or None to
+        signal the caller should fall back to the BFS path.
+        """
+        from graphistry.compute.ast import ASTEdge
+        from graphistry.compute.gfql.same_path.edge_semantics import EdgeSemantics
+        from graphistry.compute.gfql.same_path.native_shortest_path import ShortestPathBackend, try_native_shortest_path
+
+        if self._nodes is None or self._edges is None or len(seed_table) == 0:
+            return None
+
+        base_graph = self._gfql_base_graph()
+        if base_graph is None:
+            return None
+        src_col = base_graph._source
+        dst_col = base_graph._destination
+        if src_col is None or dst_col is None:
+            return None
+        src_col, dst_col = str(src_col), str(dst_col)
+
+        edge_op = cast(ASTEdge, ops[1])
+        sem = EdgeSemantics.from_edge(edge_op)
+        min_hops = edge_op.min_hops if edge_op.min_hops is not None else (
+            edge_op.hops if edge_op.hops is not None else 1
+        )
+        max_hops = edge_op.max_hops if edge_op.max_hops is not None else (
+            edge_op.hops if edge_op.hops is not None else None
+        )
+        # Native backends only handle the shortestPath scalar contract:
+        # min_hops 0 or 1, unbounded or finite max, no edge aliases
+        if min_hops > 1:
+            return None
+
+        base_df = self._nodes if self._nodes is not None else self._edges
+        engine = resolve_engine(EngineAbstract.AUTO, base_df)
+
+        # Get the full filtered edge set by running edge_op across all nodes
+        base_nodes = base_graph._nodes
+        if base_nodes is None:
+            return None
+        edge_result = edge_op.execute(
+            g=base_graph,
+            prev_node_wavefront=base_nodes,
+            target_wave_front=None,
+            engine=engine,
+        )
+        edges_df = edge_result._edges
+        if edges_df is None or len(edges_df) == 0:
+            # No edges → all pairs are unreachable; return all-null result
+            base = seed_table[[start_alias, end_alias]]
+            null_val = self._gfql_broadcast_scalar(base, None)
+            return base.assign(**{hop_column: null_val, f"{end_alias}.{hop_column}": null_val})
+
+        step_pairs = sem.orient_edges(edges_df, src_col, dst_col, dedupe=True)[[WALK_FROM_COL, WALK_TO_COL]]
+
+        sources = seed_table[start_alias]
+        targets = seed_table[end_alias]
+
+        # Per-execution cache of the built native graph, shared across a query's pairwise
+        # shortestPath ops. cache_key fully captures the edge pattern via the op's canonical
+        # JSON (a partial key could reuse a graph built for a DIFFERENT pattern -> wrong
+        # distances); directedness is folded into the key inside try_native_shortest_path.
+        import json
+        sp_cache = self._gfql_native_shortest_path_cache(base_graph)
+        sp_cache_key = (
+            json.dumps(edge_op.to_json(), sort_keys=True) if sp_cache is not None else None
+        )
+
+        native_result = try_native_shortest_path(
+            step_pairs, sources, targets,
+            min_hops=min_hops,
+            max_hops=max_hops,
+            directed=not sem.is_undirected,
+            engine=engine,
+            backend=cast(ShortestPathBackend, backend),
+            cache=sp_cache,
+            cache_key=sp_cache_key,
+        )
+        if native_result is None:
+            return None
+
+        # native_result has __sp_source__, __sp_target__, __sp_hops__
+        # Rename to match the expected reachable_hops schema
+        reachable_hops = (
+            native_result
+            .rename(columns={"__sp_source__": start_alias, "__sp_target__": end_alias, "__sp_hops__": hop_column})
+            .assign(**{f"{end_alias}.{hop_column}": lambda df: df[hop_column]})
+        )
+        reachable_hops = reachable_hops[reachable_hops[hop_column].notna()]
+        return reachable_hops[[start_alias, end_alias, hop_column, f"{end_alias}.{hop_column}"]]
+
+    def _gfql_shortest_path_scalar_bindings_row_table(
+        self,
+        ops: Sequence[Any],
+    ) -> "Plottable":
+        from graphistry.compute.ast import ASTEdge, ASTNode
+
+        start_op = cast(ASTNode, ops[0])
+        edge_op = cast(ASTEdge, ops[1])
+        end_op = cast(ASTNode, ops[2])
+        start_alias = cast(str, getattr(start_op, "_name"))
+        end_alias = cast(str, getattr(end_op, "_name"))
+        hop_column = cast(str, edge_op.label_node_hops)
+
+        seed_table = self._gfql_cartesian_node_bindings_row_table([start_op, end_op])._nodes
+        if seed_table is None:
+            return self._gfql_row_table(self._gfql_empty_frame())
+
+        # Try native igraph/cugraph backend first; fall back to BFS
+        sp_backend = self._gfql_shortest_path_backend
+        reachable_hops = self._gfql_shortest_path_scalar_native(
+            seed_table, ops, start_alias, end_alias, hop_column, backend=sp_backend
+        )
+
+        if reachable_hops is None:
+            state_df, alias_frames = self._gfql_connected_bindings_state(ops)
+            if len(state_df) == 0:
+                out = seed_table.copy()
+                out[hop_column] = self._gfql_broadcast_scalar(out, None)
+                out[f"{end_alias}.{hop_column}"] = self._gfql_broadcast_scalar(out, None)
+                return self._gfql_row_table(out)
+
+            reachable = self._gfql_connected_bindings_row_frame_from_state(ops, state_df, alias_frames)
+            reachable_cols = [start_alias, end_alias]
+            for col in [hop_column, f"{end_alias}.{hop_column}"]:
+                if col in reachable.columns and col not in reachable_cols:
+                    reachable_cols.append(col)
+            reachable_hops = reachable[reachable_cols].drop_duplicates(subset=[start_alias, end_alias], keep="first")
+        merged = seed_table.merge(
+            reachable_hops,
+            on=[start_alias, end_alias],
+            how="left",
+            sort=False,
+            suffixes=("", "__reachable__"),
+        )
+        to_numeric = None
+        try:
+            to_numeric = s_to_numeric(resolve_engine(EngineAbstract.AUTO, merged))
+        except ValueError:
+            to_numeric = None
+        for col in [hop_column, f"{end_alias}.{hop_column}"]:
+            dup_col = f"{col}__reachable__"
+            if dup_col in merged.columns:
+                merged[col] = merged[dup_col]
+                merged = merged.drop(columns=[dup_col])
+            elif col not in merged.columns:
+                merged[col] = self._gfql_broadcast_scalar(merged, None)
+            if col in merged.columns:
+                if to_numeric is not None:
+                    try:
+                        merged[col] = to_numeric(merged[col], errors="coerce")
+                    except (TypeError, ValueError, RuntimeError):
+                        pass
+                null_mask = merged[col].isna()
+                if bool(null_mask.any()):
+                    merged[col] = merged[col].astype(object).where(~null_mask, None)
+        return self._gfql_row_table(merged)
+
+    def _gfql_cartesian_node_bindings_row_table(
+        self,
+        ops: Sequence["ASTObject"],
+        alias_prefilters: Optional[AliasPrefilters] = None,
+    ) -> "Plottable":
+        from graphistry.compute.ast import ASTNode
+
+        if self._nodes is None:
+            return self._gfql_row_table(self._gfql_empty_frame())
+
+        base_graph = self._gfql_base_graph()
+        if base_graph is None:
+            self._gfql_bindings_error(
+                "Cypher multi-alias row bindings require a graph-backed row pipeline context"
+            )
+        node_id = base_graph._node
+        base_nodes = base_graph._nodes
+        if node_id is None or base_nodes is None or node_id not in base_nodes.columns:
+            return self._gfql_row_table(self._gfql_empty_frame(base_nodes))
+
+        base_df = self._nodes if self._nodes is not None else self._edges
+        engine = resolve_engine(EngineAbstract.AUTO, base_df)
+        start_nodes = self._gfql_start_nodes
+        join_col = RowPipelineMixin._gfql_fresh_col_name(base_nodes.columns, "__gfql_bindings_join__")
+        bindings: Optional[Any] = None
+        anonymous_cols: List[str] = []
+
+        for idx, node_op in enumerate(ops):
+            if not isinstance(node_op, ASTNode):
+                self._gfql_bindings_error(
+                    "Cypher disconnected row bindings currently require node steps"
+                )
+            matched_nodes = node_op.execute(
+                g=base_graph,
+                prev_node_wavefront=start_nodes,
+                target_wave_front=None,
+                engine=engine,
+            )._nodes
+            if matched_nodes is None or node_id not in matched_nodes.columns:
+                return self._gfql_row_table(base_nodes.iloc[0:0].copy())
+
+            # L4 pushdown: pre-filter each disconnected-pattern node alias frame.
+            alias = node_op._name
+            matched_nodes = self._gfql_apply_alias_prefilter(
+                matched_nodes, alias, alias_prefilters
+            )
+
+            if isinstance(alias, str):
+                # Same marker shadowing as the connected path, keyed on the node id.
+                lookup_source = self._gfql_unshadow_alias_marker_column(
+                    matched_nodes, alias, base_nodes, str(node_id)
+                )
+                assert lookup_source is not None  # non-None in, non-None out
+                frame = self._gfql_node_alias_lookup_frame(lookup_source, str(node_id), alias)
+            else:
+                anon_col = RowPipelineMixin._gfql_fresh_col_name(matched_nodes.columns, f"__gfql_binding_node_{idx}__")
+                frame = matched_nodes[[node_id]].copy().rename(columns={node_id: anon_col})
+                anonymous_cols.append(anon_col)
+            frame[join_col] = 1
+            bindings = frame if bindings is None else bindings.merge(frame, on=join_col, how="inner", sort=False)
+
+        if bindings is None:
+            return self._gfql_row_table(self._gfql_empty_frame(base_nodes))
+        bindings = bindings.drop(columns=[join_col] + anonymous_cols, errors="ignore")
+        return self._gfql_row_table(bindings)
+
+    def _gfql_binding_ops_row_table(
+        self,
+        binding_ops: List[Dict[str, JSONVal]],
+        alias_prefilters: Optional[AliasPrefilters] = None,
+        attach_prop_aliases: Optional[List[str]] = None,
+        attach_prop_columns: Optional[Dict[str, List[str]]] = None,
+    ) -> "Plottable":
+        from graphistry.compute.ast import from_json as ast_from_json
+
+        ops = [ast_from_json(op_json, validate=False) for op_json in binding_ops]
+        mode = self._gfql_binding_ops_mode(ops)
+        if mode == "node_cartesian":
+            return self._gfql_cartesian_node_bindings_row_table(ops, alias_prefilters=alias_prefilters)
+        return self._gfql_connected_bindings_row_table(
+            binding_ops,
+            alias_prefilters=alias_prefilters,
+            attach_prop_aliases=attach_prop_aliases,
+            attach_prop_columns=attach_prop_columns,
+        )
+
+    def _gfql_bindings_row_table(
+        self, alias_endpoints: Dict[str, str]
+    ) -> "Plottable":
+        """Build a bindings table by joining edges with node properties.
+
+        Each edge row becomes one binding row.  For each alias in
+        *alias_endpoints*, node properties are joined via the corresponding
+        edge endpoint column (``src`` or ``dst``) and prefixed with
+        ``alias.`` so that downstream ``return_()`` / ``select()`` can
+        resolve ``alias.prop`` expressions directly as column lookups.
+        """
+        edges = self._edges
+        nodes = self._nodes
+        if edges is None or nodes is None:
+            return self._gfql_row_table(self._gfql_empty_frame())
+
+        node_id = self._node
+        src_col = self._source
+        dst_col = self._destination
+        if node_id is None or src_col is None or dst_col is None:
+            raise ValueError(
+                "bindings row table requires node id, source, and destination columns"
+            )
+
+        bindings = edges.copy()
+        for alias, endpoint in alias_endpoints.items():
+            join_col = src_col if endpoint == "src" else dst_col
+            lookup = self._gfql_node_alias_lookup_frame(nodes, node_id, alias)
+            bindings = bindings.merge(
+                lookup,
+                left_on=join_col,
+                right_on=node_id,
+                how="left",
+                suffixes=("", f"__{alias}_join__"),
+            )
+            # Drop the duplicate node_id column from the merge
+            dup_col = f"{node_id}__{alias}_join__"
+            if dup_col in bindings.columns:
+                bindings = bindings.drop(columns=[dup_col])
+
+        # Also prefix edge properties for edge aliases
+        for alias, endpoint in alias_endpoints.items():
+            if endpoint == "edge":
+                for col in edges.columns:
+                    if col in (src_col, dst_col):
+                        continue
+                    bindings[f"{alias}.{col}"] = edges[col]
+
+        return self._gfql_row_table(bindings)
+
+    drop_cols = row_frame_ops.drop_cols
+
+    def _gfql_project_items(
+        self,
+        table_df: Any,
+        items: List[Any],
+        *,
+        op_name: str,
+        normalize_shortest_path_hops: bool = False,
+    ) -> Dict[str, Any]:
+        if items is None:
+            raise ValueError(
+                f"{op_name}(items=...) requires entries of form (alias, expr) or shorthand 'col'"
+            )
+
+        projected: Dict[str, Any] = {}
+        for item in items:
+            if isinstance(item, str):
+                alias_raw, expr = item, item
+            else:
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    raise ValueError(
+                        f"{op_name} expects entries of form (alias, expr) or shorthand 'col', "
+                        f"got {item!r}"
+                    )
+                alias_raw, expr = item
+            alias = str(alias_raw)
+            if alias == "":
+                raise ValueError(f"{op_name} alias must be non-empty")
+            if isinstance(expr, str):
+                value = table_df[expr] if expr in table_df.columns else self._gfql_eval_string_expr(table_df, expr)
+                is_series_value = isinstance(value, pd.Series) or value.__class__.__module__.startswith("cudf")
+                if normalize_shortest_path_hops and SHORTEST_PATH_HOPS_COLUMN_PREFIX in expr and is_series_value:
+                    to_numeric = None
+                    try:
+                        to_numeric = s_to_numeric(resolve_engine(EngineAbstract.AUTO, table_df))
+                    except ValueError:
+                        to_numeric = None
+                    if to_numeric is not None:
+                        try:
+                            value = to_numeric(value, errors="coerce")
+                            null_mask = value.isna()
+                            if bool(null_mask.any()):
+                                value = value.astype(object).where(~null_mask, None)
+                        except (TypeError, ValueError, RuntimeError):
+                            pass
+                if not hasattr(value, "astype"):
+                    value = self._gfql_broadcast_scalar(table_df, value)
+                projected[alias] = value
+            else:
+                projected[alias] = self._gfql_broadcast_scalar(table_df, expr)
+        return projected
+
+    def select(self, items: List[Any]) -> "Plottable":
+        table_df = self._gfql_get_active_table()
+        cudf_row_table = resolve_engine(EngineAbstract.AUTO, table_df) == Engine.CUDF
+        projected = self._gfql_project_items(
+            table_df,
+            items,
+            op_name="select",
+            normalize_shortest_path_hops=True,
+        )
+
+        if cudf_row_table and any(isinstance(value, pd.Series) for value in projected.values()):
+            out_df = _gfql_projected_values_to_pandas_frame(projected, len(table_df))
+        elif isinstance(table_df, pd.DataFrame) and all(isinstance(v, pd.Series) for v in projected.values()):
+            out_df = pd.DataFrame(projected, index=table_df.index)
+        else:
+            out_df = table_df.assign(**projected)[list(projected.keys())]
+        return self._gfql_row_table(out_df)
+
+    def with_(self, items: List[Any], extend: bool = False) -> "Plottable":
+        """Python-safe alias for Cypher WITH-style row projection.
+
+        When ``extend=True``, new columns are added to the existing table
+        instead of replacing it.  This is used for mixed whole-row + scalar
+        WITH projections on bindings-row tables (#880).
+        """
+        if not extend:
+            return self.select(items)
+        table_df = self._gfql_get_active_table()
+        projected = self._gfql_project_items(table_df, items, op_name="with_")
+        out_df = table_df.assign(**projected)
+        return self._gfql_row_table(out_df)
+
+    def where_rows(
+        self,
+        filter_dict: Optional[Dict[str, Any]] = None,
+        expr: Optional[str] = None,
+    ) -> "Plottable":
+        """Filter active row table with vectorized dict predicates and/or expression."""
+        table_df = self._gfql_get_active_table()
+        out_df = table_df
+
+        if filter_dict is None:
+            filter_dict = {}
+        if not isinstance(filter_dict, dict):
+            raise ValueError("where_rows(filter_dict=...) must be a dict when provided")
+        if filter_dict:
+            from graphistry.compute.filter_by_dict import filter_by_dict
+
+            out_df = filter_by_dict(out_df, filter_dict)
+
+        if expr is not None:
+            if not isinstance(expr, str) or expr.strip() == "":
+                raise ValueError("where_rows(expr=...) must be a non-empty string")
+            expr_value = self._gfql_eval_string_expr(out_df, expr)
+            mask = self._gfql_bool_mask(out_df, expr_value)
+            out_df = out_df.loc[mask]
+
+        return self._gfql_row_table(out_df)
+
+    @staticmethod
+    def _gfql_validate_apply_args(
+        op_name: str,
+        binding_ops: List[Dict[str, Any]],
+        join_aliases: List[str],
+        *,
+        out_col: Optional[str] = None,
+        how: Optional[str] = None,
+    ) -> None:
+        if not isinstance(binding_ops, list) or len(binding_ops) == 0:
+            raise ValueError(f"{op_name}(binding_ops=...) requires a non-empty list")
+        if not isinstance(join_aliases, list) or len(join_aliases) == 0:
+            raise ValueError(f"{op_name}(join_aliases=...) requires a non-empty list")
+        if not all(isinstance(alias, str) and alias.strip() for alias in join_aliases):
+            raise ValueError(f"{op_name}(join_aliases=...) must be a list of non-empty strings")
+        if out_col is not None and (not isinstance(out_col, str) or out_col.strip() == ""):
+            raise ValueError(f"{op_name}(out_col=...) requires a non-empty string")
+        if how is not None and how not in {"inner", "left"}:
+            raise ValueError(f"{op_name}(how=...) must be 'inner' or 'left'")
+
+    @staticmethod
+    def _gfql_shared_join_cols(
+        left_df: Any,
+        right_df: Any,
+        join_aliases: List[str],
+        node_id_col: str,
+    ) -> Tuple[List[str], List[str]]:
+        join_cols: List[str] = []
+        missing_aliases: List[str] = []
+        for alias in join_aliases:
+            candidates = (f"{alias}.{node_id_col}", alias)
+            chosen = next((col for col in candidates if col in left_df.columns and col in right_df.columns), None)
+            if chosen is None:
+                missing_aliases.append(alias)
+            elif chosen not in join_cols:
+                join_cols.append(chosen)
+        return join_cols, missing_aliases
+
+    @staticmethod
+    def _gfql_pattern_semi_join_frame(
+        left_df: DataFrameT,
+        right_df: DataFrameT,
+        join_aliases: List[str],
+        node_id_col: str,
+        requested_property_columns: Optional[Mapping[str, Sequence[str]]] = None,
+    ) -> Tuple[DataFrameT, List[str], List[str]]:
+        """Give boolean alias markers an explicit ID key for correlated patterns."""
+        for alias in join_aliases:
+            id_col = f"{alias}.{node_id_col}"
+            if id_col in left_df.columns and id_col in right_df.columns:
+                continue
+            alias_col = alias
+            if (
+                node_id_col == alias
+                or node_id_col not in left_df.columns
+                or id_col not in right_df.columns
+                or alias_col not in left_df.columns
+                or not RowPipelineMixin._gfql_series_bool_like(left_df[alias_col])
+            ):
+                continue
+            assignments = {id_col: left_df[node_id_col]}
+            for prop_col in (requested_property_columns or {}).get(alias, ()):
+                qualified_col = f"{alias}.{prop_col}"
+                if qualified_col in left_df.columns:
+                    continue
+                if prop_col not in left_df.columns:
+                    RowPipelineMixin._gfql_report_absent_property(qualified_col)
+                if prop_col in left_df.columns:
+                    prop_series = left_df[prop_col]
+                elif is_polars_df(left_df):
+                    import polars as pl
+
+                    prop_series = pl.Series(qualified_col, [None] * left_df.height, dtype=pl.Null)
+                else:
+                    prop_series = None
+                assignments[qualified_col] = prop_series
+            left_df = left_df.assign(**assignments)
+        join_cols, missing_aliases = RowPipelineMixin._gfql_shared_join_cols(
+            left_df, right_df, join_aliases, node_id_col
+        )
+        return left_df, join_cols, missing_aliases
+
+    @staticmethod
+    def _gfql_raise_missing_join_cols(
+        *,
+        message: str,
+        field: str,
+        join_aliases: List[str],
+        missing_aliases: List[str],
+        suggestion: str,
+        language: str,
+    ) -> None:
+        raise GFQLValidationError(
+            ErrorCode.E108,
+            message,
+            field=field,
+            value={"join_aliases": join_aliases, "missing_aliases": missing_aliases},
+            suggestion=suggestion,
+            language=language,
+        )
+
+    def _gfql_apply_right_df(self, binding_ops: List[Dict[str, Any]]) -> Tuple[Any, Any]:
+        base_graph = self._gfql_base_graph(fallback_to_self=True)
+        right_rows = _RowPipelineAdapter(cast("Plottable", base_graph))._gfql_binding_ops_row_table(binding_ops)
+        return base_graph, right_rows._nodes
+
+    @staticmethod
+    def _gfql_apply_neq_filter(right_df: Any, neq: Optional[List[str]], node_id_col: str) -> Any:
+        """``EXISTS { ... WHERE a <> b }``: keep binding rows whose two alias node ids
+        DIFFER (the viz drop-self prune-isolated flavor). Column resolution mirrors the
+        join-column candidates (``alias.node_id`` then bare ``alias``)."""
+        if not neq or right_df is None or len(right_df) == 0:
+            return right_df
+        cols: List[str] = []
+        for alias in neq:
+            cand = next((c for c in (f"{alias}.{node_id_col}", alias) if c in right_df.columns), None)
+            if cand is None:
+                raise GFQLValidationError(
+                    ErrorCode.E108,
+                    "EXISTS inner WHERE inequality references an alias missing from the pattern bindings",
+                    field="where",
+                    value=list(neq),
+                    suggestion="Compare the pattern's endpoint aliases, e.g. EXISTS { (n)--(m) WHERE m <> n }.",
+                    language="cypher",
+                )
+            cols.append(cand)
+        return right_df.loc[right_df[cols[0]] != right_df[cols[1]]]
+
+    def search_any(
+        self,
+        alias: str,
+        term: str,
+        out_col: str,
+        case_sensitive: bool = False,
+        regex: bool = False,
+        columns: Optional[List[str]] = None,
+    ) -> "Plottable":
+        """Cross-column search marker (viz-filter L2, panel-algebra D2): ``out_col`` is
+        True where ANY of the alias's columns matches ``term`` — OR across columns,
+        case-insensitive substring by default, regex opt-in, dtype-gated (string cols
+        always; int cols iff numeric-literal term; kernel in gfql/search_any.py)."""
+        from graphistry.compute.gfql.search_any import search_any_mask
+        left_df = self._gfql_get_active_table()
+        if left_df is None:
+            empty = self._gfql_empty_frame()
+            empty[out_col] = pd.Series(dtype="bool")
+            return self._gfql_row_table(empty)
+        if len(left_df) == 0:
+            out_df = left_df.copy()
+            out_df[out_col] = pd.Series(dtype="bool")
+            return self._gfql_row_table(out_df)
+        prefix = f"{alias}."
+        prefixed = [c for c in left_df.columns if c.startswith(prefix)]
+        if prefixed:
+            sub = left_df[prefixed].rename(columns={c: c[len(prefix):] for c in prefixed})
+        else:
+            # single-entity row table: bare columns (internals + the alias marker excluded)
+            sub = left_df[[c for c in left_df.columns
+                           if not c.startswith("__gfql_") and c != alias]]
+        mask = search_any_mask(
+            sub, term, case_sensitive=case_sensitive, regex=regex, columns=columns)
+        if mask is None:
+            raise GFQLValidationError(
+                ErrorCode.E108,
+                "searchAny columns= includes a column absent from the searched table",
+                field="columns",
+                value=columns,
+                suggestion="List only columns present on the searched entity.",
+                language="cypher",
+            )
+        out_df = left_df.copy()
+        out_df[out_col] = mask
+        return self._gfql_row_table(out_df)
+
+    def anti_semi_apply(
+        self,
+        binding_ops: List[Dict[str, Any]],
+        join_aliases: List[str],
+        neq: Optional[List[str]] = None,
+        requested_property_columns: Optional[Mapping[str, Sequence[str]]] = None,
+    ) -> "Plottable":
+        """Row anti-semi-join against rows produced by ``binding_ops``."""
+        self._gfql_validate_apply_args("anti_semi_apply", binding_ops, join_aliases)
+
+        left_df = self._gfql_get_active_table()
+        if left_df is None or len(left_df) == 0:
+            return self._gfql_row_table(self._gfql_empty_frame(left_df))
+
+        base_graph, right_df = self._gfql_apply_right_df(binding_ops)
+        if right_df is None or len(right_df) == 0:
+            return self._gfql_row_table(left_df.copy())
+
+        node_id_col = base_graph._node
+        if not isinstance(node_id_col, str) or node_id_col == "":
+            node_id_col = "id"
+
+        right_df = self._gfql_apply_neq_filter(right_df, neq, node_id_col)
+        if right_df is None or len(right_df) == 0:
+            return self._gfql_row_table(left_df.copy())
+
+        left_df, join_cols, missing_aliases = self._gfql_pattern_semi_join_frame(
+            left_df,
+            right_df,
+            join_aliases,
+            node_id_col,
+            requested_property_columns,
+        )
+        if not join_cols:
+            self._gfql_raise_missing_join_cols(
+                message="Cypher WHERE NOT (pattern) anti-semi-join lowering could not recover shared alias join columns",
+                field="where",
+                join_aliases=join_aliases,
+                missing_aliases=missing_aliases,
+                suggestion="Use a NOT-pattern that references aliases already bound in the active MATCH scope.",
+                language="cypher",
+            )
+
+        right_keys = right_df[join_cols].drop_duplicates()
+        marker_col = RowPipelineMixin._gfql_fresh_col_name(left_df.columns, "__gfql_anti_semi_hit__")
+        right_keys = right_keys.assign(**{marker_col: True})
+        merged = left_df.merge(right_keys, on=join_cols, how="left", sort=False)
+        kept = merged.loc[merged[marker_col].isna()].drop(columns=[marker_col])
+        return self._gfql_row_table(kept)
+
+    def semi_apply_mark(
+        self,
+        binding_ops: List[Dict[str, Any]],
+        join_aliases: List[str],
+        out_col: str,
+        neq: Optional[List[str]] = None,
+        requested_property_columns: Optional[Mapping[str, Sequence[str]]] = None,
+    ) -> "Plottable":
+        """Annotate each active row with correlated pattern-match existence."""
+        self._gfql_validate_apply_args("semi_apply_mark", binding_ops, join_aliases, out_col=out_col)
+
+        left_df = self._gfql_get_active_table()
+        if left_df is None:
+            empty = self._gfql_empty_frame()
+            empty[out_col] = pd.Series(dtype="bool")
+            return self._gfql_row_table(empty)
+        if len(left_df) == 0:
+            out_df = left_df.copy()
+            out_df[out_col] = pd.Series(dtype="bool")
+            return self._gfql_row_table(out_df)
+
+        base_graph, right_df = self._gfql_apply_right_df(binding_ops)
+        if right_df is None or len(right_df) == 0:
+            out_df = left_df.copy()
+            out_df[out_col] = False
+            return self._gfql_row_table(out_df)
+
+        node_id_col = base_graph._node
+        if not isinstance(node_id_col, str) or node_id_col == "":
+            node_id_col = "id"
+
+        right_df = self._gfql_apply_neq_filter(right_df, neq, node_id_col)
+        if right_df is None or len(right_df) == 0:
+            out_df = left_df.copy()
+            out_df[out_col] = False
+            return self._gfql_row_table(out_df)
+
+        left_df, join_cols, missing_aliases = self._gfql_pattern_semi_join_frame(
+            left_df,
+            right_df,
+            join_aliases,
+            node_id_col,
+            requested_property_columns,
+        )
+        if not join_cols:
+            self._gfql_raise_missing_join_cols(
+                message="Cypher WHERE pattern semi-apply lowering could not recover shared alias join columns",
+                field="where",
+                join_aliases=join_aliases,
+                missing_aliases=missing_aliases,
+                suggestion="Use a pattern that references aliases already bound in the active MATCH scope.",
+                language="cypher",
+            )
+
+        right_keys = right_df[join_cols].drop_duplicates()
+        marker_col = RowPipelineMixin._gfql_fresh_col_name(left_df.columns, "__gfql_semi_apply_hit__")
+        right_keys = right_keys.assign(**{marker_col: True})
+        merged = left_df.merge(right_keys, on=join_cols, how="left", sort=False)
+        out_df = merged.drop(columns=[marker_col])
+        out_df[out_col] = ~merged[marker_col].isna()
+        return self._gfql_row_table(out_df)
+
+    def join_apply(
+        self,
+        binding_ops: List[Dict[str, Any]],
+        join_aliases: List[str],
+        how: str = "inner",
+    ) -> "Plottable":
+        """Join active rows with rows produced by ``binding_ops``."""
+        self._gfql_validate_apply_args("join_apply", binding_ops, join_aliases, how=how)
+
+        left_df = self._gfql_get_active_table()
+        if left_df is None:
+            return self._gfql_row_table(self._gfql_empty_frame())
+        if len(left_df) == 0:
+            return self._gfql_row_table(left_df.copy())
+
+        base_graph, right_df = self._gfql_apply_right_df(binding_ops)
+
+        node_id_col = base_graph._node
+        if not isinstance(node_id_col, str) or node_id_col == "":
+            node_id_col = "id"
+
+        right_cols: List[str] = [] if right_df is None else list(right_df.columns)
+        join_cols, missing_aliases = (
+            ([], list(join_aliases))
+            if right_df is None
+            else self._gfql_shared_join_cols(left_df, right_df, join_aliases, node_id_col)
+        )
+
+        if not join_cols:
+            self._gfql_raise_missing_join_cols(
+                message="GFQL row join could not recover shared alias join columns",
+                field="join_apply",
+                join_aliases=join_aliases,
+                missing_aliases=missing_aliases,
+                suggestion="Join on aliases present in both the active row table and binding_ops rows.",
+                language="gfql",
+            )
+
+        right_payload_cols = [
+            col
+            for col in right_cols
+            if col in join_cols or col not in left_df.columns
+        ]
+        if right_df is None or len(right_df) == 0:
+            if how == "inner":
+                return self._gfql_row_table(left_df.iloc[0:0].copy())
+            out_df = left_df.copy()
+            for col in right_payload_cols:
+                if col not in out_df.columns:
+                    out_df = out_df.assign(**{col: self._gfql_broadcast_scalar(out_df, None)})
+            return self._gfql_row_table(out_df)
+
+        joined = left_df.merge(
+            right_df[right_payload_cols],
+            on=join_cols,
+            how=how,
+            sort=False,
+        )
+        return self._gfql_row_table(joined)
+
+    def return_(self, items: List[Any]) -> "Plottable":
+        return self.select(items)
+
+    def order_by(self, keys: List[Any]) -> "Plottable":
+        table_df = self._gfql_get_active_table()
+        input_engine = resolve_engine(EngineAbstract.AUTO, table_df)
+        row_order_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_sort_row_order__")
+        if keys is None:
+            raise ValueError(
+                "order_by(keys=...) requires a list/tuple of (expr, direction)"
+            )
+
+        sort_cols: List[str] = []
+        ascending: List[bool] = []
+        aux_drop_cols: List[str] = []
+        used_host_bridge = False
+        work_df = table_df.assign(**{row_order_col: range(len(table_df))})
+        tmp_idx = 0
+        for key_item in keys:
+            if not isinstance(key_item, (list, tuple)) or len(key_item) != 2:
+                raise ValueError(
+                    f"order_by expects (expr, direction) pairs, got {key_item!r}"
+                )
+            expr, direction = key_item
+            if not isinstance(expr, str):
+                raise ValueError(
+                    "order_by currently supports string expressions, got "
+                    f"{type(expr).__name__}"
+                )
+            if expr in work_df.columns:
+                sort_col = expr
+            else:
+                parsed_order_node = None
+                parser_bundle = _gfql_expr_runtime_parser_bundle()
+                if parser_bundle is not None:
+                    parser, _capability_checker, _expr_parser_mod = parser_bundle
+                    try:
+                        parsed_order_node = parser(expr)
+                    except Exception:
+                        parsed_order_node = None
+                if not RowPipelineMixin._gfql_order_expr_static_supported(expr):
+                    raise ValueError(
+                        "unsupported order_by expression in vectorized mode; "
+                        f"use column/scalar arithmetic comparisons only: {expr!r}"
+                    )
+                temporal_duration_expr = (
+                    extract_temporal_duration_sort_ast(parsed_order_node)
+                    if parsed_order_node is not None
+                    else None
+                )
+                if temporal_duration_expr is not None:
+                    base_node, duration_text, duration_sign = temporal_duration_expr
+                    duration_components = parse_temporal_sort_duration_components(duration_text)
+                    if duration_components is None:
+                        raise ValueError(
+                            "unsupported order_by temporal duration expression in vectorized mode; "
+                            f"unsupported duration literal: {expr!r}"
+                        )
+                    month_shift, duration_shift = duration_components
+                    ok_base, base_value = self._gfql_eval_expr_ast(work_df, base_node)
+                    if not ok_base or not hasattr(base_value, "astype"):
+                        raise ValueError(
+                            "unsupported order_by temporal duration expression in vectorized mode; "
+                            f"base expression must resolve to a vectorized temporal series: {expr!r}"
+                        )
+                    sort_col = f"__gfql_sort_{tmp_idx}__"
+                    tmp_idx += 1
+                    work_df = work_df.assign(**{sort_col: base_value})
+                    direction_is_asc = str(direction).lower() != "desc"
+                    series = work_df[sort_col]
+                    temporal_mode = order_detect_temporal_mode(series)
+                    if temporal_mode is None:
+                        raise ValueError(
+                            "unsupported order_by temporal duration expression in vectorized mode; "
+                            f"base expression is not a supported temporal series: {expr!r}"
+                        )
+                    if month_shift != 0 and temporal_mode in {"time", "time_constructor"}:
+                        raise ValueError(
+                            "unsupported order_by temporal duration expression in vectorized mode; "
+                            f"time values do not support year/month duration offsets: {expr!r}"
+                        )
+                    key_prefix = f"__gfql_sort_temporal_{tmp_idx}__"
+                    tmp_idx += 1
+                    work_df, temporal_key_cols = build_temporal_sort_columns(
+                        work_df,
+                        sort_col,
+                        key_prefix,
+                        temporal_mode,
+                        month_shift=duration_sign * month_shift,
+                        nanosecond_shift=duration_sign * duration_shift,
+                        null_mask_fn=self._gfql_null_mask,
+                        fresh_col_name_fn=RowPipelineMixin._gfql_fresh_col_name,
+                    )
+                    sort_cols.extend(temporal_key_cols)
+                    ascending.extend([direction_is_asc] * len(temporal_key_cols))
+                    continue
+                sort_col = f"__gfql_sort_{tmp_idx}__"
+                tmp_idx += 1
+                sort_value = self._gfql_eval_string_expr(work_df, expr)
+                if resolve_engine(EngineAbstract.AUTO, work_df) == Engine.CUDF and isinstance(sort_value, pd.Series):
+                    try:
+                        sort_value = s_cons(Engine.CUDF)(
+                            sort_value.tolist(),
+                            index=getattr(work_df, "index", None),
+                        )
+                    except (
+                        TypeError,
+                        ValueError,
+                        RuntimeError,
+                        AttributeError,
+                        NotImplementedError,
+                    ):
+                        warnings.warn(
+                            "cuDF order_by expression produced pandas series; applying scoped host bridge "
+                            "and converting result rows back to cuDF",
+                            RuntimeWarning,
+                        )
+                        work_df = _gfql_bridge_cudf_df_to_pandas(work_df)
+                        used_host_bridge = True
+                work_df = work_df.assign(**{sort_col: sort_value})
+            direction_is_asc = str(direction).lower() != "desc"
+            series = work_df[sort_col]
+            if (
+                resolve_engine(EngineAbstract.AUTO, work_df) == Engine.CUDF
+                and _gfql_cudf_list_sort_series_requires_host_bridge(series)
+            ):
+                work_df = _gfql_bridge_cudf_df_to_pandas(work_df)
+                series = work_df[sort_col]
+            list_candidate = order_detect_list_series(series)
+            if list_candidate:
+                top_null_mask = self._gfql_null_mask(work_df, series)
+                if hasattr(top_null_mask, "any") and bool(top_null_mask.any()):
+                    list_candidate = False
+            if not list_candidate and order_detect_stringified_list_series(series):
+                top_null_mask = self._gfql_null_mask(work_df, series)
+                has_null = hasattr(top_null_mask, "any") and bool(top_null_mask.any())
+                if not has_null:
+                    parsed = parse_stringified_list_series(series)
+                    if parsed is not None:
+                        if resolve_engine(EngineAbstract.AUTO, work_df) == Engine.CUDF and isinstance(parsed, pd.Series):
+                            try:
+                                parsed = s_cons(Engine.CUDF)(parsed.tolist(), index=getattr(work_df, "index", None))
+                            except (
+                                TypeError,
+                                ValueError,
+                                RuntimeError,
+                                AttributeError,
+                                NotImplementedError,
+                            ) as exc:
+                                if _gfql_cudf_list_sort_requires_host_bridge():
+                                    work_df = _gfql_bridge_cudf_df_to_pandas(work_df)
+                                    used_host_bridge = True
+                                else:
+                                    raise ValueError(
+                                        "internal engine-boundary violation: parsed stringified-list sort key "
+                                        "in cuDF mode must materialize as cuDF series"
+                                    ) from exc
+                        sort_col = RowPipelineMixin._gfql_fresh_col_name(
+                            work_df.columns, "__gfql_sort_listparsed_"
+                        )
+                        work_df = work_df.assign(**{sort_col: parsed})
+                        aux_drop_cols.append(sort_col)
+                        series = work_df[sort_col]
+                        list_candidate = True
+            if list_candidate:
+                if (
+                    resolve_engine(EngineAbstract.AUTO, work_df) == Engine.CUDF
+                    and (
+                        _gfql_cudf_list_sort_requires_host_bridge()
+                        or _gfql_cudf_list_sort_series_requires_host_bridge(series)
+                    )
+                ):
+                    work_df = _gfql_bridge_cudf_df_to_pandas(work_df)
+                    used_host_bridge = True
+                    series = work_df[sort_col]
+                key_prefix = f"__gfql_sort_list_{tmp_idx}__"
+                tmp_idx += 1
+                work_df, list_key_cols = build_list_sort_columns(
+                    work_df,
+                    sort_col,
+                    key_prefix,
+                    null_mask_fn=self._gfql_null_mask,
+                    broadcast_scalar_fn=self._gfql_broadcast_scalar,
+                    fresh_col_name_fn=RowPipelineMixin._gfql_fresh_col_name,
+                )
+                sort_cols.extend(list_key_cols)
+                ascending.extend([direction_is_asc] * len(list_key_cols))
+                continue
+            temporal_mode = order_detect_temporal_mode(series)
+            if temporal_mode is not None:
+                key_prefix = f"__gfql_sort_temporal_{tmp_idx}__"
+                tmp_idx += 1
+                work_df, temporal_key_cols = build_temporal_sort_columns(
+                    work_df,
+                    sort_col,
+                    key_prefix,
+                    temporal_mode,
+                    null_mask_fn=self._gfql_null_mask,
+                    fresh_col_name_fn=RowPipelineMixin._gfql_fresh_col_name,
+                )
+                sort_cols.extend(temporal_key_cols)
+                ascending.extend([direction_is_asc] * len(temporal_key_cols))
+                continue
+            validate_order_series_vector_safe(series, expr)
+            sort_cols.append(sort_col)
+            ascending.append(direction_is_asc)
+
+        if sort_cols:
+            try:
+                # openCypher orders NULL as the LARGEST value: ASC -> nulls last, DESC -> nulls
+                # FIRST. pandas/cuDF sort_values `na_position` is a SINGLE scalar (cannot be
+                # per-key) and cuDF has no stable sort, so use a per-key null-indicator column
+                # sorted in the SAME direction as its key: ind = col.isna(); for an ASC key
+                # (ascending=True) True (null) sorts LAST, for a DESC key (ascending=False) True
+                # sorts FIRST. Matches the OLAP fast-path fix and order_by_polars. (Previously
+                # sort_values defaulted na_position='last' for every key, silently returning the
+                # wrong `... DESC LIMIT k` top-k over a column containing NULLs.)
+                interleaved_cols: List[Any] = []
+                interleaved_ascending: List[bool] = []
+                for _i, (_sc, _asc) in enumerate(zip(sort_cols, ascending)):
+                    _ind_col = RowPipelineMixin._gfql_fresh_col_name(
+                        work_df.columns, f"__gfql_sort_nullrank_{_i}__"
+                    )
+                    work_df = work_df.assign(**{_ind_col: work_df[_sc].isna()})
+                    interleaved_cols.extend([_ind_col, _sc])
+                    interleaved_ascending.extend([_asc, _asc])
+                effective_sort_cols = interleaved_cols + [row_order_col]
+                effective_ascending = interleaved_ascending + [True]
+                out_df = work_df.sort_values(by=effective_sort_cols, ascending=effective_ascending)
+            except Exception as exc:
+                raise ValueError(
+                    "unsupported order_by for vectorized execution; "
+                    f"cannot sort key set {sort_cols!r} with expression set "
+                    f"{[k[0] for k in keys]!r}: {exc}"
+                ) from exc
+            drop_cols = [c for c in effective_sort_cols if isinstance(c, str) and c.startswith("__gfql_sort_")]
+            drop_cols.extend(c for c in aux_drop_cols if c not in drop_cols)
+            if drop_cols:
+                out_df = out_df.drop(columns=drop_cols)
+        else:
+            out_df = work_df.drop(columns=[row_order_col])
+
+        if input_engine == Engine.CUDF and used_host_bridge:
+            output_engine = resolve_engine(EngineAbstract.AUTO, out_df)
+            if output_engine != Engine.CUDF:
+                try:
+                    out_df = df_to_engine(out_df, Engine.CUDF)
+                except (
+                    TypeError,
+                    ValueError,
+                    RuntimeError,
+                    AttributeError,
+                    NotImplementedError,
+                    ImportError,
+                    ModuleNotFoundError,
+                ) as exc:
+                    raise ValueError(
+                        "internal engine-boundary violation: cuDF order_by host-bridge "
+                        "compatibility path must return to cuDF before returning rows"
+                    ) from exc
+        return self._gfql_row_table(out_df)
+
+    skip = row_frame_ops.skip
+    limit = row_frame_ops.limit
+    distinct = row_frame_ops.distinct
+    count_table = row_frame_ops.count_table
+
+    def unwind(self, expr: Any, as_: str = "value") -> "Plottable":
+        """Vectorized UNWIND for column or literal list expressions."""
+        table_df = self._gfql_get_active_table()
+        if not isinstance(as_, str) or as_.strip() == "":
+            raise ValueError("unwind(as_=...) must be a non-empty string")
+        as_clean = as_.strip()
+
+        if isinstance(expr, str):
+            if expr in table_df.columns:
+                explode_src = table_df[expr]
+            else:
+                explode_src = self._gfql_eval_string_expr(table_df, expr)
+        elif isinstance(expr, (list, tuple)):
+            explode_src = self._gfql_broadcast_scalar(table_df, list(expr))
+        else:
+            raise ValueError(
+                "unwind(expr=...) currently supports a row expression or list/tuple literal"
+            )
+
+        if not hasattr(explode_src, "astype"):
+            explode_src = self._gfql_broadcast_scalar(table_df, explode_src)
+
+        tmp_col = "__gfql_unwind_values__"
+        list_like = self._gfql_series_is_list_like(explode_src)
+        out_df = table_df.assign(**{tmp_col: explode_src})
+        row_col = None
+        len_col = None
+        pos_col = None
+        null_mask = self._gfql_null_mask(out_df, out_df[tmp_col])
+        if not list_like and hasattr(null_mask, "all") and bool(null_mask.all()):
+            empty_df = out_df.iloc[0:0].drop(columns=[tmp_col]).assign(**{as_clean: out_df.iloc[0:0][tmp_col]})
+            return self._gfql_row_table(empty_df)
+        if list_like:
+            row_col = self._gfql_fresh_col_name(out_df.columns, "__gfql_unwind_row__")
+            len_col = self._gfql_fresh_col_name(out_df.columns, "__gfql_unwind_len__")
+            pos_col = self._gfql_fresh_col_name(out_df.columns, "__gfql_unwind_pos__")
+            lengths = series_sequence_len(explode_src)
+            if hasattr(lengths, "fillna"):
+                lengths = lengths.fillna(0)
+            out_df = out_df.assign(**{row_col: range(len(out_df)), len_col: lengths})
+        if not hasattr(out_df, "explode"):
+            raise ValueError("unwind requires dataframe explode() support")
+        out_df = out_df.explode(tmp_col)
+        if list_like and row_col is not None and len_col is not None and pos_col is not None:
+            out_df = out_df.assign(**{pos_col: out_df.groupby(row_col, sort=False).cumcount()})
+            out_df = out_df.loc[out_df[pos_col] < out_df[len_col]]
+            out_df = out_df.drop(columns=[row_col, len_col, pos_col])
+        out_df = out_df.assign(**{as_clean: out_df[tmp_col]})
+        out_df = out_df.drop(columns=[tmp_col])
+        return self._gfql_row_table(out_df)
+
+    def group_by(
+        self,
+        keys: Sequence[str],
+        aggregations: Sequence[AggSpec],
+        key_prefixes: Optional[Sequence[str]] = None,
+    ) -> "Plottable":
+        """Vectorized grouped aggregations for row-table pipelines."""
+        table_df = self._gfql_get_active_table()
+        key_cols = [str(k) for k in keys]
+        if key_prefixes:
+            seen = set(key_cols)
+            for prefix in key_prefixes:
+                for col in table_df.columns:
+                    if isinstance(col, str) and col.startswith(prefix) and col not in seen:
+                        key_cols.append(col)
+                        seen.add(col)
+        # cuDF groupby(...).size() fails on a key column named 'name'; group on a copy and restore it on output
+        name_key = None
+        if type(table_df).__module__.startswith("cudf") and "name" in key_cols:
+            name_key = RowPipelineMixin._gfql_fresh_col_name(
+                [*table_df.columns, *(str(agg[0]) for agg in aggregations if agg)],
+                "__gfql_name_key__",
+            )
+            table_df = table_df.assign(**{name_key: table_df["name"]})
+            key_cols = [name_key if k == "name" else k for k in key_cols]
+        from graphistry.compute.gfql.agg_types import validate_aggregation_output
+
+        validate_aggregation_output(bool(key_cols), bool(aggregations))
+        global_key = None
+        if not key_cols:
+            global_key = RowPipelineMixin._gfql_fresh_col_name(
+                [*table_df.columns, *(str(agg[0]) for agg in aggregations if agg)],
+                "__gfql_global_group__",
+            )
+            table_df = table_df.assign(**{global_key: 0})
+            key_cols = [global_key]
+        for key in key_cols:
+            if key not in table_df.columns:
+                raise ValueError(f"group_by key column not found: {key!r}")
+
+        group_order_col = RowPipelineMixin._gfql_fresh_col_name(table_df.columns, "__gfql_group_order__")
+        table_df = table_df.assign(**{group_order_col: range(len(table_df))})
+
+        def _make_grouped(df: Any, value_cols: Any = ()) -> Any:
+            # Group over ONLY key + this call's value columns; a spare column trips cuDF's groupby.
+            keep_cols = list(dict.fromkeys([*key_cols, *(c for c in value_cols if c in df.columns)]))
+            df = df[keep_cols]
+
+            def _build_grouped(group_df: Any) -> Any:
+                try:
+                    grouped_local = group_df.groupby(key_cols, sort=False, dropna=False)
+                except TypeError:
+                    grouped_local = group_df.groupby(key_cols, sort=False)
+                # Trigger factorization now so unhashable key payloads fail fast
+                # and can be normalized to string keys in the outer fallback.
+                grouped_local.size()
+                return grouped_local
+
+            try:
+                return _build_grouped(df)
+            except TypeError:
+                key_object_cols = [
+                    col for col in key_cols if col in df.columns and str(df[col].dtype) == "object"
+                ]
+                work_df = df
+                if key_object_cols:
+                    work_df = df.assign(**{col: df[col].astype(str) for col in key_object_cols})
+                return _build_grouped(work_df)
+
+        grouped = _make_grouped(table_df, [group_order_col])
+
+        base = grouped.size().reset_index(name="__gfql_group_size__")
+        group_order_df = grouped[group_order_col].min().reset_index(name=group_order_col)
+        base = base.merge(group_order_df, on=key_cols, how="left", sort=False)
+        base = base.sort_values(by=[group_order_col]).reset_index(drop=True)
+        out_df = base[key_cols + [group_order_col]].copy()
+
+        for agg in aggregations:
+            if not isinstance(agg, (list, tuple)) or len(agg) not in {2, 3}:
+                raise ValueError(
+                    "group_by aggregations must be tuples/lists of "
+                    "(alias, func) or (alias, func, expr)"
+                )
+            alias = str(agg[0])
+            func = str(agg[1]).lower()
+            expr = agg[2] if len(agg) == 3 else None
+
+            if func == "count" and (expr is None or expr == "*"):
+                grouped = _make_grouped(table_df)
+                agg_df = grouped.size().reset_index(name=alias)
+            else:
+                if not isinstance(expr, str):
+                    raise ValueError(
+                        f"group_by aggregation {alias!r} requires string expr column"
+                    )
+                expr_col = expr
+                if expr_col not in table_df.columns:
+                    expr_values = self._gfql_eval_string_expr(table_df, expr_col)
+                    if not hasattr(expr_values, "astype"):
+                        null_scalar = expr_values is None
+                        expr_values = self._gfql_broadcast_scalar(table_df, expr_values)
+                        if null_scalar and len(table_df) == 0:
+                            # Empty None broadcasts otherwise become object/string on cuDF.
+                            expr_values = expr_values.astype("float64")
+                    tmp_col = "__gfql_group_expr__"
+                    while tmp_col in table_df.columns:
+                        tmp_col = f"{tmp_col}_x"
+                    table_df = table_df.assign(**{tmp_col: expr_values})
+                    expr_col = tmp_col
+                if "category" in str(table_df[expr_col].dtype).lower():
+                    # A categorical column is a STRING column to cypher (its categories are the
+                    # values), but the host kernels disagree per-aggregate: pandas raises on
+                    # grouped min/max/sum/mean over a categorical, and cuDF additionally raises
+                    # on collect and -- worse -- answers count(DISTINCT) with a CATEGORY LABEL
+                    # instead of a count. Decategorize once, up front, so every aggregate below
+                    # sees the string column cypher says it is.
+                    table_df = table_df.assign(**{expr_col: table_df[expr_col].astype("string")})
+                grouped = _make_grouped(table_df, [expr_col])
+                if func in {"collect", "collect_distinct"}:
+                    # collect() ignores null entries; compute collection on
+                    # non-null rows and merge against full key space below.
+                    grouped_df = grouped.obj
+                    non_null_df = grouped_df.loc[
+                        ~grouped_df[expr_col].isna(), key_cols + [expr_col]
+                    ]
+                    if len(non_null_df) == 0:
+                        agg_df = out_df[key_cols].iloc[0:0].copy()
+                        agg_df[alias] = self._gfql_broadcast_scalar(agg_df, None)
+                    else:
+                        if func == "collect_distinct":
+                            try:
+                                non_null_df = non_null_df.drop_duplicates(
+                                    subset=key_cols + [expr_col],
+                                    keep="first",
+                                )
+                            except TypeError:
+                                norm_col = "__gfql_collect_distinct_norm__"
+                                while norm_col in non_null_df.columns:
+                                    norm_col = f"{norm_col}_x"
+                                norm_df = non_null_df.assign(**{norm_col: non_null_df[expr_col].astype(str)})
+                                norm_df = norm_df.drop_duplicates(
+                                    subset=key_cols + [norm_col],
+                                    keep="first",
+                                )
+                                non_null_df = norm_df.drop(columns=[norm_col])
+                        agg_df = (
+                            _make_grouped(non_null_df, [expr_col])[expr_col]
+                            .agg(list)
+                            .reset_index(name=alias)
+                        )
+                else:
+                    method_name = GFQL_GROUPBY_AGG_METHODS.get(func)
+                    if method_name is None:
+                        raise ValueError(f"unsupported group_by aggregation function: {func!r}")
+                    all_null_numeric = False
+                    if func in GFQL_NUMERIC_ONLY_AGGREGATIONS:
+                        # Cypher restricts sum()/avg() to INTEGER|FLOAT|DURATION -- see
+                        # gfql/agg_types.py for the sources. Without this, pandas answered
+                        # sum(<string column>) with the CONCATENATION ('abac'), a silent wrong
+                        # answer, while avg(<string column>) raised only incidentally (pandas'
+                        # own TypeError, rewrapped as an E201 "parameter error" naming neither
+                        # the column nor the operation).
+                        # DTYPE FIRST, data second: a column the dtype PROVES numeric is served
+                        # with no data inspection at all, so an ordinary numeric aggregate --
+                        # every served one -- pays only a dtype string check here. Anything else
+                        # is already on a slow or erroring path, which is where the O(n)
+                        # all-null question gets asked.
+                        if not pandas_dtype_is_numeric_for_agg(table_df[expr_col]):
+                            all_null_numeric = (
+                                len(table_df) > 0 and bool(table_df[expr_col].isna().all())
+                            )
+                            if not all_null_numeric:
+                                dtype_label = pandas_non_numeric_agg_dtype(table_df[expr_col])
+                                if dtype_label is not None:
+                                    raise_non_numeric_aggregation(func, expr_col, dtype_label, alias)
+                    if all_null_numeric:
+                        # cypher sum(null)==0 / avg(null)==null, substituted rather than computed:
+                        # pandas answers an all-null column 0/NaN when object but ''/NaT/TypeError
+                        # once typed, so the kernel cannot be trusted to produce it.
+                        agg_df = out_df[key_cols].copy()
+                        agg_df[alias] = self._gfql_broadcast_scalar(
+                            agg_df, numeric_agg_all_null_value(func)
+                        )
+                        out_df = out_df.merge(agg_df, on=key_cols, how="left", sort=False)
+                        continue
+                    if func in {"min", "max"} and (
+                        RowPipelineMixin._gfql_series_object_non_null_str_like(table_df[expr_col])
+                    ):
+                        table_df = table_df.assign(**{expr_col: table_df[expr_col].astype("string")})
+                        grouped = _make_grouped(table_df, [expr_col])
+                    agg_series = grouped[expr_col]
+                    agg_df = getattr(agg_series, method_name)().reset_index(name=alias)
+                    if func == "sum" and pandas_object_series_is_bool_like(table_df[expr_col]):
+                        # The object-dtype kernel returns a lone-row group as the raw bool.
+                        agg_df = agg_df.assign(**{alias: pd.to_numeric(agg_df[alias])})  # bool sums as int (#1821)
+                    null_fill = pandas_agg_kernel_null_fill(func, table_df[expr_col])
+                    if null_fill is not None:
+                        # cypher sum() never answers null; cuDF's grouped sum does (agg_types.py)
+                        agg_df = agg_df.assign(**{alias: agg_df[alias].fillna(null_fill)})
+                    agg_df = agg_df.assign(**{alias: pandas_conform_agg_dtype(
+                        agg_df[alias], func,
+                        str(table_df[expr_col].dtype).lower() in {"bool", "boolean"})})
+
+            out_df = out_df.merge(agg_df, on=key_cols, how="left", sort=False)
+            if func in {"collect", "collect_distinct"}:
+                null_mask = out_df[alias].isna()
+                has_nulls = True
+                if hasattr(null_mask, "any"):
+                    try:
+                        has_nulls = bool(null_mask.any())
+                    except Exception:
+                        has_nulls = True
+                if has_nulls:
+                    try:
+                        empty_lists = self._gfql_broadcast_scalar(out_df, [])
+                        out_df[alias] = out_df[alias].where(~null_mask, empty_lists)
+                    except Exception:
+                        filled_values = [
+                            [] if is_null_scalar(value) else value
+                            for value in self._gfql_series_to_pylist(out_df[alias])
+                        ]
+                        out_df = out_df.drop(columns=[alias]).assign(**{alias: filled_values})
+
+        out_df = out_df.sort_values(by=[group_order_col]).reset_index(drop=True)
+        out_df = out_df.drop(columns=[group_order_col])
+        if name_key is not None:
+            out_df = out_df.rename(columns={name_key: "name"})
+        if global_key is not None:
+            out_df = out_df.drop(columns=[global_key])
+            if len(out_df) == 0:
+                from graphistry.compute.gfql.cypher.aggregate_identity import aggregate_identity_value
+
+                out_df = type(table_df)({
+                    str(agg[0]): [aggregate_identity_value(str(agg[1]).lower())]
+                    for agg in aggregations
+                })
+        return self._gfql_row_table(out_df)
+
+    def fill_empty_row(self, row: Dict[str, Any]) -> "Plottable":  # hygiene-ok: explicit-any -- heterogeneous Cypher identity values (0 / [] / None)
+        """openCypher ungrouped-aggregate identity: an aggregate with no grouping
+        keys yields exactly one row, so an EMPTY aggregate output becomes the given
+        identity row here -- where the compiled suffix (post-aggregate WHERE,
+        projections, paging) still sees it with runtime semantics."""
+        table_df = self._gfql_get_active_table()
+        if len(table_df) > 0:
+            return self._gfql_row_table(table_df)
+        filled = type(table_df)({key: [value] for key, value in row.items()})
+        return self._gfql_row_table(filled)
+
+
+class _RowPipelineAdapter(RowPipelineMixin):
+    """Adapter for row-pipeline calls without requiring global ComputeMixin inheritance."""
+
+    def __init__(self, g: "Plottable") -> None:
+        from graphistry.compute.gfql.index.handoff import read_handoff
+
+        self._g = g
+        self._gfql_start_nodes = g._gfql_start_nodes
+        self._gfql_rows_base_graph = g._gfql_rows_base_graph
+        self._gfql_rows_edge_aliases = g._gfql_rows_edge_aliases
+        self._gfql_indexed_bindings_handoff = read_handoff(g)
+        self._nodes = g._nodes
+        self._edges = g._edges
+        self._node = g._node
+        self._source = g._source
+        self._destination = g._destination
+        self._edge = g._edge
+
+    def bind(self) -> "Plottable":
+        assert self._g is not None  # set by __init__; kept Optional for the protocol
+        return self._g.bind()
+
+
+_ROW_PIPELINE_DISPATCH: Dict[str, Callable[..., "Plottable"]] = {
+    "rows": RowPipelineMixin.rows,
+    "search_any": RowPipelineMixin.search_any,
+    "semi_apply_mark": RowPipelineMixin.semi_apply_mark,
+    "anti_semi_apply": RowPipelineMixin.anti_semi_apply,
+    "join_apply": RowPipelineMixin.join_apply,
+    "where_rows": RowPipelineMixin.where_rows,
+    "select": RowPipelineMixin.select,
+    "with_": RowPipelineMixin.with_,
+    "return_": RowPipelineMixin.return_,
+    "order_by": RowPipelineMixin.order_by,
+    "skip": RowPipelineMixin.skip,
+    "limit": RowPipelineMixin.limit,
+    "distinct": RowPipelineMixin.distinct,
+    "unwind": RowPipelineMixin.unwind,
+    "group_by": RowPipelineMixin.group_by,
+    "fill_empty_row": RowPipelineMixin.fill_empty_row,
+    "drop_cols": RowPipelineMixin.drop_cols,
+    "count_table": RowPipelineMixin.count_table,
+}
+
+
+# Row-pipeline ops with native polars implementations (frame-level only — no
+# cypher expression engine). Everything else falls back through the guard below
+# until lowered natively (no-silent-fallback policy).
+_POLARS_NATIVE_ROW_PIPELINE_CALLS = frozenset(
+    {"rows", "skip", "limit", "distinct", "drop_cols", "count_table"}
+)
+
+
+from graphistry.Engine import active_frames_are_polars as _row_pipeline_active_is_polars
+
+
+def execute_row_pipeline_call(
+    g: "Plottable", function: str, params: Dict[str, Any]
+) -> "Plottable":
+    if function not in ROW_PIPELINE_CALLS:
+        raise ValueError(f"not a row-pipeline call: {function!r}")
+    if _row_pipeline_active_is_polars(g):
+        unsupported = function not in _POLARS_NATIVE_ROW_PIPELINE_CALLS
+        # ``rows`` is native only for the single-entity (table/source) shape; the
+        # multi-entity binding_ops / alias_endpoints shapes route into the pandas
+        # expression engine, so defer them explicitly rather than crash.
+        if function == "rows" and (
+            params.get("binding_ops") is not None
+            or params.get("alias_endpoints") is not None
+        ):
+            unsupported = True
+        if unsupported:
+            raise NotImplementedError(
+                f"polars row pipeline does not yet support op {function!r}; "
+                "use engine='pandas' or engine='cudf' for this query"
+            )
+    adapter = _RowPipelineAdapter(g)
+    method = _ROW_PIPELINE_DISPATCH[function]
+    out = method(adapter, **params)
+    return out

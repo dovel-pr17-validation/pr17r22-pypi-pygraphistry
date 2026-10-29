@@ -1,0 +1,791 @@
+"""Build CSR adjacency / node-id indexes from a graph's frames.
+
+Build cost is O(E log E) (one sort), paid once per resident graph. The result is
+a set of sidecar arrays over edge **row positions** — the user's ``.edges`` frame
+is never reordered.
+"""
+from __future__ import annotations
+
+from dataclasses import replace
+from typing import Any, List, Optional, Sequence, Tuple, Union, cast
+
+import numpy as np
+
+from graphistry.Engine import Engine
+from graphistry.compute.typing import DataFrameT, SeriesT
+from .engine_arrays import array_namespace, col_to_array
+from .registry import (
+    AdjacencyIndex, CategoryIndex, ColStatsFact, ColStatsRole, DegreeFact, EndpointRowsFact,
+    NodeIdIndex, NodePropIndex, PartitionValue, TemporalTextFact, frame_fingerprint,
+)
+from .types import AdjacencyIndexKind, ArrayLike, ArrayNamespace
+
+
+def _csr_from_keys(keys: ArrayLike, xp: ArrayNamespace) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
+    """(keys array over E rows) -> (unique_keys, group_offsets[U+1], row_positions[E]).
+
+    row_positions = the original row indices grouped (contiguously) by key value.
+    Fully vectorized: sorted unique NumPy keys directly form singleton buckets;
+    other inputs use argsort followed by a boundary scan.
+    """
+    E = int(keys.shape[0])
+    if E == 0:
+        empty = keys[:0]
+        return empty, xp.zeros(1, dtype=xp.int64), xp.zeros(0, dtype=xp.int64)
+    import numpy as np
+    if type(keys) is np.ndarray and xp is np and keys.dtype.kind in "iuf" and E > 1 and int(xp.count_nonzero(keys[1:] > keys[:-1])) == E - 1:
+        # Strict ordering proves the existing sort's identity permutation.
+        return keys.copy(), xp.arange(E + 1, dtype=xp.int64), xp.arange(E, dtype=xp.int64)
+    else:
+        order = xp.argsort(keys)
+        sorted_keys = keys[order]
+        row_positions = order.astype(xp.int64)
+    change = xp.ones(E, dtype=bool)
+    change[1:] = sorted_keys[1:] != sorted_keys[:-1]
+    starts = xp.nonzero(change)[0].astype(xp.int64)
+    unique_keys = sorted_keys[starts]
+    group_offsets = xp.concatenate([starts, xp.asarray([E], dtype=xp.int64)])
+    return unique_keys, group_offsets, row_positions
+
+
+
+def _non_null_id_rows(
+    frame: DataFrameT, columns: Sequence[str], engine: Engine, xp: ArrayNamespace,
+    *, exclude_nan: bool = False,
+) -> Tuple[DataFrameT, Optional[ArrayLike]]:
+    """Remove unlinked null ids before conversion; retain original row positions."""
+    if engine in (Engine.POLARS, Engine.POLARS_GPU):
+        import polars as pl
+
+        if not exclude_nan and columns and all(frame.get_column(column).null_count() == 0 for column in columns):
+            return frame, None
+        valid = frame.select(pl.all_horizontal(
+            pl.col(column).is_not_null() & pl.col(column).is_not_nan() if exclude_nan
+            else pl.col(column).is_not_null() for column in columns
+        )).to_series()
+        if bool(valid.all()):
+            return frame, None
+        positions = xp.nonzero(valid.to_numpy())[0]
+        return frame.filter(valid), positions
+    valid = frame[list(columns)].notna().all(axis=1)
+    if bool(valid.all()):
+        return frame, None
+    mask = valid.values if engine == Engine.CUDF else valid.to_numpy()
+    return frame[valid], xp.nonzero(mask)[0]
+
+
+def build_adjacency_index(
+    edges: DataFrameT,
+    kind: AdjacencyIndexKind,
+    key_col: str,
+    other_col: str,
+    edge_id_col: Optional[str],
+    engine: Engine,
+    fingerprint_cols: Tuple[str, ...],
+) -> AdjacencyIndex:
+    xp, backend = array_namespace(engine)
+    valid_edges, original_rows = _non_null_id_rows(edges, (key_col, other_col), engine, xp)
+    keys = col_to_array(valid_edges, key_col, engine)
+    other_values = col_to_array(valid_edges, other_col, engine)
+    unique_keys, group_offsets, row_positions = _csr_from_keys(keys, xp)
+    if original_rows is not None:
+        row_positions = original_rows[row_positions]
+        neighbors = xp.zeros(len(edges), dtype=other_values.dtype)
+        neighbors[original_rows] = other_values
+        other_values = neighbors
+    return AdjacencyIndex(
+        kind=kind,
+        key_col=key_col,
+        other_col=other_col,
+        edge_id_col=edge_id_col,
+        keys_sorted=unique_keys,
+        group_offsets=group_offsets,
+        row_positions=row_positions,
+        other_values=other_values,
+        backend=backend,
+        engine=engine,
+        fingerprint=frame_fingerprint(edges, fingerprint_cols, engine),
+        source_ref=cast(DataFrameT, edges),
+        n_edges=len(edges),
+        n_keys=int(unique_keys.shape[0]),
+    )
+
+
+def build_typed_adjacency_indexes(
+    edges: DataFrameT,
+    type_column: str,
+    type_value: PartitionValue,
+    src: str,
+    dst: str,
+    engine: Engine,
+    base_out: Optional[AdjacencyIndex],
+    base_in: Optional[AdjacencyIndex],
+) -> Tuple[Optional[AdjacencyIndex], Optional[AdjacencyIndex]]:
+    """Build the requested directions over one scalar type, retaining original edge positions.
+
+    Filtering uses the canonical engine predicate once at setup; querying still
+    applies the ordinary residual edge filter. Base indexes own the full-length
+    neighbor arrays, so typed sidecars add only their CSR arrays.
+    """
+    from graphistry.compute.filter_by_dict import filter_by_dict
+    from .registry import EDGE_IN_ADJ, EDGE_OUT_ADJ
+
+    xp, _ = array_namespace(engine)
+    columns = list(dict.fromkeys((src, dst, type_column)))
+    position_column = "__gfql_typed_edge_position__"
+    while position_column in edges.columns:
+        position_column += "_"
+    if engine in (Engine.POLARS, Engine.POLARS_GPU):
+        import polars as pl
+
+        if not isinstance(edges, pl.DataFrame):
+            raise TypeError("typed Polars adjacency requires an eager Polars edge frame")
+        positioned: DataFrameT = edges.select(columns).with_row_index(position_column)
+    else:
+        positioned = edges[columns].assign(
+            **{position_column: xp.arange(len(edges), dtype=xp.int64)}
+        )
+    matching = filter_by_dict(positioned, {type_column: type_value}, engine=engine.value)
+    # Stable int64 positions keep cross-hop edge identities comparable.
+    original_rows = xp.asarray(
+        col_to_array(matching, position_column, engine), dtype=xp.int64,
+    )
+    subset = (
+        matching.select([src, dst]) if engine in (Engine.POLARS, Engine.POLARS_GPU)
+        else matching[[src, dst]]
+    )
+    fingerprint = frame_fingerprint(edges, tuple(sorted(set(columns))), engine)
+    out = None
+    into = None
+    if base_out is not None:
+        built_out = build_adjacency_index(subset, EDGE_OUT_ADJ, src, dst, None, engine, (src, dst))
+        out = replace(
+            built_out,
+            row_positions=original_rows[built_out.row_positions],
+            other_values=base_out.other_values,
+            fingerprint=fingerprint,
+            source_ref=edges,
+        )
+    if base_in is not None:
+        built_in = build_adjacency_index(subset, EDGE_IN_ADJ, dst, src, None, engine, (src, dst))
+        into = replace(
+            built_in,
+            row_positions=original_rows[built_in.row_positions],
+            other_values=base_in.other_values,
+            fingerprint=fingerprint,
+            source_ref=edges,
+        )
+    return out, into
+
+
+def build_node_type_segment(
+    nodes: DataFrameT,
+    type_column: str,
+    type_value: PartitionValue,
+    engine: Engine,
+) -> NodePropIndex:
+    """Row positions of nodes matching one scalar/Boolean type value, as a
+    single-bucket :class:`NodePropIndex`.
+
+    The dual of the typed edge sidecar: the canonical engine predicate
+    (``filter_by_dict``) decides membership ONCE at setup, so segment selection is
+    parity-exact with the scan's node filter by construction — including null rows
+    (null == value filters out on the scan path, and the canonical predicate encodes
+    that here). Original node row positions are retained through a position column,
+    mirroring ``build_typed_adjacency_indexes``; the user's ``.nodes`` frame is never
+    reordered. Boolean label columns give MEMBERSHIP semantics (a node appears in
+    several segments); a scalar type column gives partition semantics — the storage
+    is the same either way.
+    """
+    from graphistry.compute.filter_by_dict import filter_by_dict
+
+    xp, backend = array_namespace(engine)
+    position_column = "__gfql_typed_node_position__"
+    while position_column in nodes.columns:
+        position_column += "_"
+    if engine in (Engine.POLARS, Engine.POLARS_GPU):
+        import polars as pl
+
+        if not isinstance(nodes, pl.DataFrame):
+            raise TypeError("typed Polars node segment requires an eager Polars node frame")
+        positioned: DataFrameT = nodes.select([type_column]).with_row_index(position_column)
+    else:
+        positioned = nodes[[type_column]].assign(
+            **{position_column: xp.arange(len(nodes), dtype=xp.int64)}
+        )
+    matching = filter_by_dict(positioned, {type_column: type_value}, engine=engine.value)
+    # Stable int64 positions preserve cross-hop node identities.
+    row_positions = xp.asarray(
+        col_to_array(matching, position_column, engine), dtype=xp.int64,
+    )
+    if engine == Engine.CUDF and isinstance(type_value, str):
+        # cupy cannot encode text; registry keys drive lookup, not keys_sorted.
+        import cudf  # type: ignore[import]
+
+        keys = cast(ArrayLike, cudf.Series([type_value]))
+    else:
+        keys = xp.asarray([type_value])
+    return NodePropIndex(
+        key_col=type_column,
+        keys_sorted=keys,
+        group_offsets=xp.asarray([0, int(row_positions.shape[0])], dtype=xp.int64),
+        row_positions=row_positions,
+        backend=backend,
+        engine=engine,
+        fingerprint=frame_fingerprint(nodes, (type_column,), engine),
+        source_ref=nodes,
+        n_nodes=len(nodes),
+        n_keys=1,
+        min_group_count=int(row_positions.shape[0]),
+    )
+
+
+def build_node_id_index(
+    nodes: DataFrameT,
+    node_col: str,
+    engine: Engine,
+) -> Optional[NodeIdIndex]:
+    """Sorted non-null node-id -> first-row index; None for duplicate non-null ids.
+
+    ``_csr_from_keys`` returns ``row_positions`` of length E (all rows, grouped by
+    key), but a node-id lookup indexes it with a *unique-key* searchsorted position
+    (0..U-1). Those align ONLY when keys are unique — so we (a) collapse to the FIRST
+    row position per unique key (``row_positions[group_offsets[:-1]]``, length U,
+    aligned with ``unique_keys``) and (b) REFUSE (return None) when ids aren't unique:
+    a unique-key CSR can't reproduce the scan's "all rows per id" semantics, so the
+    caller falls back to the correct ``select_by_ids`` isin path. (Regression guard: a non-unique
+    node-id index dropped reached nodes / emitted unrelated rows.)"""
+    xp, backend = array_namespace(engine)
+    valid_nodes, original_rows = _non_null_id_rows(nodes, (node_col,), engine, xp)
+    keys = col_to_array(valid_nodes, node_col, engine)
+    unique_keys, group_offsets, row_positions = _csr_from_keys(keys, xp)
+    n_keys = int(unique_keys.shape[0])
+    if n_keys != int(keys.shape[0]):
+        return None  # duplicate node ids -> not a valid unique index; scan fallback
+    first_row_per_key = row_positions[group_offsets[:-1]]  # length U, aligned to keys
+    if original_rows is not None:
+        first_row_per_key = original_rows[first_row_per_key]
+    return NodeIdIndex(
+        key_col=node_col,
+        keys_sorted=unique_keys,
+        row_positions=first_row_per_key,
+        backend=backend,
+        engine=engine,
+        fingerprint=frame_fingerprint(nodes, (node_col,), engine),
+        source_ref=nodes,
+        n_nodes=n_keys,
+    )
+
+
+def build_property_index(
+    nodes: DataFrameT,
+    column: str,
+    engine: Engine,
+) -> Optional[NodePropIndex]:
+    """Sorted property value -> frame row positions (CSR), or None when unindexable.
+
+    Duplicates are fine (CSR keeps every row per value) — this is the secondary
+    index, so the caller still applies the remaining predicates to the gathered
+    candidates. Text uses a native sorted dictionary with integer CSR codes,
+    including only non-null rows. Integer columns use their non-null values
+    directly. Categorical keys use native codes; timestamps use physical integer
+    candidates with their key dtype. Floats exclude NaNs and retain native
+    precision candidates with canonical residual comparisons. Boolean columns
+    index False/True keys directly. Other dtypes decline.
+    """
+    from .property_keys import (
+        bool_property_keys, bounded_string_key_positions, categorical_property_keys, float_property_keys, is_bool_property, is_categorical_property,
+        is_float_property, is_integer_property, is_string_property, is_timestamp_property, string_property_keys, timestamp_property_keys,
+    )
+
+    xp, backend = array_namespace(engine)
+    dictionary = None
+    category_dictionary = None
+    timestamp_dtype = None
+    original_rows = None
+    if is_categorical_property(nodes, column, engine):
+        valid_nodes, original_rows = _non_null_id_rows(nodes, (column,), engine, xp)
+        keys, dictionary, category_dictionary = categorical_property_keys(valid_nodes, column, engine)
+    elif is_timestamp_property(nodes, column, engine):
+        valid_nodes, original_rows = _non_null_id_rows(nodes, (column,), engine, xp)
+        keys, timestamp_dtype = timestamp_property_keys(valid_nodes, column, engine)
+    elif is_float_property(nodes, column, engine):
+        valid_nodes, original_rows = _non_null_id_rows(nodes, (column,), engine, xp, exclude_nan=True)
+        keys = float_property_keys(valid_nodes, column, engine)
+    elif is_string_property(nodes, column, engine):
+        valid_nodes, original_rows = _non_null_id_rows(nodes, (column,), engine, xp)
+        keys, dictionary = string_property_keys(valid_nodes, column, engine)
+    elif is_bool_property(nodes, column, engine):
+        valid_nodes, original_rows = _non_null_id_rows(nodes, (column,), engine, xp)
+        keys = bool_property_keys(valid_nodes, column, engine)
+    else:
+        valid_nodes = nodes
+        if is_integer_property(nodes, column, engine) and (
+            engine != Engine.PANDAS or not isinstance(nodes[column].dtype, np.dtype)
+        ) and (
+            engine != Engine.CUDF or nodes[column].null_count > 0
+        ):
+            # Primitive pandas integers and null-free cuDF columns need no null mask.
+            valid_nodes, original_rows = _non_null_id_rows(nodes, (column,), engine, xp)
+        try:
+            keys = col_to_array(valid_nodes, column, engine)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+    if str(keys.dtype.kind) not in ("i", "u", "f", "b"):  # numpy/cupy arrays always carry dtype.kind
+        return None
+    unique_keys, group_offsets, row_positions = _csr_from_keys(keys, xp)
+    if original_rows is not None:
+        row_positions = original_rows[row_positions]
+    string_key_positions, string_key_positions_bytes = bounded_string_key_positions(dictionary, engine)
+    return NodePropIndex(
+        key_col=column,
+        keys_sorted=unique_keys,
+        group_offsets=group_offsets,
+        row_positions=row_positions,
+        backend=backend,
+        engine=engine,
+        fingerprint=frame_fingerprint(nodes, (column,), engine),
+        source_ref=nodes,
+        string_keys=dictionary,
+        string_key_positions=string_key_positions,
+        string_key_positions_bytes=string_key_positions_bytes,
+        category_keys=category_dictionary,
+        timestamp_dtype=timestamp_dtype,
+        n_nodes=len(nodes),
+        n_keys=int(unique_keys.shape[0]),
+        min_group_count=int((group_offsets[1:] - group_offsets[:-1]).min()) if int(unique_keys.shape[0]) else 0,
+    )
+
+
+def build_node_prop_index(nodes: DataFrameT, column: str, engine: Engine) -> Optional[NodePropIndex]:
+    """Backward-compatible node property builder; edge properties use the same CSR."""
+    return build_property_index(nodes, column, engine)
+
+
+def build_col_stats_fact(
+    frame: DataFrameT,
+    column: str,
+    role: "ColStatsRole",
+    engine: Engine,
+) -> Optional[ColStatsFact]:
+    """Verified min/max/null-count fact for one column of the bound frame.
+
+    Declines (None) are decided by EXPLICIT preconditions -- column absent,
+    non-integer dtype (v1), empty frame -- never by swallowing exceptions: an
+    error raised by the reductions themselves is a real bug and PROPAGATES.
+    A null-bearing integer column still gets a fact (null_count recorded,
+    min/max omitted); consumers require null_count == 0 before trusting bounds,
+    so such a fact can only ever route to the scan. Widening the dtype gate
+    later is additive -- a decline only means "scan", never a wrong answer.
+    """
+    from graphistry.Engine import POLARS_ENGINES
+    n_unique: Optional[int] = None
+    if engine in POLARS_ENGINES:
+        pl_frame: Any = frame  # engine seam: polars frame rides DataFrameT
+        if column not in pl_frame.columns:
+            return None
+        s = pl_frame.get_column(column)
+        if not s.dtype.is_integer():
+            return None
+        if int(s.len()) == 0:
+            return None
+        null_count = int(s.null_count())
+        mn, mx = ((None, None) if null_count
+                  else (int(s.min()), int(s.max())))
+        if role == "nodes":
+            n_unique = int(s.n_unique())
+    else:
+        if column not in frame.columns:
+            return None
+        ser = frame[column]
+        if _dtype_kind(ser) not in ("i", "u"):
+            return None
+        if int(ser.shape[0]) == 0:
+            return None
+        null_count = int(ser.isna().sum())
+        mn, mx = ((None, None) if null_count
+                  else (int(ser.min()), int(ser.max())))
+        if role == "nodes":
+            n_unique = int(ser.nunique())
+    return ColStatsFact(
+        role=role,
+        column=column,
+        min_val=mn,
+        max_val=mx,
+        null_count=null_count,
+        is_integer=True,
+        engine=engine,
+        n_unique=n_unique,
+        fingerprint=frame_fingerprint(frame, (column,), engine),
+        source_ref=frame,
+    )
+
+
+_MAX_COL_STATS_PARTITIONS = 256
+
+#: Degree arrays are dense over [lo, hi], so a pathological interval would allocate
+#: far more than the graph needs; decline rather than allocate.
+_MAX_DEGREE_SPAN = 50_000_000
+
+
+def _dtype_kind(series: SeriesT) -> str:
+    """The numpy-style dtype kind letter: 'i'/'u' integer, 'f' float, 'b' bool,
+    'M' datetime, 'O' object and every extension dtype.
+
+    Always present: ``pandas.api.extensions.ExtensionDtype`` DEFINES ``kind``, so
+    every pandas and cudf dtype has one (measured: ArrowDtype, Interval, Period,
+    Sparse, Categorical, DatetimeTZ, and cudf's ListDtype/StructDtype/
+    Decimal128Dtype all report a kind). No default is needed.
+
+    pandas' ``is_integer_dtype`` and friends are NOT a substitute here: they
+    RAISE ``TypeError`` on cudf ``ListDtype`` (measured), which is precisely the
+    exotic dtype this module must DECLINE cleanly rather than crash on.
+    """
+    return str(series.dtype.kind)  # type: ignore[union-attr]  # engine seam: every backend dtype has .kind
+
+
+def _column_to_pylist(series: SeriesT, engine: Engine) -> List[PartitionValue]:
+    """Host-side values of a pandas/cudf column, dispatched on the ENGINE.
+
+    cudf crosses to the host via arrow rather than ``to_pandas()``, which
+    segfaults on string columns in some RAPIDS builds. The engine is already
+    known at every call site, so this dispatches on it instead of probing the
+    object for a ``to_arrow`` attribute.
+    """
+    if engine == Engine.CUDF:
+        return list(series.to_arrow().to_pylist())  # type: ignore[union-attr]  # engine seam: cudf only
+    return list(series.tolist())  # type: ignore[union-attr]  # engine seam: pandas only
+
+
+def _type_column_is_scalar(frame: DataFrameT, type_column: str, engine: Engine) -> bool:
+    """True iff the type column holds SCALARS we can key a partition on.
+
+    List/struct-valued type columns (GFQL's ``labels`` list convention, which
+    ``resolve_filter_column`` rewrites ``label__X`` into) are not equality-
+    addressable: a query never produces a list-valued partition key, so a fact
+    built on one could never be consulted. pandas raises ``unhashable type`` on
+    such a groupby while polars happily groups by list -- so this is an EXPLICIT
+    precondition on both engines rather than an engine-dependent accident.
+    """
+    from graphistry.Engine import POLARS_ENGINES
+    if engine in POLARS_ENGINES:
+        import polars as pl
+        dtype: Any = frame.get_column(type_column).dtype  # engine seam
+        return not isinstance(dtype, (pl.List, pl.Array, pl.Struct, pl.Object))
+    series = frame[type_column]
+    if _dtype_kind(series) not in ("O", "S", "U"):
+        return True  # numeric/bool/datetime dtypes are scalar by construction
+    non_null = series.dropna()
+    if int(non_null.shape[0]) == 0:
+        return True
+    sample = _column_to_pylist(non_null.head(1), engine)
+    return not isinstance(sample[0], (list, tuple, set, dict, bytearray))
+
+
+def build_col_stats_facts_by_type(
+    frame: DataFrameT,
+    columns: Sequence[str],
+    role: "ColStatsRole",
+    type_column: str,
+    engine: Engine,
+) -> List[ColStatsFact]:
+    """One fact per (column, type value), from a SINGLE grouped pass over ALL columns.
+
+    Multi-type graphs defeat whole-frame facts: an interval over every node id
+    says nothing about the ids of one label, so bound proofs that a homogeneous
+    graph passes fail outright. Partition facts restore them per label, and a
+    partition fact upper-bounds any further-filtered subset of that partition --
+    the same conservative direction as the whole-frame fact.
+
+    ``columns`` is a SEQUENCE because the edge role needs facts on both endpoint
+    bindings: aggregating them together is ONE pass over the edge frame instead
+    of one per endpoint.
+
+    Declines (empty list) are decided by EXPLICIT preconditions -- a column
+    absent, a non-integer or null-bearing value column, a float/null/list-valued
+    type column (neither NaN nor list group keys are equality-addressable), an
+    empty frame, or more than ``_MAX_COL_STATS_PARTITIONS`` distinct types --
+    never by swallowing exceptions: an error raised by the aggregation itself is
+    a real bug and PROPAGATES. The decline is ALL-OR-NOTHING across ``columns``,
+    so a caller cannot receive a partial answer and mistake it for a complete
+    one. Null-bearing value columns are declined rather than recorded with
+    ``null_count > 0`` (as the whole-frame builder does) because consumers require
+    zero nulls before trusting bounds, so such facts could only ever route to the
+    scan they were built to avoid.
+    """
+    from graphistry.Engine import POLARS_ENGINES
+    cols = list(dict.fromkeys(columns))  # de-dup, preserve caller order
+    if not cols:
+        return []
+    # Fingerprint PER COLUMN, even though the aggregation is shared: validity is
+    # checked per fact by get_col_stats_valid, which recomputes it over exactly
+    # {column, type_column}. Spanning every aggregated column here would make
+    # each fact look stale on lookup -- caught by the engagement pins.
+    fingerprints = {c: frame_fingerprint(frame, tuple(sorted({c, type_column})), engine)
+                    for c in cols}
+    want_unique = role == "nodes"
+
+    def fact(column: str, type_value: PartitionValue, mn: int, mx: int,
+             n_unique: Optional[int]) -> ColStatsFact:
+        return ColStatsFact(
+            role=role, column=column, min_val=mn, max_val=mx,
+            null_count=0, is_integer=True, engine=engine,
+            n_unique=n_unique, type_column=type_column, type_value=type_value,
+            fingerprint=fingerprints[column], source_ref=frame,
+        )
+
+    facts: List[ColStatsFact] = []
+    if engine in POLARS_ENGINES:
+        import polars as pl
+        pl_frame: Any = frame  # engine seam: polars frame rides DataFrameT
+        if type_column not in pl_frame.columns or any(c not in pl_frame.columns for c in cols):
+            return []
+        for c in cols:
+            values = pl_frame.get_column(c)
+            if not values.dtype.is_integer() or int(values.null_count()) > 0:
+                return []
+        if not _type_column_is_scalar(frame, type_column, engine):
+            return []
+        types = pl_frame.get_column(type_column)
+        if types.dtype.is_float() or int(types.null_count()) > 0:
+            return []
+        if int(pl_frame.height) == 0 or int(types.n_unique()) > _MAX_COL_STATS_PARTITIONS:
+            return []
+        aggs = []
+        for c in cols:
+            aggs += [pl.col(c).min().alias(f"{c}__mn"), pl.col(c).max().alias(f"{c}__mx")]
+            if want_unique:
+                aggs.append(pl.col(c).n_unique().alias(f"{c}__nu"))
+        for row in pl_frame.group_by(type_column).agg(aggs).iter_rows(named=True):
+            for c in cols:
+                facts.append(fact(c, row[type_column], int(row[f"{c}__mn"]), int(row[f"{c}__mx"]),
+                                  int(row[f"{c}__nu"]) if want_unique else None))
+        return facts
+
+    if type_column not in frame.columns or any(c not in frame.columns for c in cols):
+        return []
+    for c in cols:
+        values_ser = frame[c]
+        if _dtype_kind(values_ser) not in ("i", "u") or int(values_ser.isna().sum()) > 0:
+            return []
+    if not _type_column_is_scalar(frame, type_column, engine):
+        return []
+    types_ser = frame[type_column]
+    if _dtype_kind(types_ser) == "f" or int(types_ser.isna().sum()) > 0:
+        return []
+    if int(frame.shape[0]) == 0 or int(types_ser.nunique()) > _MAX_COL_STATS_PARTITIONS:
+        return []
+    names = ["min", "max"] + (["nunique"] if want_unique else [])
+    # ONE grouped pass over every value column. MultiIndex agg columns are
+    # flattened to "<col>__<agg>" so the read-back is engine-uniform (cudf too).
+    grouped = frame.groupby(type_column, sort=False)[cols].agg(names).reset_index()
+    grouped.columns = [type_column if (c[0] == type_column or not c[1]) else f"{c[0]}__{c[1]}"
+                       for c in grouped.columns.to_flat_index()]
+    read = {name: _column_to_pylist(grouped[name], engine) for name in grouped.columns}
+    for i, type_value in enumerate(read[type_column]):
+        for c in cols:
+            facts.append(fact(c, type_value, int(read[f"{c}__min"][i]), int(read[f"{c}__max"][i]),
+                              int(read[f"{c}__nunique"][i]) if want_unique else None))
+    return facts
+
+
+def build_degree_fact(
+    edges: DataFrameT,
+    src_col: str,
+    dst_col: str,
+    lo: int,
+    hi: int,
+    engine: Engine,
+    type_column: Optional[str] = None,
+    type_value: Optional[PartitionValue] = None,
+) -> Optional[DegreeFact]:
+    """In/out degree over ``edges``, indexed by node id - ``lo`` across [lo, hi].
+
+    Lets the two-hop count kernel answer with ``dot(indeg, outdeg)`` -- O(N) --
+    instead of an O(E) bincount plus gather. The arrays cover exactly the dense
+    interval the kernel already proves, so ids outside it are not representable;
+    that is why the interval is a parameter rather than derived here.
+
+    Declines (None) by explicit precondition -- absent column, non-integer or
+    null-bearing endpoints, an endpoint outside [lo, hi], or an interval wider
+    than ``_MAX_DEGREE_SPAN``. An endpoint outside the interval is a DECLINE and
+    not a clamp: clamping would silently miscount.
+    """
+    xp, backend = array_namespace(engine)
+    for col in (src_col, dst_col):
+        if col not in edges.columns:
+            return None
+    if hi < lo or (hi - lo + 1) > _MAX_DEGREE_SPAN:
+        return None
+    _, null_free_rows = _non_null_id_rows(edges, (src_col, dst_col), engine, xp)
+    if null_free_rows is not None:
+        return None
+    src = col_to_array(edges, src_col, engine)
+    dst = col_to_array(edges, dst_col, engine)
+    for arr in (src, dst):
+        if str(getattr(arr.dtype, "kind", "")) not in ("i", "u"):
+            return None
+        if int(arr.shape[0]) and (int(arr.min()) < lo or int(arr.max()) > hi):
+            return None  # outside the proved interval: decline, never clamp
+    n = hi - lo + 1
+    indeg = xp.bincount(dst - lo, minlength=n)
+    outdeg = xp.bincount(src - lo, minlength=n)
+    cols = tuple(sorted({src_col, dst_col} | ({type_column} if type_column else set())))
+    return DegreeFact(
+        src_col=src_col, dst_col=dst_col, indeg=indeg, outdeg=outdeg, lo=lo, hi=hi,
+        backend=backend, engine=engine, self_loops=int((src == dst).sum()),
+        type_column=type_column, type_value=type_value,
+        fingerprint=frame_fingerprint(edges, cols, engine), source_ref=edges,
+    )
+
+
+#: Above this many distinct values a column is not a category: the code map stops
+#: paying for itself and the predicate is better served by the canonical filter.
+_MAX_CATEGORY_VALUES = 64
+#: The sketch may only decline this far above the cap, so its error never moves the cap.
+_CATEGORY_SKETCH_MARGIN = 4
+
+
+def build_category_index(
+    frame: DataFrameT,
+    column: str,
+    role: ColStatsRole,
+    engine: Engine,
+) -> Optional[CategoryIndex]:
+    """Per-row integer codes for a low-cardinality column, or None when unindexable.
+
+    Serves scalar-equality predicates (``{label__Person: True}``, ``{type: "KNOWS"}``)
+    by comparing gathered codes instead of filtering a frame. Nulls ARE coded, under a
+    reserved code never handed out for a queried value, which is what makes the
+    null-heavy ``label__*`` columns indexable at all. Declines high cardinality and any
+    dtype outside Boolean, integer and string. Polars only for now; the other engines
+    keep the canonical filter, which is the same answer.
+    """
+    if engine != Engine.POLARS:
+        return None
+    import polars as pl
+
+    if column not in frame.columns:
+        return None
+    try:
+        series = frame.get_column(column)  # type: ignore[operator]
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+    dtype = series.dtype
+    if not (dtype == pl.Boolean or dtype.is_integer() or dtype in (pl.String, pl.Categorical)):
+        return None
+    _, backend = array_namespace(engine)
+    # Everything near the cap is still decided by the exact pass below.
+    try:
+        if int(series.approx_n_unique()) > _CATEGORY_SKETCH_MARGIN * _MAX_CATEGORY_VALUES:
+            return None
+    except (AttributeError, TypeError, ValueError):
+        pass
+    distinct = series.unique()
+    if distinct.len() > _MAX_CATEGORY_VALUES:
+        return None
+    values = sorted(value for value in distinct.to_list() if value is not None)
+    # A reserved null code is never handed out for a queried value, so nulls match nothing.
+    null_code = len(values)
+    value_codes: dict = {value: code for code, value in enumerate(values)}
+    mapping = pl.DataFrame(
+        {column: pl.Series(values, dtype=dtype), "__gfql_code__": list(range(len(values)))}
+    )
+    joined = frame.select([column]).join(mapping, on=column, how="left")  # type: ignore[operator]
+    code_series = joined.get_column("__gfql_code__").fill_null(null_code)
+    codes = code_series.to_numpy().astype("uint16" if null_code > 254 else "uint8")
+    return CategoryIndex(
+        role=role, column=column, codes=codes, value_codes=value_codes,
+        backend=backend, engine=engine, n_rows=int(series.len()),
+        fingerprint=frame_fingerprint(frame, (column,), engine), source_ref=frame,
+    )
+
+
+def build_endpoint_rows_fact(
+    edges: DataFrameT,
+    nodes: DataFrameT,
+    src_col: str,
+    dst_col: str,
+    node_index: NodeIdIndex,
+    engine: Engine,
+) -> Optional[EndpointRowsFact]:
+    """Node row position of each edge endpoint, or None when any endpoint is unresolvable.
+
+    Resolves both endpoint columns through the node id index once, so a traversal that
+    has an edge row already has its endpoints' node rows. Declines when an endpoint id
+    is absent from the index or either column carries nulls, because a row that denotes
+    no node would be worse than the search it replaces. Polars only, matching its only
+    consumer: building it for an engine that cannot read it is pure cost.
+    """
+    if engine != Engine.POLARS:
+        return None
+    xp, backend = array_namespace(engine)
+    keys = node_index.keys_sorted
+    total_keys = int(keys.shape[0])
+    if total_keys == 0:
+        return None
+    resolved = []
+    for column in (src_col, dst_col):
+        try:
+            values = col_to_array(edges, column, engine)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+        if str(values.dtype.kind) not in ("i", "u"):  # numpy/cupy arrays always carry dtype.kind
+            return None
+        probe = values
+        probe_keys = keys
+        if probe.dtype != probe_keys.dtype:
+            common = xp.promote_types(probe.dtype, probe_keys.dtype)  # promote, never narrow
+            probe = probe.astype(common)
+            probe_keys = probe_keys.astype(common)
+        position = xp.searchsorted(probe_keys, probe)
+        clipped = xp.minimum(position, total_keys - 1)
+        if int(xp.count_nonzero(probe_keys[clipped] == probe)) != int(probe.shape[0]):
+            return None  # an endpoint with no node row: decline rather than point at one
+        resolved.append(node_index.row_positions[clipped])
+    return EndpointRowsFact(
+        src_col=src_col, dst_col=dst_col, node_col=node_index.key_col,
+        src_rows=resolved[0], dst_rows=resolved[1], backend=backend, engine=engine,
+        edges_fingerprint=frame_fingerprint(edges, tuple(sorted({src_col, dst_col})), engine),
+        nodes_fingerprint=frame_fingerprint(nodes, (node_index.key_col,), engine),
+        edges_ref=edges, nodes_ref=nodes,
+    )
+
+
+def build_temporal_text_fact(
+    frame: DataFrameT,
+    role: ColStatsRole,
+    engine: Engine,
+) -> Optional[TemporalTextFact]:
+    """Per String column, whether it holds Cypher temporal-constructor text.
+
+    One scan per column at build time answers what the projection guard otherwise asks
+    of every projected result. A frame with no String columns yields an empty verdict
+    map, which is still a useful fact: it says no projection of it can leak that text.
+    """
+    if engine != Engine.POLARS:
+        return None
+    import polars as pl
+
+    from graphistry.compute.gfql.temporal.constructors import TEMPORAL_CALL_EXPR_RE
+
+    try:
+        schema = frame.schema  # type: ignore[union-attr]
+    except (AttributeError, TypeError):
+        return None
+    columns = [str(name) for name, dtype in schema.items() if dtype == pl.String]
+    pattern = r"^\s*" + TEMPORAL_CALL_EXPR_RE.pattern
+    verdicts = {}
+    if columns:
+        try:
+            row = frame.select(  # type: ignore[operator]
+                [pl.col(column).str.contains(pattern).any().alias(column) for column in columns]
+            ).row(0)
+        except Exception:
+            return None
+        verdicts = {column: bool(value) for column, value in zip(columns, row)}
+    return TemporalTextFact(
+        role=role, verdicts=verdicts, engine=engine,
+        fingerprint=frame_fingerprint(frame, tuple(sorted(verdicts)), engine),
+        source_ref=frame,
+    )

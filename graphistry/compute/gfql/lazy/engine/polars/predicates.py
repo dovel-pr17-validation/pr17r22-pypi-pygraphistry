@@ -1,0 +1,822 @@
+"""Vectorized polars filter_by_dict for the native polars GFQL engine.
+
+Common comparison/membership/string/null predicates lower to native polars expressions.
+NO-CHEATING contract: no pandas bridge — a predicate with no native lowering raises
+NotImplementedError (bridging one column would misrepresent pandas semantics as polars and
+break columnar/GPU assumptions; use engine='pandas'). Filtering uses native expressions
+or Series operations. Small eager CPU frames can use scalar equalities when their storage
+and filter types agree.
+"""
+from __future__ import annotations
+
+import operator
+import re
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Tuple, TypeVar, Union
+
+from graphistry.compute.predicates.ASTPredicate import ASTPredicate
+from graphistry.compute.predicates.is_in import IsIn
+from graphistry.compute.predicates.str import Contains, Endswith, Fullmatch, Match, Startswith
+from graphistry.compute.filter_by_dict import resolve_filter_column_or_absent
+from graphistry.compute.gfql.strictness import absent_column_matches
+from .dtypes import is_numeric as _dtype_numeric, is_stringlike as _dtype_stringlike
+
+if TYPE_CHECKING:
+    import datetime
+    import pandas as pd
+    import polars as pl
+
+    # Constrained TypeVar keeps eager DataFrame / lazy LazyFrame flavor through `.filter`.
+    PolarsFrameT = TypeVar("PolarsFrameT", "pl.DataFrame", "pl.LazyFrame")
+
+# Cypher RHS is dynamic: scalar or GFQL temporal, matched structurally without imports.
+CmpValue = Union[int, float, str, bool, "datetime.date", "datetime.time", Any]
+
+# Python-`re` features Rust regex (polars) rejects or evaluates differently: lookaround
+# ((?=/(?!/(?<=/(?<!) and backreferences (\\1, (?P=name), \\k<name>) — ComputeError or silent
+# difference, so such patterns decline (NIE), never guess; pandas evaluates them with Python `re`.
+_REGEX_RUST_INCOMPAT = re.compile(r"\(\?<?[=!]|\\[1-9]|\(\?P=|\\k<")
+
+
+def _regex_rust_incompatible(pat: str) -> bool:
+    return _REGEX_RUST_INCOMPAT.search(pat) is not None
+
+
+def _homogeneous_scalar_category(opts: List[Any]) -> Optional[str]:
+    """The single value-category (num/str/bool) of a literal list, else None (mixed/empty).
+    polars ``is_in`` raises on a cross-type list, so a non-homogeneous IN must decline (NIE)."""
+    def _cat(o: Any) -> Optional[str]:
+        if isinstance(o, bool):
+            return "bool"
+        if isinstance(o, (int, float)):
+            return "num"
+        if isinstance(o, str):
+            return "str"
+        return None
+    cats = {_cat(o) for o in opts}
+    return next(iter(cats)) if (len(cats) == 1 and None not in cats) else None
+
+
+# Comparison callables predicates declare (op = staticmethod(operator.gt) etc.); pl.Expr
+# implements Python rich comparison so op(lhs, rhs) builds exactly `lhs > rhs`/... . Ops outside
+# this whitelist have no proven lowering and fall through to the decline paths.
+_CMP_OPS = frozenset({operator.gt, operator.lt, operator.ge, operator.le, operator.eq, operator.ne})
+_ORDER_OPS = frozenset({operator.gt, operator.lt, operator.ge, operator.le})
+
+
+def _orders_boolean_column_against_number(op: object, val: object, dtype: "Optional[pl.DataType]") -> bool:
+    """Ordering a Boolean column against a number: incomparable, so it never satisfies.
+
+    Equality is not ordering and stays served.
+    """
+    if op not in _ORDER_OPS or isinstance(val, bool) or not isinstance(val, (int, float)):
+        return False
+    import polars as pl
+    return dtype == pl.Boolean
+
+
+def _dtype_is_temporal(dtype: "Optional[pl.DataType]") -> bool:
+    import polars as pl
+    return dtype is not None and (
+        isinstance(dtype, (pl.Datetime, pl.Duration)) or dtype == pl.Date or dtype == pl.Time
+    )
+
+
+def _utc_timestamp_count(ts: "pd.Timestamp", time_unit: str) -> Optional[int]:
+    """Encode a timestamp as the exact integer count at a Polars datetime unit."""
+    import datetime as _dt
+    utc = ts.tz_convert("UTC") if ts.tzinfo is not None else ts.tz_localize("UTC")
+    days = (utc.date() - _dt.date(1970, 1, 1)).days
+    secs = days * 86400 + utc.hour * 3600 + utc.minute * 60 + utc.second
+    frac_ns = utc.microsecond * 1000 + utc.nanosecond
+    scale = {"s": 10**9, "ms": 10**6, "us": 10**3, "ns": 1}[time_unit]
+    if frac_ns % scale != 0:
+        return None
+    count = secs * (10**9 // scale) + frac_ns // scale
+    if not (-(2**63) <= count <= 2**63 - 1):
+        return None
+    return count
+
+
+def _parse_temporal_filter_scalar(
+    val: str, dtype: "pl.DataType"
+) -> "Optional[Union[datetime.date, datetime.time, datetime.datetime, datetime.timedelta]]":
+    """The python temporal scalar a TEMPORAL column can compare ``val`` against, or None.
+
+    Parses with pandas (``pd.Timestamp`` / ``pd.to_timedelta``) — the SAME parse pandas
+    comparison ops apply to a string operand, so the compared instant is
+    parity-equal by construction. SAFE subset only: a NAIVE Datetime column takes a
+    naive parse (tz-suffixed text and sub-microsecond precision decline — pandas
+    itself raises/zero-rows on the tz mix), Duration takes a ``to_timedelta`` parse,
+    Date/Time take exact ISO parses. None means not comparable, so the caller
+    raises the typed schema error."""
+    import datetime as _dt
+    import pandas as pd
+    import polars as pl
+    try:
+        if isinstance(dtype, pl.Datetime):
+            if dtype.time_zone is not None:
+                return None
+            ts = pd.Timestamp(val)
+            if ts.tz is not None or ts.nanosecond != 0:
+                return None
+            return ts.to_pydatetime()
+        if isinstance(dtype, pl.Duration):
+            td = pd.to_timedelta(val)
+            if td.nanoseconds % 1000 != 0:
+                return None
+            return td.to_pytimedelta()
+        if dtype == pl.Date:
+            return _dt.date.fromisoformat(val)
+        if dtype == pl.Time:
+            return _dt.time.fromisoformat(val)
+    except (ValueError, TypeError):
+        return None
+    return None
+
+
+def _raise_temporal_str_mismatch(col: str, dtype: "pl.DataType", val: str) -> None:
+    from graphistry.compute.exceptions import ErrorCode, GFQLSchemaError
+    raise GFQLSchemaError(
+        ErrorCode.E302,
+        f'Type mismatch: column "{col}" is temporal ({dtype}) but filter value is a '
+        f'string it cannot be compared to',
+        field=col,
+        value=val,
+        column_type=str(dtype),
+        suggestion='Use matching temporal text (e.g. a naive ISO datetime for a naive '
+                   'datetime column) or a temporal value such as date(...)',
+    )
+
+
+def _raise_temporal_member_mismatch(col: str, dtype: "pl.DataType", value: object) -> None:
+    from graphistry.compute.exceptions import ErrorCode, GFQLSchemaError
+    raise GFQLSchemaError(
+        ErrorCode.E302,
+        f'Type mismatch: column "{col}" is temporal ({dtype}) but filter value is not comparable',
+        field=col,
+        value=value,
+        column_type=str(dtype),
+        suggestion='Use matching temporal values with the same timezone contract',
+    )
+
+
+def _temporal_membership_expr(
+    col: str, values: List[object], dtype: "Optional[pl.DataType]",
+) -> "pl.Expr":
+    """Coerce temporal members of a Polars datetime column with the pandas contract."""
+    import datetime as _dt
+    import pandas as pd
+    import polars as pl
+    from graphistry.compute.ast_temporal import TemporalValue
+    from graphistry.compute.filter_by_dict import _coerce_temporal_filter_scalar
+
+    if not isinstance(dtype, pl.Datetime):
+        return pl.col(col).is_in(values)
+    if dtype.time_zone is None:
+        pandas_dtype = pd.api.types.pandas_dtype(f"datetime64[{dtype.time_unit}]")
+    else:
+        pandas_dtype = pd.DatetimeTZDtype(dtype.time_unit, dtype.time_zone)
+
+    def _coerce_member(value: object) -> Tuple[str, object]:
+        if value is None:
+            return "null", None
+        if isinstance(value, str):
+            value = _coerce_temporal_filter_scalar(value, pandas_dtype, field=col)
+        elif isinstance(value, TemporalValue):
+            value = value.as_pandas_value()
+        elif isinstance(value, (_dt.datetime, _dt.date)):
+            value = pd.Timestamp(value)
+        if value is pd.NaT:
+            return "no_match", None
+        if not isinstance(value, pd.Timestamp):
+            _raise_temporal_member_mismatch(col, dtype, value)
+
+        ts = pd.Timestamp(value)
+        if dtype.time_zone is None:
+            if ts.tzinfo is not None:
+                return "no_match", None
+        elif ts.tzinfo is None:
+            return "no_match", None
+        if isinstance(ts, pd.Timestamp):
+            count = _utc_timestamp_count(ts, dtype.time_unit)
+            if count is None:
+                return "no_match", None
+            return "exact", count
+
+        return "no_match", None
+
+    col_utc = (
+        pl.col(col).dt.replace_time_zone("UTC")
+        if dtype.time_zone is None
+        else pl.col(col).dt.convert_time_zone("UTC")
+    )
+
+    members = [_coerce_member(value) for value in values]
+    if not members:
+        return pl.lit(False)
+    exact_counts = [count for kind, count in members if kind == "exact"]
+    if exact_counts:
+        return col_utc.dt.replace_time_zone(None).cast(pl.Int64).is_in(exact_counts)
+    if any(kind == "null" for kind, _ in members):
+        return pl.lit(None, dtype=pl.Boolean)
+    return pl.lit(False)
+
+
+def _temporal_str_cmp_expr(
+    col: str,
+    col_expr: "pl.Expr",
+    op: "Callable[[pl.Expr, pl.Expr], pl.Expr]",
+    val: str,
+    dtype: "pl.DataType",
+) -> "pl.Expr":
+    """Temporal column vs string comparison: parse-and-compare in the SAFE subset,
+    typed GFQLSchemaError otherwise — never a raw polars error."""
+    import polars as pl
+    parsed = _parse_temporal_filter_scalar(val, dtype)
+    if parsed is None:
+        _raise_temporal_str_mismatch(col, dtype, val)
+    return op(col_expr, pl.lit(parsed))
+
+
+def _raise_numeric_temporal_mismatch(
+    col: str, dtype: "pl.DataType", val: CmpValue
+) -> None:
+    from graphistry.compute.exceptions import ErrorCode, GFQLSchemaError
+
+    coercion = (
+        "Use a matching temporal value/text, or an explicit UTC epoch instant "
+        '{"type": "datetime", "value": <count>, "unit": "s"|"ms"}; a numeric '
+        "bound is never implicitly an instant"
+    )
+    raise GFQLSchemaError(
+        ErrorCode.E302,
+        f'Type mismatch: column "{col}" is temporal ({dtype}) but filter value is numeric',
+        field=col,
+        value=val,
+        column_type=str(dtype),
+        suggestion=coercion,
+    )
+
+
+def _cmp_expr(
+    col_expr: "pl.Expr",
+    op: Callable[[Any, Any], Any],
+    val: CmpValue,
+    dtype: "Optional[pl.DataType]" = None,
+    col: str = "",
+) -> "Optional[pl.Expr]":
+    import datetime as _dt
+
+    # Numeric bounds never implicitly become instants: typed GFQLSchemaError, matching
+    # the pandas E302 contract. Explicit epoch instants arrive as DateTimeValue values.
+    import numpy as np
+    if (
+        isinstance(val, (int, float, np.number))
+        and not isinstance(val, bool)
+        and _dtype_is_temporal(dtype)
+        and dtype is not None
+    ):
+        _raise_numeric_temporal_mismatch(col, dtype, val)
+
+    # DateTimeValue lowering (typed datetime instants, incl. tz-aware values and the
+    # explicit-epoch UTC contract): compare naive-UTC instants on both sides, matching
+    # pandas _prepare_temporal_series semantics exactly — a naive column is read as
+    # UTC (tz_localize('UTC')), an aware column is converted, and the scalar is the
+    # instant in UTC. The bound literal is an exact integer epoch count cast at the
+    # column's time unit: no pydatetime conversion, so sub-microsecond (ns) precision
+    # is preserved. A bound finer than the column resolution (or beyond i64 at that
+    # resolution) cannot be represented exactly -> decline (NIE), never round.
+    if type(val).__name__ == "DateTimeValue":
+        import polars as pl
+        if isinstance(dtype, pl.Datetime) and op in _CMP_OPS:
+            ts = val.as_pandas_value()  # type: ignore[union-attr]
+            count = _utc_timestamp_count(ts, dtype.time_unit)
+            if count is None:
+                return None
+            bound = pl.lit(count).cast(pl.Int64).cast(pl.Datetime(dtype.time_unit))
+            if dtype.time_zone is None:
+                col_utc = col_expr.dt.replace_time_zone("UTC")
+            else:
+                col_utc = col_expr.dt.convert_time_zone("UTC")
+            return op(col_utc.dt.replace_time_zone(None), bound)
+        # Date/Time/Duration columns cannot compare a datetime instant -> decline
+        return None
+
+    # Native temporal SAFE SUBSET: DateValue (Cypher date('YYYY-MM-DD') / p.gt(date(...))) vs a
+    # NAIVE pl.Datetime column. pandas oracle: s.dt.date compared to the tz-free python date
+    # (DateValue._parsed); col_expr.dt.date() <op> pl.lit(date) is the exact equivalent — same
+    # calendar-date truncation, no tz on either side, parity provable. REQUIRE dtype (from the
+    # frame schema) to prove naive Datetime, else fall through to the decline. All else declines:
+    # tz-tagged DateTimeValue (always carries tz; pandas tz_localize/convert), TimeValue,
+    # tz-aware columns, raw python datetimes — each risks a silent tz/semantic mismatch.
+    if type(val).__name__ == "DateValue":
+        import polars as pl
+        d = getattr(val, "_parsed", None)
+        if (
+            isinstance(dtype, pl.Datetime) and dtype.time_zone is None
+            and isinstance(d, _dt.date) and not isinstance(d, _dt.datetime)
+        ):
+            if op in _CMP_OPS:
+                return op(col_expr.dt.date(), pl.lit(d))
+        # naive-Datetime parity unprovable here -> fall through to the decline below.
+
+    # decline (NIE): remaining temporal values (datetime/time/TemporalValue etc.) have no SAFE
+    # polars-literal comparison — returning `col > TemporalValue` would be a non-None broken expr
+    # erroring at df.filter (or silently misordering). Tracked feature gap; numeric/string
+    # vals unaffected.
+    if isinstance(val, (_dt.date, _dt.datetime, _dt.time)) or type(val).__name__ in (
+        "TemporalValue", "Timestamp", "Timedelta", "datetime64",
+        "DateTimeValue", "TimeValue", "DateValue",
+    ):
+        return None
+    # Documented residual: only a natively-built polars frame holding a RAW NaN diverges from pandas.
+    if _orders_boolean_column_against_number(op, val, dtype):
+        import polars as pl
+        return pl.lit(False)
+    # Temporal column vs raw string raises InvalidOperationError at collect; parse-or-typed-error instead.
+    if isinstance(val, str) and _dtype_is_temporal(dtype) and op in _CMP_OPS:
+        assert dtype is not None
+        return _temporal_str_cmp_expr(col, col_expr, op, val, dtype)
+    if op in _CMP_OPS:
+        return op(col_expr, val)
+    return None
+
+
+def _inline_regex_flag_prefix(case: bool, flags: int) -> str:
+    """Translate pandas-style `re` flags int + case bool to a Rust-regex inline prefix like
+    ``(?im)`` (empty when nothing applies), keeping the polars regex lowering faithful to pandas."""
+    letters = ""
+    if not case or (flags & re.IGNORECASE):
+        letters += "i"
+    if flags & re.MULTILINE:
+        letters += "m"
+    if flags & re.DOTALL:
+        letters += "s"
+    if flags & re.VERBOSE:
+        letters += "x"
+    return f"(?{letters})" if letters else ""
+
+
+def predicate_to_expr(col: str, pred: ASTPredicate, dtype: "Optional[pl.DataType]" = None) -> "Optional[pl.Expr]":
+    """Lower an ASTPredicate to a polars boolean expression, or None if unsupported. ``dtype`` =
+    schema dtype of ``col`` (None if unknown), letting the temporal lowering prove a NAIVE
+    Datetime column before lowering a DateValue comparison (else decline)."""
+    import polars as pl
+
+    c = pl.col(col)
+    name = type(pred).__name__
+
+    op = getattr(pred, "op", None)
+    if op is not None and hasattr(pred, "val"):
+        expr = _cmp_expr(c, op, pred.val, dtype, col)
+        if expr is not None:
+            return expr
+
+    if name == "Between" and hasattr(pred, "lower") and hasattr(pred, "upper"):
+        lo, hi = pred.lower, pred.upper
+        inclusive = getattr(pred, "inclusive", True)
+        if isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
+            lo_expr = _cmp_expr(
+                c, operator.ge if inclusive else operator.gt,
+                lo, dtype, col,
+            )
+            hi_expr = _cmp_expr(
+                c, operator.le if inclusive else operator.lt,
+                hi, dtype, col,
+            )
+            if lo_expr is not None and hi_expr is not None:
+                return lo_expr & hi_expr
+        # Temporal Between: pandas evaluates as GE/LE (inclusive) or GT/LT (exclusive)
+        # sub-predicates, and each endpoint compare _cmp_expr already lowers with proven
+        # parity (DateValue date-truncation, DateTimeValue naive-UTC instants) — composing
+        # the two endpoint compares adds NO new proof obligation. Both endpoints must lower
+        # or _cmp_expr returns None -> honest NIE (TimeValue, raw datetime, mixed bounds,
+        # non-Datetime dtype all decline this way — never a silent mismatch).
+        lo_expr = _cmp_expr(c, operator.ge if inclusive else operator.gt, lo, dtype, col)
+        hi_expr = _cmp_expr(c, operator.le if inclusive else operator.lt, hi, dtype, col)
+        if lo_expr is not None and hi_expr is not None:
+            return lo_expr & hi_expr
+
+    if name == "IsIn" and hasattr(pred, "options"):
+        opts = list(pred.options)
+        # Only non-empty single-category literal lists are parity-safe: is_in raises ComputeError
+        # on a cross-type list ([1, 'a'] over Int), so mixed/empty declines (NIE) — matching the
+        # row-pipeline _lower_in discipline.
+        if opts and _homogeneous_scalar_category(opts) is not None:
+            return c.is_in(opts)
+        return None
+
+    if name == "AllOf" and hasattr(pred, "predicates"):
+        # Conjunction (n.val > 20 AND n.val < 90 folds to AllOf[GT, LT]): lower each child and
+        # AND them; if ANY child can't lower, the whole predicate can't (caller NIEs).
+        child_exprs = [predicate_to_expr(col, p, dtype) for p in pred.predicates]
+        if child_exprs and all(e is not None for e in child_exprs):
+            lowered: "List[pl.Expr]" = [e for e in child_exprs if e is not None]
+            combined = lowered[0]
+            for e in lowered[1:]:
+                combined = combined & e
+            return combined
+        return None
+
+    if name == "NeverMatch":
+        return c.is_null() & pl.lit(False)  # column-length all-False, nulls included
+
+    if name in ("IsNull", "IsNA"):
+        return c.is_null()
+    if name in ("NotNull", "NotNA"):
+        return c.is_not_null()
+
+    if name == "IsLeapYear":
+        # pandas s.dt.is_leap_year and polars expr.dt.is_leap_year() are the identical Boolean
+        # over the calendar year (Gregorian rule incl. 1900-not-leap / 2000-leap) — parity
+        # provable. Require naive Datetime or Date from the schema (a tz derives the year in
+        # LOCAL time; year-boundary equality unproven); else decline (NIE). Mirrors the
+        # naive-Datetime guard used for DateValue.
+        if (isinstance(dtype, pl.Datetime) and dtype.time_zone is None) or dtype == pl.Date:
+            return c.dt.is_leap_year()
+        return None
+
+    if name in ("IsMonthStart", "IsMonthEnd", "IsQuarterStart",
+                "IsQuarterEnd", "IsYearStart", "IsYearEnd"):
+        # Temporal boundary predicates: polars has no is_month_start/... BOOLEAN accessor
+        # (month_start()/month_end() ROLL to a Datetime), but the pandas oracle with freq=None is
+        # a pure calendar-field test (is_month_start = day==1; is_month_end = day==days_in_month;
+        # quarter/year add a month-set / month==N). polars dt.day()/dt.month()/dt.days_in_month()
+        # extract the SAME fields (both proleptic Gregorian, days_in_month leap-aware), so each
+        # compose is BIT-IDENTICAL on non-null rows — a proven derivation, not a guess. pandas
+        # returns False for NaT; polars comparison yields null -> fill_null(False) restores
+        # parity. Require naive Datetime or Date (tz shifts wall-clock fields), like IsLeapYear;
+        # else honest NIE.
+        if (isinstance(dtype, pl.Datetime) and dtype.time_zone is None) or dtype == pl.Date:
+            day = c.dt.day()
+            month = c.dt.month()
+            if name == "IsMonthStart":
+                expr = day == 1
+            elif name == "IsMonthEnd":
+                expr = day == c.dt.days_in_month()
+            elif name == "IsQuarterStart":
+                expr = (day == 1) & month.is_in([1, 4, 7, 10])
+            elif name == "IsQuarterEnd":
+                expr = (day == c.dt.days_in_month()) & month.is_in([3, 6, 9, 12])
+            elif name == "IsYearStart":
+                expr = (day == 1) & (month == 1)
+            else:  # IsYearEnd
+                expr = (day == c.dt.days_in_month()) & (month == 12)
+            return expr.fill_null(False)
+        return None
+
+    if name == "Contains" and hasattr(pred, "pat") and isinstance(pred.pat, str):
+        case = getattr(pred, "case", True)
+        regex = getattr(pred, "regex", True)
+        flags = getattr(pred, "flags", 0)
+        if not regex:
+            # Literal substring must NOT be regex-interpreted (metachars like ./*/( over-match).
+            # polars has no literal+case flag, so lowercase both sides for the case-insensitive
+            # literal (matches pandas).
+            if case:
+                return c.str.contains(pred.pat, literal=True)
+            return c.str.to_lowercase().str.contains(pred.pat.lower(), literal=True)
+        # Regex: mirror pandas case/flags via a Rust inline flag prefix. decline (NIE):
+        # Python-re-only features (lookaround, backreferences) — no silent wrong answer.
+        if _regex_rust_incompatible(pred.pat):
+            return None
+        prefix = _inline_regex_flag_prefix(case, flags)
+        return c.str.contains(f"{prefix}{pred.pat}", literal=False)
+
+    if isinstance(pred, (Match, Fullmatch)):
+        # Regex predicates: Match = start-anchored (``re.match`` semantics), Fullmatch =
+        # fully anchored (``^..$``) — the target for Cypher's ``=~`` (full/anchored, Java
+        # ``Matcher.matches()``). Wrap the user pattern in a non-capturing group so a
+        # top-level alternation (``a|b``) anchors as a whole. ``case``/``flags`` → inline prefix.
+        # Same Rust-regex gate as Contains: lookaround/backrefs raised a non-NIE
+        # ComputeError at collect (dgx-repro'd) — decline honestly instead.
+        # isinstance narrowing (not name-string dispatch): pat/case/flags statically typed.
+        if _regex_rust_incompatible(pred.pat):
+            return None
+        prefix = _inline_regex_flag_prefix(pred.case, pred.flags)
+        body = f"^(?:{pred.pat})$" if isinstance(pred, Fullmatch) else f"^(?:{pred.pat})"
+        return c.str.contains(f"{prefix}{body}", literal=False)
+
+    if name in ("Startswith", "Endswith") and hasattr(pred, "pat") and isinstance(pred.pat, str):
+        if getattr(pred, "case", True):
+            return c.str.starts_with(pred.pat) if name == "Startswith" else c.str.ends_with(pred.pat)
+        # Case-insensitive: anchored (?i) regex on the escaped literal — matches the pandas
+        # boundary predicate's lowercase-both-sides semantics for a single str pat.
+        anchored = f"(?i)^{re.escape(pred.pat)}" if name == "Startswith" else f"(?i){re.escape(pred.pat)}$"
+        return c.str.contains(anchored, literal=False)
+
+    if name in ("Startswith", "Endswith") and hasattr(pred, "pat") and isinstance(pred.pat, (tuple, list)):
+        # pandas boundary predicates accept a tuple of prefixes/suffixes (match if ANY) — OR-fold.
+        case = getattr(pred, "case", True)
+        parts = []
+        for p in pred.pat:
+            if not isinstance(p, str):
+                return None
+            if case:
+                parts.append(c.str.starts_with(p) if name == "Startswith" else c.str.ends_with(p))
+            else:
+                anc = f"(?i)^{re.escape(p)}" if name == "Startswith" else f"(?i){re.escape(p)}$"
+                parts.append(c.str.contains(anc, literal=False))
+        if not parts:
+            return pl.lit(False)
+        expr = parts[0]
+        for p in parts[1:]:
+            expr = expr | p
+        return expr
+
+    return None
+
+
+def _is_membership(value: Any) -> bool:
+    return isinstance(value, (list, tuple, set, frozenset))
+
+
+def _is_cross_type_predicate(df: "Union[pl.DataFrame, pl.LazyFrame]", col: str, pred: ASTPredicate) -> bool:
+    """True iff the predicate compares a numeric column to a string value (or vice versa):
+    polars raises `cannot compare string with numeric type` (an uncatchable Rust panic when
+    nested); pandas/cypher return a value/null. Recurses into AllOf (fold of x>a AND x<b) and
+    Between (lower+upper) — a cross-type compare hidden inside those would otherwise panic."""
+    name = type(pred).__name__
+    if name == "AllOf" and hasattr(pred, "predicates"):
+        return any(_is_cross_type_predicate(df, col, p) for p in pred.predicates)
+    dtype = df.schema.get(col)
+    col_num = _dtype_numeric(dtype)
+    col_str = _dtype_stringlike(dtype)
+
+    def _mismatch(v: Any) -> bool:
+        v_str = isinstance(v, str)
+        v_num = isinstance(v, (int, float)) and not isinstance(v, bool)
+        return (col_num and v_str) or (col_str and v_num)
+
+    if name == "Between":
+        return any(_mismatch(getattr(pred, b, None)) for b in ("lower", "upper"))
+    val = getattr(pred, "val", None)
+    if val is None or getattr(pred, "op", None) is None:
+        return False
+    return _mismatch(val)
+
+
+def _supports_scalar_equality(dtype: object, expected: object) -> bool:
+    import polars as pl
+    return (
+        dtype == pl.Boolean and type(expected) is bool
+        or dtype == pl.String and type(expected) is str
+        or dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64)
+        and type(expected) is int and -(2**63) <= expected < 2**63
+    )
+
+
+def _filter_singleton_equalities(
+    df: "Union[pl.DataFrame, pl.LazyFrame]", filter_dict: Optional[Mapping[str, object]],
+) -> "Optional[pl.DataFrame]":
+    """Check supported equalities on one CPU row; otherwise use expression filtering."""
+    import math
+    import polars as pl
+    from graphistry.compute.gfql.lazy import active_target, ExecutionTarget
+
+    if not isinstance(df, pl.DataFrame) or df.height != 1 or not filter_dict:
+        return None
+    if active_target() == ExecutionTarget.GPU:
+        return None
+    matches = True
+    needs_clone = False
+    schema = df.schema
+    for column, expected in filter_dict.items():
+        dtype = schema.get(column)
+        finite_float64 = dtype == pl.Float64 and type(expected) is float and math.isfinite(expected)
+        if not _supports_scalar_equality(dtype, expected) and not finite_float64:
+            return None
+        needs_clone = needs_clone or finite_float64
+        actual = df.get_column(column).item()
+        matches = matches and actual is not None and actual == expected
+    return (df.clone() if needs_clone else df) if matches else df.clear()
+
+
+def _filter_small_equalities(
+    df: "Union[pl.DataFrame, pl.LazyFrame]", filter_dict: Optional[Mapping[str, object]],
+) -> "Optional[pl.DataFrame]":
+    """Filter up to 32 eager CPU rows without starting an expression plan."""
+    import polars as pl
+    from graphistry.compute.gfql.lazy import active_target, ExecutionTarget
+
+    if not isinstance(df, pl.DataFrame) or df.height <= 1:
+        return _filter_singleton_equalities(df, filter_dict)
+    if df.height > 32 or not filter_dict or active_target() == ExecutionTarget.GPU:
+        return None
+    schema = df.schema
+    mask = [True] * df.height
+    for column, expected in filter_dict.items():
+        if not _supports_scalar_equality(schema.get(column), expected):
+            return None
+        values = df.get_column(column).to_list()
+        mask = [matched and actual is not None and actual == expected
+                for matched, actual in zip(mask, values)]
+    positions = [index for index, matched in enumerate(mask) if matched]
+    if not positions:
+        return df.clear()
+    if len(positions) == df.height:
+        return df
+    if positions[-1] - positions[0] + 1 == len(positions):
+        return df.slice(positions[0], len(positions))
+    return df[positions]
+
+
+def _filter_eager_equalities(
+    df: "Union[pl.DataFrame, pl.LazyFrame]", filter_dict: Optional[Mapping[str, object]],
+) -> "Optional[pl.DataFrame]":
+    """Apply native Series equality/filtering to small eager CPU candidate frames."""
+    import polars as pl
+    from graphistry.compute.gfql.lazy import active_target, ExecutionTarget
+
+    if not isinstance(df, pl.DataFrame) or not 0 < df.height <= 1024 or not filter_dict:
+        return None
+    if active_target() == ExecutionTarget.GPU:
+        return None
+    schema = df.schema
+    mask: Optional[pl.Series] = None
+    for column, expected in filter_dict.items():
+        dtype = schema.get(column)
+        supported = _supports_scalar_equality(dtype, expected) or (
+            dtype in (pl.Categorical, pl.Enum) and type(expected) is str
+            or dtype in (pl.Float32, pl.Float64) and type(expected) in (int, float)
+        )
+        if supported and type(expected) is int:
+            if dtype in (pl.Float32, pl.Float64):
+                supported = -(2**63) <= expected < 2**63
+            else:
+                # Series equality does not widen narrow/unsigned integer storage.
+                supported = dtype == pl.Int64 or dtype == pl.UInt64 and expected >= 0
+        if isinstance(dtype, pl.Datetime) and type(expected) is str:
+            # Expr comparisons coerce ns storage to literal us units; Series equality does not.
+            if dtype.time_unit == "ns":
+                return None
+            expected = _parse_temporal_filter_scalar(expected, dtype)
+            supported = expected is not None
+        if not supported:
+            return None
+        current = df.get_column(column) == expected
+        mask = current if mask is None else mask & current
+    assert mask is not None  # A nonempty supported filter creates a Boolean Series.
+    if mask.null_count() == 0 and mask.all():
+        return df.clone()
+    if not mask.any():
+        return df.clear()
+    # Native Series filtering discards null mask entries and preserves row order.
+    return pl.DataFrame([column.filter(mask) for column in df.iter_columns()])
+
+
+def filter_by_dict_polars(df: "PolarsFrameT", filter_dict: "Optional[Dict[str, Any]]") -> "PolarsFrameT":
+    """Return rows of polars ``df`` matching all entries in ``filter_dict`` via one filter."""
+    small = _filter_small_equalities(df, filter_dict)
+    if small is not None:
+        return small  # type: ignore[return-value]  # The helper admits only eager frames.
+    eager = _filter_eager_equalities(df, filter_dict)
+    if eager is not None:
+        return eager  # type: ignore[return-value]  # The helper admits only eager frames.
+    combined = filter_expr_by_dict_polars(df, filter_dict)
+    if combined is None:
+        return df
+    return df.filter(combined)
+
+
+def filter_expr_by_dict_polars(df: "Union[pl.DataFrame, pl.LazyFrame]", filter_dict: "Optional[Dict[str, Any]]") -> "Optional[pl.Expr]":
+    """Build the combined boolean ``pl.Expr`` filter_by_dict_polars would apply, or None
+    for an empty/absent filter dict. ``df`` supplies the schema for column/dtype
+    resolution. Empty eager frames retain scalar mismatch behavior; valid temporal
+    text still lowers to a temporal literal so empty traversal wavefronts can be filtered.
+    Otherwise callers may apply the expr to a LazyFrame over the same schema (the fused
+    connected-join lane), with identical semantics incl. the same typed error/NIE contract
+    for unsupported shapes."""
+    import polars as pl
+
+    if not filter_dict:
+        return None
+
+    exprs: "List[pl.Expr]" = []
+    _schema_memo: "List[pl.Schema]" = []
+
+    def _dtype_of(name: str) -> "Optional[pl.DataType]":
+        if not _schema_memo:
+            _schema_memo.append(df.collect_schema() if isinstance(df, pl.LazyFrame) else df.schema)
+        return _schema_memo[0].get(name)
+
+    for col, val in filter_dict.items():
+        resolved = resolve_filter_column_or_absent(df, col, val)
+        if resolved is None:
+            if not absent_column_matches(val):
+                return pl.lit(False)  # absent column is all-null; 3VL never matches (#1916)
+            continue
+        resolved_col, resolved_val = resolved
+        if isinstance(resolved_val, ASTPredicate):
+            if _is_cross_type_predicate(df, resolved_col, resolved_val):
+                # numeric-vs-string comparison -> polars ComputeError; decline (NIE).
+                raise NotImplementedError(
+                    f"polars engine does not yet natively support a numeric-vs-string "
+                    f"comparison on column {resolved_col!r}; use engine='pandas' or "
+                    f"engine='cudf' for this query (no silent fallback; parity-or-error by design)"
+                )
+            # String predicate on a non-`String` column: pandas/cuDF raise a clean
+            # GFQLSchemaError (E302) at schema validation, but polars would build `.str.<op>` and
+            # raise an OPAQUE `InvalidOperationError` ("expected String type, got: cat") at collect
+            # on a Categorical/Enum/numeric column. Raise the SAME clean, typed error so all three
+            # engines agree (categorical is treated as non-string here, exactly as filter_by_dict).
+            if isinstance(resolved_val, (Contains, Startswith, Endswith, Match)):
+                _col_dtype = _dtype_of(resolved_col)
+                if _col_dtype is not None and _col_dtype != pl.String:
+                    from graphistry.compute.exceptions import ErrorCode, GFQLSchemaError
+                    raise GFQLSchemaError(
+                        ErrorCode.E302,
+                        f'Type mismatch: string predicate used on non-string column "{resolved_col}"',
+                        field=col,
+                        value=f"{resolved_val.__class__.__name__}(...)",
+                        column_type=str(_col_dtype),
+                        suggestion='Use numeric predicates like gt() or lt() for numeric columns',
+                    )
+            resolved_dtype = _dtype_of(resolved_col)
+            if isinstance(resolved_val, IsIn) and _dtype_is_temporal(resolved_dtype):
+                expr = _temporal_membership_expr(
+                    resolved_col,
+                    resolved_val.options,
+                    resolved_dtype,
+                )
+                exprs.append(expr)
+                continue
+            expr = predicate_to_expr(resolved_col, resolved_val, _dtype_of(resolved_col))
+            if expr is None:
+                # decline (NIE): no native lowering for this predicate; no pandas bridge.
+                raise NotImplementedError(
+                    f"polars engine does not yet natively support the "
+                    f"{type(resolved_val).__name__} predicate on column "
+                    f"{resolved_col!r}; use engine='pandas' for this query "
+                    f"(no pandas fallback; parity-or-error by design)"
+                )
+            exprs.append(expr)
+        elif _is_membership(resolved_val):
+            exprs.append(_temporal_membership_expr(
+                resolved_col, list(resolved_val), _dtype_of(resolved_col)
+            ))
+        elif isinstance(_dtype_of(resolved_col), pl.List):
+            if resolved_col == "labels":
+                # MATCH (n:Label) = scalar match on the RESERVED `labels` List column ->
+                # list.contains (empty for a non-existent label, matching pandas). A plain ==
+                # would cast the List to String and crash.
+                exprs.append(pl.col(resolved_col).list.contains(resolved_val))
+            else:
+                # decline (NIE): a user List property vs scalar is NOT membership — pandas
+                # compares the whole list (always unequal to a scalar); contains-membership
+                # would be a silent wrong answer.
+                raise NotImplementedError(
+                    f"polars engine does not yet natively support comparing the List "
+                    f"column {resolved_col!r} to a scalar; use engine='pandas' "
+                    f"(no pandas fallback; parity-or-error by design)"
+                )
+        else:
+            _eq_dtype = _dtype_of(resolved_col)
+            _empty_eager = isinstance(df, pl.DataFrame) and df.height == 0
+            if _empty_eager and isinstance(resolved_val, str) and _dtype_is_temporal(_eq_dtype):
+                assert _eq_dtype is not None
+                parsed = _parse_temporal_filter_scalar(resolved_val, _eq_dtype)
+                if parsed is not None:
+                    exprs.append(pl.col(resolved_col) == pl.lit(parsed))
+                    continue
+            if _eq_dtype is not None and not _empty_eager:
+                from graphistry.compute.exceptions import ErrorCode, GFQLSchemaError
+                _numeric = _eq_dtype.is_numeric() or _eq_dtype == pl.Boolean
+                if _numeric and isinstance(resolved_val, str):
+                    raise GFQLSchemaError(
+                        ErrorCode.E302,
+                        f'Type mismatch: column "{resolved_col}" is numeric but filter value is string',
+                        field=col,
+                        value=resolved_val,
+                        column_type=str(_eq_dtype),
+                        suggestion=f'Use a numeric value like {col}=123',
+                    )
+                if (
+                    _eq_dtype == pl.String
+                    and isinstance(resolved_val, (int, float))
+                    and not isinstance(resolved_val, bool)
+                ):
+                    raise GFQLSchemaError(
+                        ErrorCode.E302,
+                        f'Type mismatch: column "{resolved_col}" is string but filter value is numeric',
+                        field=col,
+                        value=resolved_val,
+                        column_type=str(_eq_dtype),
+                        suggestion=f'Use a string value like {col}="value"',
+                    )
+                if isinstance(resolved_val, str) and _dtype_is_temporal(_eq_dtype):
+                    # Raw temporal `col == 'str'` raises at collect; parse-or-typed-error instead.
+                    exprs.append(
+                        _temporal_str_cmp_expr(
+                            resolved_col, pl.col(resolved_col), operator.eq, resolved_val, _eq_dtype
+                        )
+                    )
+                    continue
+            exprs.append(pl.col(resolved_col) == resolved_val)
+
+    if not exprs:
+        return None
+    combined = exprs[0]
+    for e in exprs[1:]:
+        combined = combined & e
+    return combined

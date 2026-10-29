@@ -1,0 +1,627 @@
+"""Join-related engine-polymorphic DataFrame operations."""
+
+import operator
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union, cast
+
+from graphistry.Engine import Engine, POLARS_ENGINES, is_polars_df
+from graphistry.compute.gfql.cypher.reentry.naming import REENTRY_HIDDEN_COLUMN_PREFIX
+from graphistry.compute.gfql.identifiers import HIDDEN_ALIAS_COLUMN_PREFIX
+from graphistry.compute.typing import DataFrameT, DomainT
+
+
+def binding_join_columns(frame: DataFrameT) -> List[str]:
+    return [column for column in frame.columns if isinstance(column, str) and "." in column]
+
+
+def joined_hidden_scalar_columns(frame: DataFrameT) -> DataFrameT:
+    hidden_suffixes: Dict[str, List[str]] = {}
+    for column in frame.columns:
+        if not isinstance(column, str) or "." not in column:
+            continue
+        _, suffix = column.split(".", 1)
+        if suffix.startswith(REENTRY_HIDDEN_COLUMN_PREFIX) or suffix.startswith(HIDDEN_ALIAS_COLUMN_PREFIX):
+            hidden_suffixes.setdefault(suffix, []).append(column)
+    out = frame
+    is_polars = "polars" in type(frame).__module__
+    for suffix, columns in hidden_suffixes.items():
+        if suffix in out.columns:
+            continue
+        if is_polars:
+            import polars as pl
+            expr = pl.coalesce([pl.col(column) for column in columns]).alias(suffix)
+            out = out.with_columns(expr)
+            continue
+        series = out[columns[0]]
+        for column in columns[1:]:
+            if hasattr(series, "combine_first"):
+                series = series.combine_first(out[column])
+        out = out.assign(**{suffix: series})
+    return out
+
+
+def joined_alias_columns(frame: DataFrameT) -> DataFrameT:
+    alias_candidates: Dict[str, str] = {}
+    for column in frame.columns:
+        if not isinstance(column, str) or "." not in column:
+            continue
+        alias, suffix = column.split(".", 1)
+        if alias in frame.columns:
+            continue
+        if suffix == alias:
+            alias_candidates.setdefault(alias, column)
+        elif suffix == "id" and alias not in alias_candidates:
+            alias_candidates[alias] = column
+    out = frame
+    is_polars = "polars" in type(frame).__module__
+    if is_polars and alias_candidates:
+        import polars as pl
+        return cast(DataFrameT, out.with_columns([
+            pl.col(source_column).alias(alias)
+            for alias, source_column in alias_candidates.items()
+        ]))
+    for alias, source_column in alias_candidates.items():
+        out = out.assign(**{alias: out[source_column]})
+    return out
+
+
+def connected_inner_join_rows(
+    joined_rows: DataFrameT,
+    pattern_rows: DataFrameT,
+    *,
+    join_cols: Sequence[str],
+    keep_cols: Sequence[str],
+    engine: Engine,
+) -> DataFrameT:
+    """Inner-join connected MATCH row payloads.
+
+    cuDF path: avoid full-row merge on dotted payload columns by joining only
+    compact key/index frames, then gathering payload rows by position.
+    """
+    join_cols_list = list(join_cols)
+    keep_cols_list = list(keep_cols)
+    rhs = cast(DataFrameT, pattern_rows[keep_cols_list])
+    if engine in POLARS_ENGINES:
+        return cast(DataFrameT, joined_rows.join(rhs, on=join_cols_list, how="inner"))
+    if engine != Engine.CUDF:
+        return cast(DataFrameT, joined_rows.merge(rhs, on=join_cols_list, how="inner"))
+
+    lhs_row_id = "__gfql_connected_lhs_row_id__"
+    rhs_row_id = "__gfql_connected_rhs_row_id__"
+    lhs = cast(DataFrameT, joined_rows.reset_index(drop=True))
+    rhs = cast(DataFrameT, rhs.reset_index(drop=True))
+    lhs_with_idx = cast(DataFrameT, lhs.reset_index().rename(columns={"index": lhs_row_id}))
+    rhs_with_idx = cast(DataFrameT, rhs.reset_index().rename(columns={"index": rhs_row_id}))
+    lhs_keys = cast(DataFrameT, lhs_with_idx[[lhs_row_id] + join_cols_list])
+    rhs_keys = cast(DataFrameT, rhs_with_idx[[rhs_row_id] + join_cols_list])
+    row_pairs = cast(DataFrameT, lhs_keys.merge(rhs_keys, on=join_cols_list, how="inner"))
+    rhs_payload_cols = [column for column in keep_cols_list if column not in join_cols_list]
+    if len(row_pairs) == 0:
+        out = cast(DataFrameT, lhs.head(0))
+        for column in rhs_payload_cols:
+            out = out.assign(**{column: rhs[column].head(0)})
+        return out
+
+    lhs_taken = cast(DataFrameT, lhs.take(row_pairs[lhs_row_id]))
+    if not rhs_payload_cols:
+        return cast(DataFrameT, lhs_taken.reset_index(drop=True))
+    rhs_payload = cast(DataFrameT, rhs[rhs_payload_cols].take(row_pairs[rhs_row_id]).reset_index(drop=True))
+    lhs_taken = cast(DataFrameT, lhs_taken.reset_index(drop=True))
+    for column in rhs_payload_cols:
+        lhs_taken = lhs_taken.assign(**{column: rhs_payload[column]})
+    return lhs_taken
+
+
+def _row_notna_all(frame: DataFrameT, cols: Sequence[str]) -> Any:
+    if len(cols) == 0:
+        return True
+    # cuDF 25.02 can segfault on DataFrame.notna().all(axis=1); reduce masks
+    # column-by-column instead of using row-wise DataFrame reductions.
+    mask = frame[cols[0]].notna()
+    for col in cols[1:]:
+        mask = mask & frame[col].notna()
+    return mask
+
+
+def project_node_attrs(
+    frame: DataFrameT,
+    node_col: str,
+    cols: Sequence[str],
+    *,
+    id_label: str,
+    prefix: str = "",
+    labels: Optional[Sequence[str]] = None,
+    node_domain: Optional[DomainT] = None,
+    dedupe: bool = False,
+    drop_nulls: bool = False,
+) -> DataFrameT:
+    df = frame[frame[node_col].isin(node_domain)] if node_domain is not None else frame
+    data_cols = [node_col] + [col for col in cols if col != node_col]
+    rename_map = {node_col: id_label}
+    if labels is not None:
+        rename_map.update(
+            {col: label for col, label in zip(cols, labels) if col != node_col}
+        )
+    else:
+        rename_map.update({col: f"{prefix}{col}" for col in cols if col != node_col})
+    df = df[data_cols].rename(columns=rename_map)
+    if labels is not None and node_col in cols:
+        df[labels[cols.index(node_col)]] = df[id_label]
+    if drop_nulls and labels is not None:
+        label_cols = [label for label in labels if label in df.columns]
+        if label_cols:
+            df = df[_row_notna_all(df, label_cols)]
+    return df.drop_duplicates() if dedupe else df
+
+
+def ineq_eval_pairs(
+    left_pairs: DataFrameT,
+    right_pairs: DataFrameT,
+    op: str,
+    *,
+    group_cols: Optional[Sequence[str]] = None,
+    left_value: str = "__value__",
+    right_value: str = "__value__",
+) -> Tuple[DataFrameT, DataFrameT]:
+    group_cols = list(group_cols) if group_cols is not None else ["__mid__"]
+    if op in {"<", "<="}:
+        right_bound = (
+            right_pairs.groupby(group_cols)[right_value]
+            .max()
+            .reset_index()
+            .rename(columns={right_value: "__right_bound__"})
+        )
+        left_bound = (
+            left_pairs.groupby(group_cols)[left_value]
+            .min()
+            .reset_index()
+            .rename(columns={left_value: "__left_bound__"})
+        )
+        left_eval = left_pairs.merge(right_bound, on=group_cols, how="inner")
+        right_eval = right_pairs.merge(left_bound, on=group_cols, how="inner")
+        left_cmp = operator.lt if op == "<" else operator.le
+        right_cmp = operator.gt if op == "<" else operator.ge
+    else:
+        right_bound = (
+            right_pairs.groupby(group_cols)[right_value]
+            .min()
+            .reset_index()
+            .rename(columns={right_value: "__right_bound__"})
+        )
+        left_bound = (
+            left_pairs.groupby(group_cols)[left_value]
+            .max()
+            .reset_index()
+            .rename(columns={left_value: "__left_bound__"})
+        )
+        left_eval = left_pairs.merge(right_bound, on=group_cols, how="inner")
+        right_eval = right_pairs.merge(left_bound, on=group_cols, how="inner")
+        left_cmp = operator.gt if op == ">" else operator.ge
+        right_cmp = operator.lt if op == ">" else operator.le
+    left_eval = left_eval[left_cmp(left_eval[left_value], left_eval["__right_bound__"])]
+    right_eval = right_eval[
+        right_cmp(right_eval[right_value], right_eval["__left_bound__"])
+    ]
+    return left_eval, right_eval
+
+
+def semijoin_eval_pairs(
+    left_pairs: DataFrameT,
+    right_pairs: DataFrameT,
+    op: str,
+    *,
+    left_value: str = "__value__",
+    right_value: str = "__value__",
+    left_unique_col: str = "__left_unique__",
+    right_unique_col: str = "__right_unique__",
+    left_only_col: str = "__left_only__",
+    right_only_col: str = "__right_only__",
+    left_keep: Optional[Sequence[str]] = None,
+    right_keep: Optional[Sequence[str]] = None,
+) -> Tuple[Optional[DataFrameT], Optional[DataFrameT], Optional[DataFrameT]]:
+    mid_values = None
+    if op == "==":
+        left_mid = left_pairs[["__mid__", left_value]].drop_duplicates().rename(
+            columns={left_value: "__value__"}
+        )
+        right_mid = right_pairs[["__mid__", right_value]].drop_duplicates().rename(
+            columns={right_value: "__value__"}
+        )
+        mid_values = left_mid.merge(right_mid, on=["__mid__", "__value__"], how="inner")
+        if len(mid_values) == 0:
+            return None, None, mid_values
+        left_eval = left_pairs.merge(
+            mid_values.rename(columns={"__value__": left_value}),
+            on=["__mid__", left_value],
+            how="inner",
+        )
+        right_eval = right_pairs.merge(
+            mid_values.rename(columns={"__value__": right_value}),
+            on=["__mid__", right_value],
+            how="inner",
+        )
+    elif op == "!=":
+
+        def _uniq(df: DataFrameT, col: str, name: str) -> DataFrameT:
+            counts = df[["__mid__", col]].drop_duplicates().groupby("__mid__").size().reset_index()
+            return counts.rename(columns={0: name, "size": name})
+
+        left_unique = _uniq(left_pairs, left_value, left_unique_col)
+        right_unique = _uniq(right_pairs, right_value, right_unique_col)
+        right_only = (
+            right_pairs[["__mid__", right_value]]
+            .drop_duplicates()
+            .merge(
+                right_unique[right_unique[right_unique_col] == 1],
+                on="__mid__",
+                how="inner",
+            )[["__mid__", right_value]]
+            .rename(columns={right_value: right_only_col})
+        )
+        left_only = (
+            left_pairs[["__mid__", left_value]]
+            .drop_duplicates()
+            .merge(left_unique[left_unique[left_unique_col] == 1], on="__mid__", how="inner")[
+                ["__mid__", left_value]
+            ]
+            .rename(columns={left_value: left_only_col})
+        )
+        left_eval = left_pairs.merge(right_unique, on="__mid__", how="inner").merge(
+            right_only, on="__mid__", how="left"
+        )
+        left_eval = left_eval[
+            (left_eval[right_unique_col] > 1)
+            | left_eval[right_only_col].isna()
+            | (left_eval[right_only_col] != left_eval[left_value])
+        ]
+        right_eval = right_pairs.merge(left_unique, on="__mid__", how="inner").merge(
+            left_only, on="__mid__", how="left"
+        )
+        right_eval = right_eval[
+            (right_eval[left_unique_col] > 1)
+            | right_eval[left_only_col].isna()
+            | (right_eval[left_only_col] != right_eval[right_value])
+        ]
+    else:
+        left_eval, right_eval = ineq_eval_pairs(
+            left_pairs,
+            right_pairs,
+            op,
+            left_value=left_value,
+            right_value=right_value,
+        )
+    if left_eval is None or right_eval is None:
+        return None, None, mid_values
+    if left_keep:
+        left_eval = left_eval[list(left_keep)]
+    if right_keep:
+        right_eval = right_eval[list(right_keep)]
+    return left_eval, right_eval, mid_values
+
+
+def _estimate_inner_join_rows_arrays(
+    left: DataFrameT,
+    right: DataFrameT,
+    *,
+    left_on: str,
+    right_on: str,
+    engine: Engine,
+) -> Optional[int]:
+    """Exact ``estimate_inner_join_rows`` over null-free integer keys as one array pass.
+
+    Frame group-by/join plans cost ~1ms each on small frontiers; the same
+    sum-of-products is a unique/searchsorted over the key arrays. Nulls defer to
+    the frame path: engines disagree on null-key matching (pandas merges NaN with
+    NaN, polars does not), so that contract stays where it is. Key arrays of
+    different dtypes also defer, because the compare that would join them promotes
+    to float64 and aliases ids past 2**53.
+    """
+    from graphistry.compute.gfql.index.engine_arrays import (
+        array_namespace, as_eager_polars_frame, col_to_array, unique_with_counts,
+    )
+
+    if engine in POLARS_ENGINES:
+        left_frame, right_frame = as_eager_polars_frame(left), as_eager_polars_frame(right)
+        if left_frame is None or right_frame is None:
+            return None  # lazy inputs keep the single-collect plan
+        for frame, column in ((left_frame, left_on), (right_frame, right_on)):
+            series = frame.get_column(column)
+            if not series.dtype.is_integer() or series.null_count():
+                return None
+    elif engine in (Engine.PANDAS, Engine.CUDF):
+        for pandas_frame, column in ((left, left_on), (right, right_on)):
+            values = pandas_frame[column]
+            if getattr(values.dtype, "kind", None) not in ("i", "u") or bool(values.isna().any()):
+                return None
+    else:
+        return None
+    xp, _ = array_namespace(engine)
+    left_values = col_to_array(left, left_on, engine)
+    right_values = col_to_array(right, right_on, engine)
+    if left_values.dtype != right_values.dtype:
+        return None  # a promoted compare is float64, which aliases ids past 2**53
+    if int(left_values.shape[0]) == 0 or int(right_values.shape[0]) == 0:
+        return 0
+    left_keys, left_counts = unique_with_counts(xp, left_values)
+    right_keys, right_counts = unique_with_counts(xp, right_values)
+    positions = xp.minimum(xp.searchsorted(left_keys, right_keys), left_keys.shape[0] - 1)
+    matched = left_keys[positions] == right_keys
+    products = left_counts[positions[matched]].astype("int64") * right_counts[matched].astype("int64")
+    return int(products.sum())
+
+
+def estimate_inner_join_rows(
+    left: DataFrameT,
+    right: DataFrameT,
+    *,
+    left_on: str,
+    right_on: str,
+    engine: Engine,
+) -> int:
+    """Rows an inner join WOULD emit, without materializing it.
+
+    Sum over matched keys of (left count * right count) — a group-by on each side
+    instead of the join itself, so a planner can cost-gate a hop before paying for
+    it.
+    """
+    if len(left) == 0 or len(right) == 0:
+        return 0
+    array_estimate = _estimate_inner_join_rows_arrays(
+        left, right, left_on=left_on, right_on=right_on, engine=engine,
+    )
+    if array_estimate is not None:
+        return array_estimate
+    left_n, right_n = "__gfql_join_left_n__", "__gfql_join_right_n__"
+    if engine in POLARS_ENGINES:
+        import polars as pl
+
+        from graphistry.compute.gfql.lazy import collect
+
+        assert is_polars_df(left) and is_polars_df(right)
+        left_counts = left.lazy().group_by(left_on).len().rename({"len": left_n})
+        right_counts = right.lazy().group_by(right_on).len().rename({"len": right_n})
+        value = collect(
+            left_counts.join(right_counts, left_on=left_on, right_on=right_on, how="inner")
+            .select((pl.col(left_n) * pl.col(right_n)).sum())
+        ).item()
+        return 0 if value is None else int(value)
+
+    left_counts = left.groupby(left_on, sort=False).size().reset_index()
+    left_counts.columns = [left_on, left_n]
+    right_counts = right.groupby(right_on, sort=False).size().reset_index()
+    right_counts.columns = [right_on, right_n]
+    counts = left_counts.merge(
+        right_counts, left_on=left_on, right_on=right_on, how="inner", sort=False,
+    )
+    if len(counts) == 0:
+        return 0
+    return int((counts[left_n] * counts[right_n]).sum())
+
+
+class PathExpandPlan(NamedTuple):
+    """A costed one-step path expansion: ``rows`` it will emit, ``expand`` to materialize."""
+
+    rows: int
+    expand: Callable[[], DataFrameT]
+
+
+def _plan_path_ordered_expand_arrays(
+    state: DataFrameT,
+    step: DataFrameT,
+    *,
+    current_col: str,
+    from_col: str,
+    to_col: str,
+    tiebreak_cols: Sequence[str],
+    alias: Optional[str],
+    engine: Engine,
+) -> Optional[PathExpandPlan]:
+    """Exact ``path_ordered_expand_join`` for eager polars over null-free integer keys.
+
+    A join+sort plan costs ~1ms on a small frontier; the same (path, tiebreak...)
+    order is a searchsorted range per state row over the step rows sorted by
+    (key, tiebreak...), then two row gathers. The range widths sum to the row count
+    ``estimate_inner_join_rows`` returns, so the plan reports it without a second pass,
+    and the (key, tiebreak...) sort happens only when the plan is materialized -- a
+    caller that cost-gates and rejects must not pay for an ordering it discards.
+    Declines (None) to the frame path on lazy inputs, nulls, non-integer
+    keys/tiebreaks, or no tiebreak columns (the frame path's intra-key order is then
+    the engine's own, not reproduced here).
+    """
+    if engine != Engine.POLARS or not tiebreak_cols:
+        return None
+    import polars as pl
+
+    from graphistry.compute.gfql.index.engine_arrays import (
+        array_namespace, as_eager_polars_frame, col_to_array, take_rows_polars,
+    )
+
+    state_frame, step_frame = as_eager_polars_frame(state), as_eager_polars_frame(step)
+    if state_frame is None or step_frame is None:
+        return None
+    key_columns = ((state_frame, current_col), (step_frame, from_col),
+                   *((step_frame, col) for col in tiebreak_cols))
+    for frame, col in key_columns:
+        series = frame.get_column(col)
+        if not series.dtype.is_integer() or series.null_count():
+            return None
+    xp, _ = array_namespace(engine)
+    current = col_to_array(state_frame, current_col, engine)
+    keys = col_to_array(step_frame, from_col, engine)
+    if current.dtype != keys.dtype:
+        return None  # a promoted compare is float64, which aliases ids past 2**53
+    # Counting needs key order only; the (key, tiebreak...) sort is deferred to expand().
+    sorted_keys = xp.sort(keys)
+    lo = xp.searchsorted(sorted_keys, current, side="left")
+    counts = xp.searchsorted(sorted_keys, current, side="right") - lo
+    total = int(counts.sum())
+
+    def expand() -> DataFrameT:
+        # lexsort takes its PRIMARY key last, so this orders by (key, tiebreak_0, ...).
+        tiebreaks = [col_to_array(step_frame, col, engine) for col in tiebreak_cols]
+        step_order = xp.lexsort(tuple([*reversed(tiebreaks), keys]))
+        left_idx = xp.repeat(xp.arange(current.shape[0]), counts)
+        starts = xp.cumsum(counts) - counts
+        right_idx = step_order[xp.repeat(lo - starts, counts) + xp.arange(total)]
+        left_part = take_rows_polars(state_frame, left_idx).drop(current_col)
+        right_part = (
+            take_rows_polars(step_frame, right_idx)
+            .drop([from_col, *tiebreak_cols])
+            .rename({to_col: current_col})
+        )
+        out = pl.concat([left_part, right_part], how="horizontal")
+        if isinstance(alias, str):
+            out = out.with_columns(pl.col(current_col).alias(alias))
+        return cast(  # hygiene-ok: explicit-cast -- DataFrameT narrowing on the polars branch, module-wide idiom
+            DataFrameT, out,
+        )
+
+    return PathExpandPlan(total, expand)
+
+
+def _path_ordered_expand_join_arrays(
+    state: DataFrameT,
+    step: DataFrameT,
+    *,
+    current_col: str,
+    from_col: str,
+    to_col: str,
+    tiebreak_cols: Sequence[str],
+    alias: Optional[str],
+    engine: Engine,
+) -> Optional[DataFrameT]:
+    """The array-side expansion, materialized, or None to decline to the frame path."""
+    plan = _plan_path_ordered_expand_arrays(
+        state, step, current_col=current_col, from_col=from_col, to_col=to_col,
+        tiebreak_cols=tiebreak_cols, alias=alias, engine=engine,
+    )
+    return None if plan is None else plan.expand()
+
+
+def path_ordered_expand_join(
+    state: DataFrameT,
+    step: DataFrameT,
+    *,
+    current_col: str,
+    from_col: str,
+    to_col: str,
+    path_order_col: str,
+    tiebreak_cols: Sequence[str],
+    alias: Optional[str],
+    engine: Engine,
+) -> DataFrameT:
+    """Expand a path-bag by one step, preserving (path, tiebreak...) row order.
+
+    ``state[current_col]`` joins ``step[from_col]``; ``step[to_col]`` becomes the new
+    ``current_col``. A synthetic ``path_order_col`` pins the incoming row order so the
+    result is deterministic under any engine's join, and the bookkeeping columns are
+    dropped on the way out. ``alias``, when given, also exposes the new current value
+    under that name.
+    """
+    drop_after = [from_col, path_order_col, *tiebreak_cols]
+    array_expand = _path_ordered_expand_join_arrays(
+        state, step, current_col=current_col, from_col=from_col, to_col=to_col,
+        tiebreak_cols=tiebreak_cols, alias=alias, engine=engine,
+    )
+    if array_expand is not None:
+        return array_expand
+    if engine in POLARS_ENGINES:
+        import polars as pl
+
+        from graphistry.compute.gfql.lazy import collect
+
+        assert is_polars_df(state) and is_polars_df(step)
+        joined = (
+            state.lazy().with_row_index(path_order_col)
+            .join(step.lazy(), left_on=current_col, right_on=from_col, how="inner")
+            .sort([path_order_col, *tiebreak_cols])
+            .drop(current_col)
+            .rename({to_col: current_col})
+        )
+        if isinstance(alias, str):
+            joined = joined.with_columns(pl.col(current_col).alias(alias))
+        return cast(
+            DataFrameT,
+            collect(joined.drop([col for col in drop_after if col in joined.collect_schema().names()])),
+        )
+
+    import numpy as np
+
+    out = state.assign(**{path_order_col: np.arange(len(state))}).merge(
+        step, left_on=current_col, right_on=from_col, how="inner", sort=False,
+    )
+    if len(out):
+        sort_cols = [path_order_col, *tiebreak_cols]
+        out = (
+            out.sort_values(sort_cols, kind="stable") if engine == Engine.PANDAS
+            else out.sort_values(sort_cols)
+        )
+    out = out.drop(columns=[current_col]).rename(columns={to_col: current_col})
+    if isinstance(alias, str):
+        out = out.assign(**{alias: out[current_col]})
+    return cast(
+        DataFrameT,
+        out.drop(columns=[col for col in drop_after if col in out.columns]),
+    )
+
+
+def plan_path_ordered_expand_join(
+    state: DataFrameT,
+    step: DataFrameT,
+    *,
+    current_col: str,
+    from_col: str,
+    to_col: str,
+    path_order_col: str,
+    tiebreak_cols: Sequence[str],
+    alias: Optional[str],
+    engine: Engine,
+) -> PathExpandPlan:
+    """Cost this expansion before materializing it, for a caller that cost-gates a hop.
+
+    ``rows`` is exact, not an estimate. On the array path it is the expansion's own
+    searchsorted range widths, so gating costs nothing beyond work the expansion
+    already does; elsewhere it falls back to ``estimate_inner_join_rows``.
+    """
+    array_plan = _plan_path_ordered_expand_arrays(
+        state, step, current_col=current_col, from_col=from_col, to_col=to_col,
+        tiebreak_cols=tiebreak_cols, alias=alias, engine=engine,
+    )
+    if array_plan is not None:
+        return array_plan
+    return PathExpandPlan(
+        estimate_inner_join_rows(state, step, left_on=current_col, right_on=from_col, engine=engine),
+        lambda: path_ordered_expand_join(
+            state, step, current_col=current_col, from_col=from_col, to_col=to_col,
+            path_order_col=path_order_col, tiebreak_cols=tiebreak_cols, alias=alias,
+            engine=engine,
+        ),
+    )
+
+
+def semijoin_by_column(
+    frame: DataFrameT,
+    keys: DataFrameT,
+    *,
+    left_on: str,
+    right_on: str,
+    engine: Engine,
+) -> DataFrameT:
+    """Rows of ``frame`` whose ``left_on`` value appears in ``keys[right_on]``."""
+    if engine in POLARS_ENGINES:
+        import polars as pl
+
+        result: Union[pl.DataFrame, pl.LazyFrame]
+        if isinstance(frame, pl.DataFrame):
+            assert isinstance(keys, pl.DataFrame)
+            result = frame.join(
+                keys.select(right_on).unique(),
+                left_on=left_on, right_on=right_on, how="semi",
+            )
+        else:
+            assert isinstance(frame, pl.LazyFrame) and isinstance(keys, pl.LazyFrame)
+            result = frame.join(
+                keys.select(right_on).unique(),
+                left_on=left_on, right_on=right_on, how="semi",
+            )
+        return cast(DataFrameT, result)
+    return cast(DataFrameT, frame[frame[left_on].isin(keys[right_on])])

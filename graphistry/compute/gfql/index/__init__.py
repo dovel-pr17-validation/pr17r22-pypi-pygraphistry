@@ -1,0 +1,53 @@
+"""GFQL physical indexes — pay-as-you-go adjacency/node-id indexes for fast
+seeded traversal.
+
+Public surface (see api.py): ``create_index``, ``drop_index``, ``show_indexes``,
+``gfql_index_edges``, ``gfql_index_all``, ``gfql_index_node_props``,
+``gfql_index_node_types``, and the planner entry ``maybe_index_hop``.
+These are wired onto Plottable via ComputeMixin.
+"""
+from .types import (
+    AdjacencyIndexKind, ArrayLike, ArrayNamespace, EdgeIndexDirection,
+    HopDirection, IndexBackend, IndexKind, IndexTraceStep,
+)
+from .registry import (
+    GfqlIndexRegistry, EMPTY_REGISTRY,
+    EDGE_OUT_ADJ, EDGE_IN_ADJ, NODE_ID, NODE_PROP, EDGE_PROP,
+    NODE_TYPE_SEGMENT, ADJ_KINDS, ALL_KINDS,
+    AdjacencyIndex, NodeIdIndex, NodePropIndex,
+)
+from .api import (
+    create_index, drop_index, show_indexes, gfql_index_edges, gfql_index_all,
+    gfql_index_col_stats,
+    gfql_index_node_props,
+    gfql_index_node_types,
+    GfqlIndexUnsupportedError,
+    GfqlIndexNotImplementedError,
+    get_registry, set_registry, get_index_policy, with_index_policy, maybe_index_hop,
+    index_name, index_trace,
+)
+from .wire import (
+    CreateIndex, DropIndex, ShowIndexes, IndexOp, apply_index_op, index_op_from_json,
+    is_index_op, is_index_op_json,
+)
+from .cypher_ddl import parse_index_ddl, looks_like_index_ddl
+from .cost import cost_gate_frac, reset_cost_gate_frac, set_cost_gate_frac
+from .explain import GfqlExplainReport
+
+__all__ = [
+    "AdjacencyIndexKind", "ArrayLike", "ArrayNamespace", "EdgeIndexDirection",
+    "HopDirection", "IndexBackend", "IndexKind", "IndexTraceStep",
+    "GfqlIndexRegistry", "EMPTY_REGISTRY",
+    "EDGE_OUT_ADJ", "EDGE_IN_ADJ", "NODE_ID", "NODE_PROP", "EDGE_PROP",
+    "NODE_TYPE_SEGMENT", "ADJ_KINDS", "ALL_KINDS",
+    "AdjacencyIndex", "NodeIdIndex", "NodePropIndex",
+    "create_index", "drop_index", "show_indexes", "gfql_index_edges",
+    "gfql_index_all", "gfql_index_col_stats", "gfql_index_node_props", "gfql_index_node_types", "GfqlIndexUnsupportedError", "GfqlIndexNotImplementedError",
+    "get_registry", "with_index_policy", "set_registry", "get_index_policy", "maybe_index_hop", "index_name",
+    "index_trace",
+    "CreateIndex", "DropIndex", "ShowIndexes", "IndexOp", "apply_index_op",
+    "index_op_from_json", "is_index_op", "is_index_op_json",
+    "parse_index_ddl", "looks_like_index_ddl",
+    "cost_gate_frac", "reset_cost_gate_frac", "set_cost_gate_frac",
+    "GfqlExplainReport",
+]

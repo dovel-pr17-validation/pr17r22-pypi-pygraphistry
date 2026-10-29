@@ -1,0 +1,242 @@
+"""Engine-polymorphic array helpers for GFQL physical indexes.
+
+The index core (build + lookup) is written once against a tiny array protocol
+(``searchsorted``, ``argsort``, ``cumsum``, ``arange``, ``repeat``) so the same
+CSR + searchsorted gather runs on:
+
+- pandas  -> numpy host arrays, ``df.iloc`` to gather rows
+- cudf    -> cupy device arrays, ``df.iloc`` to gather rows
+- polars / polars-gpu -> numpy host arrays, polars row-gather
+
+Bulk operations stay vectorized; bounded CPU gathers can reuse row slices.
+"""
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Optional, Tuple, Union, cast
+
+import numpy as np
+
+if TYPE_CHECKING:
+    import polars as pl
+    from .registry import AdjacencyIndex, NodeIdIndex, NodePropIndex
+
+from graphistry.Engine import Engine
+from graphistry.compute.typing import DataFrameT
+from .types import ArrayLike, ArrayNamespace, IndexBackend
+
+
+def array_namespace(engine: Engine) -> Tuple[ArrayNamespace, IndexBackend]:
+    """Return (array module, backend tag) for an engine.
+
+    cudf indexes keep their arrays on-device (cupy); everything else uses numpy
+    host arrays. The frontier of a seeded query is tiny, so host-side
+    searchsorted is cheap even when the frame itself is on GPU (polars-gpu).
+    """
+    import numpy as np
+
+    if engine == Engine.CUDF:
+        try:
+            import cupy as cp  # type: ignore
+
+            return cast(ArrayNamespace, cp), "cupy"
+        except Exception:  # pragma: no cover - cupy always present with cudf
+            return cast(ArrayNamespace, np), "numpy"
+    return cast(ArrayNamespace, np), "numpy"
+
+
+def col_to_array(df: DataFrameT, col: str, engine: Engine) -> ArrayLike:
+    """Extract a column as a backend-native 1-D array (numpy or cupy)."""
+    if engine in (Engine.POLARS, Engine.POLARS_GPU):
+        return cast(ArrayLike, df.get_column(col).to_numpy())
+    if engine == Engine.CUDF:
+        # cudf Series -> cupy array (stays on device)
+        return cast(ArrayLike, df[col].values)
+    series = df[col]
+    dtype = series.dtype
+    if dtype.kind in ("i", "u"):
+        values = series.to_numpy(dtype=f"{dtype.kind}{dtype.itemsize}")
+    else:
+        values = series.to_numpy()
+    return cast(ArrayLike, values)
+
+
+def as_eager_polars_frame(df: DataFrameT) -> Optional["pl.DataFrame"]:
+    """``df`` as a statically typed eager polars frame, or None when it is not one.
+
+    Array fast paths admit only eager polars; narrowing once here is what lets the
+    callers keep real polars types instead of per-call ignores.
+    """
+    import polars as pl
+
+    return df if isinstance(df, pl.DataFrame) else None
+
+
+def take_rows_polars(df: "pl.DataFrame", positions: ArrayLike) -> "pl.DataFrame":
+    """``take_rows`` for an already-narrowed eager polars frame; order follows ``positions``."""
+    import numpy as np
+
+    return df[np.asarray(positions)]
+
+
+def ids_to_array(ids: DataFrameT, col: str, engine: Engine) -> ArrayLike:
+    """Frontier ids (a frame/Series) -> backend array, matching index backend."""
+    if engine in (Engine.POLARS, Engine.POLARS_GPU):
+        ids = ids.drop_nulls(subset=[col])
+    else:
+        ids = ids.dropna(subset=[col])
+    return col_to_array(ids, col, engine)
+
+
+
+def unique_with_counts(xp: ArrayNamespace, values: ArrayLike) -> Tuple[ArrayLike, ArrayLike]:
+    """Sorted distinct values of a 1-D array and how often each occurs."""
+    return cast(  # hygiene-ok: explicit-cast -- ArrayNamespace.unique has one declared arity; return_counts is the numpy/cupy two-array form
+        Tuple[ArrayLike, ArrayLike],
+        xp.unique(values, return_counts=True),  # type: ignore[call-arg]
+    )
+
+
+def take_rows(df: DataFrameT, positions: ArrayLike, engine: Engine) -> DataFrameT:
+    """Positionally gather rows of ``df`` by an integer array ``positions``.
+
+    ``positions`` is a backend array (numpy for pandas/polars, cupy for cudf).
+    Returns a frame of the same engine; row order follows ``positions``.
+    """
+    if engine in (Engine.POLARS, Engine.POLARS_GPU):
+        import numpy as np
+
+        idx = np.asarray(positions)
+        position = int(idx[0]) if idx.ndim == 1 and idx.size == 1 and idx.dtype.kind in "iu" else None
+        if position is not None and 0 <= position < len(df):
+            result = df.slice(position, 1)
+        elif engine == Engine.POLARS and idx.ndim == 1 and 2 <= idx.size <= 8 and idx.dtype.kind in "iu":
+            # Scheduling a tiny gather can cost more than assembling its slices.
+            values = idx.tolist()
+            if all(0 <= value < len(df) for value in values):
+                if all(value == values[0] + offset for offset, value in enumerate(values)):
+                    result = df.slice(values[0], len(values))
+                elif df.width <= 32:
+                    result = df.slice(values[0], 1)
+                    for value in values[1:]:
+                        result.vstack(df.slice(value, 1), in_place=True)
+                else:
+                    result = df[idx]
+            else:
+                result = df[idx]
+        elif (
+            engine == Engine.POLARS and idx.ndim == 1 and 9 <= idx.size <= 1024
+            and idx.dtype.kind in "iu" and df.width <= 32
+            and int(idx.min()) >= 0 and int(idx.max()) < min(len(df), 2**32)
+        ):
+            import polars as pl
+            # Gather native columns without starting a frame expression plan.
+            native_idx = pl.Series(idx.astype(np.uint32, copy=False))
+            result = pl.DataFrame([column[native_idx] for column in df.iter_columns()])
+        else:
+            result = df[idx]
+        return result
+    if engine in (Engine.PANDAS, Engine.CUDF):
+        import numpy as np
+        single_idx = positions if engine == Engine.CUDF else np.asarray(positions)
+        if len(single_idx.shape) == 1 and single_idx.shape[0] == 1 and single_idx.dtype.kind in "iu":
+            if engine == Engine.CUDF:
+                import cupy as cp
+                position = int(cp.asnumpy(single_idx)[0])
+            else:
+                position = int(np.asarray(single_idx)[0])
+            if 0 <= position < len(df):
+                return cast(DataFrameT, df.iloc[position:position + 1].copy())
+    # pandas / cudf: iloc accepts numpy (pandas) or cupy (cudf) int arrays
+    return cast(DataFrameT, df.iloc[positions])
+
+
+
+def _take_index_rows(
+    df: DataFrameT, positions: ArrayLike, engine: Engine,
+    index: "Union[AdjacencyIndex, NodeIdIndex, NodePropIndex]",
+) -> DataFrameT:
+    """Gather positions produced by a live index without repeating GPU bounds reductions.
+
+    Callers supply only nonnegative row positions from that index's lookup.
+    Builders obtain these positions from the original frame; lookup selects
+    subsets. Identity and height must still match before trusting this invariant.
+    Arbitrary indexers continue through checked ``take_rows``.
+    """
+    if engine == Engine.CUDF:
+        n_rows = len(df)
+        if (index.source_ref is df and index.fingerprint[0] == n_rows
+                and int(positions.shape[0]) > 1):
+            import cudf  # type: ignore[import]
+            from cudf.core.column import as_column  # type: ignore[import]
+            from cudf.core.copy_types import GatherMap  # type: ignore[import]
+
+            if isinstance(df, cudf.DataFrame):
+                gather_map = GatherMap.from_column_unchecked(as_column(positions), n_rows, nullify=False)
+                return df._gather(gather_map)
+    return take_rows(df, positions, engine)
+
+
+def select_by_ids(df: DataFrameT, col: str, ids: ArrayLike, engine: Engine) -> DataFrameT:
+    """Return rows of ``df`` whose ``col`` is in the id array ``ids`` (set semantics,
+    preserves df row order). Engine-polymorphic, vectorized."""
+    if engine in (Engine.POLARS, Engine.POLARS_GPU):
+        import numpy as np
+        import polars as pl
+
+        # Semi-join (not Expr.is_in(Series), which polars >= 1.28.0 deprecates as ambiguous —
+        # pola-rs/polars#22149; see lazy/engine/polars/membership.py) — vectorized AND
+        # preserves the left (df) row order, which the node materialization relies on
+        # (table-order parity with the scan).
+        # Not deduplicated: a semi-join emits a left row iff >=1 match exists, so repeated
+        # ids neither change the result nor multiply rows — the dedup is a hash pass for
+        # nothing. (cudf/pandas `isin` below has the same set semantics, also without a
+        # dedup.) Anything needing a distinct id set must apply its own `.unique()`.
+        ids_df = pl.DataFrame({col: np.asarray(ids)}).cast({col: df.schema[col]})
+        return cast(DataFrameT, df.join(ids_df, on=col, how="semi"))
+    if engine == Engine.CUDF:
+        import cudf  # type: ignore
+
+        return cast(DataFrameT, df[df[col].isin(cudf.Series(ids))])
+    import numpy as np
+
+    return cast(DataFrameT, df[df[col].isin(np.asarray(ids))])
+
+
+def set_difference(cand: ArrayLike, visited: ArrayLike, xp: ArrayNamespace) -> ArrayLike:
+    """cand minus visited (both backend arrays), vectorized via sorted membership."""
+    if int(visited.shape[0]) == 0:
+        return cand
+    if int(cand.shape[0]) == 0:
+        return cand
+    vs = xp.sort(visited)
+    pos = xp.searchsorted(vs, cand)
+    pos_c = xp.where(pos < vs.shape[0], pos, vs.shape[0] - 1)
+    ismember = vs[pos_c] == cand
+    return cand[~ismember]
+
+
+def sorted_unique(xp: ArrayNamespace, values: ArrayLike) -> ArrayLike:
+    """Sorted distinct values of a 1-D array, identical to ``xp.unique(values)``.
+
+    NumPy integer keys use sort plus adjacent differences for bulk frontiers;
+    Boolean keys use it above one entry. Other backends/dtypes keep ``xp.unique``.
+    """
+    if xp is not np or len(values.shape) != 1 or values.dtype.kind not in "iub":
+        return xp.unique(values)
+    # NumPy 2.4 favors native unique for tiny integers, but sort for booleans.
+    size = int(values.shape[0])
+    if size <= 1 or (values.dtype.kind != "b" and size < 128):
+        return xp.unique(values)
+    ordered = xp.sort(values)
+    keep = xp.empty(ordered.shape[0], dtype=bool)
+    keep[0] = True
+    keep[1:] = ordered[1:] != ordered[:-1]
+    return ordered[keep]
+
+
+def union1d(a: ArrayLike, b: ArrayLike, xp: ArrayNamespace) -> ArrayLike:
+    if int(a.shape[0]) == 0:
+        return sorted_unique(xp, b)
+    if int(b.shape[0]) == 0:
+        return sorted_unique(xp, a)
+    return sorted_unique(xp, xp.concatenate([a, b]))

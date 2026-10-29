@@ -1,0 +1,22 @@
+services:
+  neo4j:
+    container_name: neo4j-lts-test
+    # Neo4j 5.26 is the current LTS line; pin the latest LTS patch instead of
+    # floating tags or the EOL 4.1 image.
+    image: neo4j:5.26.26
+    ports:
+      - "10004:7687"
+      - "10005:7473"
+      - "10006:7474"
+    environment:
+      - NEO4J_server_memory_heap_initial__size=512m
+      - NEO4J_server_memory_heap_max__size=2G
+      - NEO4J_server_default__listen__address=0.0.0.0
+      - NEO4J_AUTH=neo4j/testtest
+    networks: ["grph_net"]
+    restart: unless-stopped
+
+
+networks:
+  grph_net:
+    name: grph_net
